@@ -49,15 +49,37 @@ pub struct Imported {
     /// The scene shown over whatever is on air (`ferrocast_top_layer`: Exeldro's Downstream
     /// Keyer, built in), when it names one of `scenes`.
     pub top_layer: Option<String>,
+    /// Ducking derived from OBS sidechained compressors (retained for explicit ducking configs;
+    /// OBS `compressor_filter` with `sidechain_source` now maps directly to per-source
+    /// `AudioEffect::Compressor { sidechain: Some(id) }`).
+    pub ducking: Option<crate::level::Ducking>,
+    /// Sidechain compressor cycles broken during import: `(source_name, key_source_name)` where
+    /// `source_name`'s compressor receives silence to break a loop.
+    pub sidechain_cycles: Vec<(String, String)>,
 }
 
 fn f(v: &Value, k: &str, d: f64) -> f32 {
-    v.get(k).and_then(Value::as_f64).unwrap_or(d) as f32
+    let x = v.get(k).and_then(Value::as_f64).unwrap_or(d) as f32;
+    if x.is_finite() { x } else { d as f32 }
 }
 
 fn color(v: u64) -> [u8; 4] {
     let v = v as u32;
     [(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8, ((v >> 24) & 0xff) as u8]
+}
+
+/// OBS's v1 Color Correction (`color_correction_filter_update_v1`) multiplies the colour by
+/// `setting + 1` round mid-grey: `c·x + (1 - c)/2`. Ours is v2's plain `1/(1 - s)` below 0, `s + 1`
+/// above, times the colour, with the brightness added after. So a v1 setting becomes the v2
+/// setting with the same multiplier, and `(1 - c)/2` goes into the brightness (the contrast and
+/// brightness matrices multiply as a scale and a shift, so the sum is exact). At or below -1
+/// (OBS's multiplier of 0 or less: a flat grey, or the picture inverted) the multiplier is the
+/// smallest we make, 0.01, never inverted. → `(contrast, brightness added)`.
+fn color_filter_v1_contrast(setting: f32) -> (f32, f32) {
+    let setting = if setting.is_finite() { setting } else { 0.0 };
+    let multiplier = (setting + 1.0).max(0.01);
+    let ours = if multiplier >= 1.0 { multiplier - 1.0 } else { 1.0 - 1.0 / multiplier };
+    (ours, (1.0 - multiplier) / 2.0)
 }
 
 /// A source's picture filter, from OBS's id and settings; None for one the engine lacks.
@@ -105,43 +127,80 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             temperature: n("temperature", 0.0),
             tint: n("tint", 0.0),
         },
-        "chroma_key_filter_v2" => Effect::ChromaKey {
-            key: key_of(&[("green", 0x00FF00), ("blue", 0xFF9900), ("magenta", 0xFF00FF)], 0x00FF00),
-            similarity: n("similarity", 400.0),
-            smoothness: n("smoothness", 80.0),
-            spill: n("spill", 100.0),
-            opacity: n("opacity", 1.0),
-            contrast: n("contrast", 0.0),
-            brightness: n("brightness", 0.0),
-            gamma: n("gamma", 0.0),
-        },
-        "color_key_filter_v2" => Effect::ColorKey {
-            key: key_of(&[("green", 0x00FF00), ("blue", 0xFF0000), ("red", 0x0000FF), ("magenta", 0xFF00FF)], 0x00FF00),
-            similarity: n("similarity", 80.0),
-            smoothness: n("smoothness", 50.0),
-            opacity: n("opacity", 1.0),
-            contrast: n("contrast", 0.0),
-            brightness: n("brightness", 0.0),
-            gamma: n("gamma", 0.0),
-        },
-        "color_filter_v2" => Effect::ColorCorrection {
-            gamma: n("gamma", 0.0),
-            contrast: n("contrast", 0.0),
-            brightness: n("brightness", 0.0),
-            saturation: n("saturation", 0.0),
-            hue_shift: n("hue_shift", 0.0),
-            opacity: n("opacity", 1.0),
-            multiply: s.get("color_multiply").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32,
-            add: s.get("color_add").and_then(Value::as_u64).unwrap_or(0) as u32,
-        },
-        "luma_key_filter_v2" => Effect::LumaKey {
+        "chroma_key_filter" | "chroma_key_filter_v2" => {
+            let v2 = kind == "chroma_key_filter_v2";
+            Effect::ChromaKey {
+                key: key_of(&[("green", 0x00FF00), ("blue", 0xFF9900), ("magenta", 0xFF00FF)], 0x00FF00),
+                similarity: n("similarity", 400.0).clamp(1.0, 1000.0),
+                smoothness: n("smoothness", 80.0).clamp(1.0, 1000.0),
+                spill: n("spill", 100.0).clamp(1.0, 1000.0),
+                opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
+                contrast: n("contrast", 0.0),
+                brightness: if v2 { n("brightness", 0.0) } else { n("brightness", 0.0) * 0.5 },
+                gamma: n("gamma", 0.0),
+            }
+        }
+        "color_key_filter" | "color_key_filter_v2" => {
+            let v2 = kind == "color_key_filter_v2";
+            Effect::ColorKey {
+                key: key_of(
+                    &[("green", 0x00FF00), ("blue", 0xFF0000), ("red", 0x0000FF), ("magenta", 0xFF00FF)],
+                    0x00FF00,
+                ),
+                similarity: n("similarity", 80.0).clamp(1.0, 1000.0),
+                smoothness: n("smoothness", 50.0).clamp(1.0, 1000.0),
+                opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
+                contrast: n("contrast", 0.0),
+                brightness: if v2 { n("brightness", 0.0) } else { n("brightness", 0.0) * 0.5 },
+                gamma: n("gamma", 0.0),
+            }
+        }
+        "color_filter" | "color_filter_v2" => {
+            let v2 = kind == "color_filter_v2";
+            let v1_contrast = color_filter_v1_contrast(n("contrast", 0.0));
+            let (multiply, add) = if !v2 && s.get("color_multiply").is_none() && s.get("color_add").is_none() {
+                // OBS v1 `color_correction_filter_update_v1`: single ABGR `color` where RGB
+                // multiplies and `RGB * A` adds.
+                let c = s.get("color").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32;
+                let a = ((c >> 24) & 0xff) as f32 / 255.0;
+                let r = (((c & 0xff) as f32) * a).round().clamp(0.0, 255.0) as u32;
+                let g = ((((c >> 8) & 0xff) as f32) * a).round().clamp(0.0, 255.0) as u32;
+                let b = ((((c >> 16) & 0xff) as f32) * a).round().clamp(0.0, 255.0) as u32;
+                (c & 0x00FF_FFFF, r | (g << 8) | (b << 16))
+            } else {
+                (
+                    s.get("color_multiply").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32,
+                    s.get("color_add").and_then(Value::as_u64).unwrap_or(0) as u32,
+                )
+            };
+            Effect::ColorCorrection {
+                gamma: n("gamma", 0.0),
+                contrast: if v2 { n("contrast", 0.0) } else { v1_contrast.0 },
+                brightness: n("brightness", 0.0) + if v2 { 0.0 } else { v1_contrast.1 },
+                saturation: n("saturation", 0.0),
+                hue_shift: n("hue_shift", 0.0),
+                opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
+                multiply,
+                add,
+            }
+        }
+        "luma_key_filter" | "luma_key_filter_v2" => Effect::LumaKey {
             max: n("luma_max", 1.0),
             min: n("luma_min", 0.0),
             max_smooth: n("luma_max_smooth", 0.0),
             min_smooth: n("luma_min_smooth", 0.0),
         },
-        "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
+        "sharpness_filter" | "sharpness_filter_v2" => {
+            Effect::Sharpen { sharpness: n("sharpness", 0.08).clamp(0.0, 1.0) }
+        }
         "ferrocast_freeze" | "freeze_filter" => Effect::Freeze,
+        // OBS's Render Delay holds pictures only; its Video Delay (Async) holds the sound too.
+        "ferrocast_video_delay" => Effect::Delay {
+            ms: (n("delay_ms", 0.0).clamp(0.0, 20_000.0)) as u32,
+            audio: s.get("audio").and_then(Value::as_bool).unwrap_or(false),
+        },
+        "gpu_delay" => Effect::Delay { ms: (n("delay_ms", 0.0).clamp(0.0, 500.0)) as u32, audio: false },
+        "async_delay_filter" => Effect::Delay { ms: (n("delay_ms", 0.0).clamp(0.0, 20_000.0)) as u32, audio: true },
         "scroll_filter" => {
             let size = |on: &str, k: &str| {
                 s.get(on)
@@ -252,74 +311,144 @@ pub fn vst_effect(source: &str, filter: &str, s: &Value) -> Option<AudioEffect> 
     Some(AudioEffect::Plugin { slot: crate::afx::plugin_slot(spec) })
 }
 
+/// OBS's `sidechain_source` on a compressor filter: non-empty and not `"none"` means the
+/// compressor is keyed by another source (ducking), not by itself (`compressor-filter.c:201`).
+fn sidechain_source(s: &Value) -> Option<&str> {
+    let name = s.get("sidechain_source").and_then(Value::as_str)?.trim();
+    (!name.is_empty() && !name.eq_ignore_ascii_case("none")).then_some(name)
+}
+
+fn compressor_from(s: &Value, sidechain: Option<u64>) -> AudioEffect {
+    let n = |k: &str, d: f64| f(s, k, d);
+    AudioEffect::Compressor {
+        ratio: n("ratio", 10.0).clamp(1.0, 32.0),
+        threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
+        attack_ms: n("attack_time", 6.0).clamp(0.0, 500.0),
+        release_ms: n("release_time", 60.0).clamp(0.0, 1_000.0),
+        output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
+        sidechain,
+    }
+}
+
 pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     let n = |k: &str, d: f64| f(s, k, d);
     Some(match kind {
-        "gain_filter" => AudioEffect::Gain { db: n("db", 0.0) },
+        "gain_filter" => AudioEffect::Gain { db: n("db", 0.0).clamp(-30.0, 30.0) },
         "invert_polarity_filter" => AudioEffect::InvertPolarity,
         "noise_gate_filter" => AudioEffect::NoiseGate {
-            open_db: n("open_threshold", -26.0),
-            close_db: n("close_threshold", -32.0),
-            attack_ms: n("attack_time", 25.0),
-            hold_ms: n("hold_time", 200.0),
-            release_ms: n("release_time", 150.0),
+            open_db: n("open_threshold", -26.0).clamp(-96.0, 0.0),
+            close_db: n("close_threshold", -32.0).clamp(-96.0, 0.0),
+            attack_ms: n("attack_time", 25.0).clamp(0.0, 10_000.0),
+            hold_ms: n("hold_time", 200.0).clamp(0.0, 10_000.0),
+            release_ms: n("release_time", 150.0).clamp(0.0, 10_000.0),
         },
-        "compressor_filter" => AudioEffect::Compressor {
-            ratio: n("ratio", 10.0),
-            threshold_db: n("threshold", -18.0),
-            attack_ms: n("attack_time", 6.0),
-            release_ms: n("release_time", 60.0),
-            output_db: n("output_gain", 0.0),
-        },
-        "limiter_filter" => {
-            AudioEffect::Limiter { threshold_db: n("threshold", -6.0), release_ms: n("release_time", 60.0) }
+        "compressor_filter" => {
+            // A sidechained compressor ducks under another source; never turn it into a
+            // self-compressor (`import_with` resolves `sidechain_source` to a source ID).
+            if sidechain_source(s).is_some() {
+                return None;
+            }
+            compressor_from(s, None)
         }
+        "limiter_filter" => AudioEffect::Limiter {
+            threshold_db: n("threshold", -6.0).clamp(-60.0, 0.0),
+            release_ms: n("release_time", 60.0).clamp(0.0, 1_000.0),
+        },
         "expander_filter" => {
             let gate = s.get("presets").and_then(Value::as_str) == Some("gate");
+            let peak = s.get("detector").and_then(Value::as_str).is_some_and(|d| d.eq_ignore_ascii_case("peak"));
             AudioEffect::Expander {
-                ratio: n("ratio", if gate { 10.0 } else { 2.0 }),
-                threshold_db: n("threshold", -40.0),
-                attack_ms: n("attack_time", 10.0),
-                release_ms: n("release_time", if gate { 125.0 } else { 50.0 }),
-                output_db: n("output_gain", 0.0),
-                rms: s.get("detector").and_then(Value::as_str) != Some("peak"),
+                ratio: n("ratio", if gate { 10.0 } else { 2.0 }).clamp(1.0, 20.0),
+                threshold_db: n("threshold", -40.0).clamp(-60.0, 0.0),
+                attack_ms: n("attack_time", 10.0).clamp(0.0, 100.0),
+                release_ms: n("release_time", if gate { 125.0 } else { 50.0 }).clamp(0.0, 1_000.0),
+                output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
+                rms: !peak,
             }
         }
         "upward_compressor_filter" => AudioEffect::UpwardCompressor {
             // OBS takes 0 to 1 here; more boosts quiet sound past clipping.
             ratio: n("ratio", 0.5).clamp(0.0, 1.0),
-            threshold_db: n("threshold", -20.0),
-            attack_ms: n("attack_time", 10.0),
-            release_ms: n("release_time", 50.0),
-            output_db: n("output_gain", 0.0),
-            knee_db: n("knee_width", 10.0),
+            threshold_db: n("threshold", -20.0).clamp(-60.0, 0.0),
+            attack_ms: n("attack_time", 10.0).clamp(0.0, 100.0),
+            release_ms: n("release_time", 50.0).clamp(0.0, 1_000.0),
+            output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
+            knee_db: n("knee_width", 10.0).clamp(0.0, 20.0),
         },
-        "basic_eq_filter" => AudioEffect::Eq3 { low_db: n("low", 0.0), mid_db: n("mid", 0.0), high_db: n("high", 0.0) },
+        "basic_eq_filter" => AudioEffect::Eq3 {
+            low_db: n("low", 0.0).clamp(-20.0, 20.0),
+            mid_db: n("mid", 0.0).clamp(-20.0, 20.0),
+            high_db: n("high", 0.0).clamp(-20.0, 20.0),
+        },
         // Strong noise removal where the app has it; the light one elsewhere.
-        "ferrocast_deepfilter" => AudioEffect::Denoise {
-            strength: s.get("strength").and_then(Value::as_u64).unwrap_or(100).clamp(1, 100) as u32,
-        },
-        // OBS's Noise Suppression (RNNoise or Speex) becomes it too: as deep as OBS's level
-        // (-30 dB by default), 0.6 dB a step. OBS's RNNoise ignores the level (it applies to
-        // Speex only, and OBS hides it for RNNoise), and RNNoise is gentle: as deep as 48 dB
-        // here, a voice came out muffled and low (19 Nov, live, "unclear"); RNNoise's is held
-        // to 24 dB, about what RNNoise takes off.
+        // Default 40 (24 dB attenuation limit, matching RNNoise) keeps voice natural instead of
+        // muffling speech; 0 turns the filter off (no delay, no CPU).
+        "ferrocast_deepfilter" => {
+            let raw = s.get("strength").and_then(Value::as_u64).unwrap_or(u64::from(DEFAULT_DENOISE_STRENGTH));
+            if raw == 0 {
+                return None;
+            }
+            AudioEffect::Denoise { strength: raw.clamp(1, 100) as u32 }
+        }
+        // OBS's Noise Suppression (RNNoise, Speex, or NVAFX) becomes our denoiser too.
+        // DeepFilterNet maps strength 1..=50 at 0.6 dB/step (up to 30 dB) and 50..=100 at
+        // 0.1 dB/step (up to 35 dB cap). 0 dB turns it off completely:
+        // - RNNoise (v2 default): capped at strength 40 (24 dB, matching RNNoise);
+        //   when OBS omitted `suppress_level` (OBS hides it for RNNoise), uses strength 40 (24 dB).
+        // - Speex (v1 default): full 1..=100 range at 0.6 dB/step.
+        // - NVAFX: intensity 0..1 mapped to 1..=40 (0 turns it off).
         "noise_suppress_filter" | "noise_suppress_filter_v2" => {
-            let level = s.get("suppress_level").and_then(Value::as_f64).unwrap_or(-30.0).abs();
-            // With no method saved: v2 means RNNoise; the older filter, Speex (OBS's defaults).
-            let rnnoise = match s.get("method").and_then(Value::as_str) {
-                Some(m) => m == "rnnoise",
-                None => kind == "noise_suppress_filter_v2",
+            let method = match s.get("method").and_then(Value::as_str) {
+                Some(m) => m,
+                None if kind == "noise_suppress_filter_v2" => "rnnoise",
+                None => "speex",
             };
-            let level = if rnnoise { level.min(RNNOISE_DB) } else { level };
+            if method == "nvafx" {
+                let intensity = s.get("intensity").and_then(Value::as_f64).unwrap_or(1.0);
+                if !intensity.is_finite() || intensity <= 0.0 {
+                    return None;
+                }
+                let strength = (intensity.clamp(0.0, 1.0) * f64::from(RNNOISE_MAX_STRENGTH)).round().clamp(1.0, 100.0);
+                return Some(AudioEffect::Denoise { strength: strength as u32 });
+            }
+            let rnnoise = method == "rnnoise";
+            // RNNoise has its own inline engine (OBS ignores the level for it too); 0 dB is off.
+            if rnnoise {
+                return match s.get("suppress_level").and_then(Value::as_f64) {
+                    Some(v) if !v.is_finite() || v >= 0.0 => None,
+                    _ => Some(AudioEffect::Rnnoise { amount: 100 }),
+                };
+            }
+            let level = match s.get("suppress_level").and_then(Value::as_f64) {
+                Some(v) if !v.is_finite() => return None,
+                Some(v) if v >= 0.0 => return None,
+                Some(v) => (-v).clamp(0.0, 60.0),
+                None if rnnoise => return Some(AudioEffect::Denoise { strength: DEFAULT_DENOISE_STRENGTH }),
+                None => 30.0,
+            };
+            // 0.6 dB a step, as it always was: OBS's -30 dB is strength 50 (30 dB), what a saved
+            // scene meant. RNNoise ignores the level in OBS: it is held to what RNNoise takes off.
+            let level = if rnnoise { level.min(24.0) } else { level };
             AudioEffect::Denoise { strength: (level / 0.6).round().clamp(1.0, 100.0) as u32 }
         }
         _ => return None,
     })
 }
 
-/// The most OBS's RNNoise noise suppression takes off here (dB): RNNoise is gentle.
-const RNNOISE_DB: f64 = 24.0;
+/// A source's push-to-talk or push-to-mute (OBS saves `<key>` on or off and `<key>-delay` in ms): its
+/// release delay when it is on (at most 5 s), else None.
+fn push_gate(s: &Value, key: &str) -> Option<u32> {
+    s.get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then(|| s.get(format!("{key}-delay")).and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32)
+}
+
+/// Default denoiser strength: 40, 24 dB (what RNNoise takes off), gentle on the voice. (A strength
+/// means the same dB as it always did: 0.6 a step up to 50, then 0.1.)
+const DEFAULT_DENOISE_STRENGTH: u32 = 40;
+/// What an OBS RNNoise or NVIDIA setting at its fullest takes off here: 40, 24 dB.
+const RNNOISE_MAX_STRENGTH: u32 = 40;
 
 /// A source kind the engine plays, from OBS's id and settings; Err with what it is otherwise.
 /// macOS's notification banners (and Notification Center, and the desktop's widgets), by bundle id.
@@ -559,7 +688,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 // Canvas-sized, so fitting it before the first replay fits the replay too.
                 (SourceKind::Color { width: canvas.0.max(1), height: canvas.1.max(1), rgba: [0, 0, 0, 0] }, false)
             } else {
-                (SourceKind::Media { path: path.into(), looping: false }, true)
+                (SourceKind::Media { path: path.into(), options: crate::ffsrc::MediaOptions::default() }, true)
             }
         }
         "ffmpeg_source" => {
@@ -571,7 +700,17 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             (
                 SourceKind::Media {
                     path: text_of("local_file").into(),
-                    looping: s.get("looping").and_then(Value::as_bool).unwrap_or(false),
+                    options: crate::ffsrc::MediaOptions {
+                        looping: s.get("looping").and_then(Value::as_bool).unwrap_or(false),
+                        restart_on_activate: s.get("restart_on_activate").and_then(Value::as_bool).unwrap_or(true),
+                        close_when_inactive: s.get("close_when_inactive").and_then(Value::as_bool).unwrap_or(false),
+                        clear_on_media_end: s.get("clear_on_media_end").and_then(Value::as_bool).unwrap_or(true),
+                        speed_percent: s
+                            .get("speed_percent")
+                            .and_then(Value::as_u64)
+                            .map_or(100, |v| v.clamp(1, 200) as u32),
+                        hw_decode: s.get("hw_decode").and_then(Value::as_bool).unwrap_or(true),
+                    },
                 },
                 true,
             )
@@ -633,22 +772,18 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         }
         #[cfg(target_os = "macos")]
         "coreaudio_input_capture" => {
+            // "default" stays "default": it follows the system's microphone, as in OBS (it was
+            // fixed to the first one listed, never the one picked in System Settings).
             let dev = text_of("device_id");
-            let dev = if dev.is_empty() || dev == "default" {
-                crate::camera::microphones().first().map(|d| d.id.clone()).unwrap_or_default()
-            } else {
-                dev
-            };
+            let dev = if dev.is_empty() { "default".to_string() } else { dev };
             (SourceKind::Microphone(dev), true)
         }
         // Windows: OBS's own source kinds.
         #[cfg(target_os = "windows")]
         "monitor_capture" => {
-            // OBS 30 keeps the monitor's device path ("monitor_id"), older ones its place
-            // ("monitor"): the place, else the first.
-            let display = s.get("monitor").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let (display, uuid) = crate::win_logic::parse_obs_monitor(s);
             let cursor = cursor_on(s, "capture_cursor");
-            (SourceKind::Screen { display, uuid: None, sound: false, hide: hide.to_vec(), cursor }, false)
+            (SourceKind::Screen { display, uuid, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "windows")]
         "window_capture" | "game_capture" => {
@@ -680,7 +815,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                             let mut parts = t.split(':').map(|p| p.replace("#3A", ":"));
                             let title = parts.next().unwrap_or_default();
                             let exe = parts.nth(1).unwrap_or_default();
-                            (exe.trim_end_matches(".exe").to_string(), title)
+                            (crate::win_logic::strip_exe_suffix(&exe).to_string(), title)
                         }
                         _ => (text_of("owner_name"), text_of("window_name")),
                     };
@@ -698,7 +833,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 // program is what's heard (its first open window's process).
                 let w = text_of("window");
                 let app = w.rsplit(':').next().unwrap_or("").replace("#3A", ":");
-                let app = app.trim_end_matches(".exe").trim_end_matches(".EXE").to_string();
+                let app = crate::win_logic::strip_exe_suffix(&app).to_string();
                 if app.is_empty() {
                     return Err("an Application Audio Capture with no app picked".into());
                 }
@@ -735,7 +870,10 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         // its pictures in. OBS's own size keys; 800x600 when it says none.
         "browser_source" | "ferrocast_web" => {
             let n = |k: &str, d: u32| s.get(k).and_then(Value::as_u64).filter(|v| *v > 0).map_or(d, |v| v as u32);
-            (SourceKind::Fed { width: n("width", 800), height: n("height", 600) }, true)
+            // OBS: a page's sound is in the mixer only with "Control audio via OBS" ticked
+            // (`reroute_audio`). A page without it is a picture: no mixer row, no silent meter.
+            let sound = s.get("reroute_audio").and_then(Value::as_bool) == Some(true);
+            (SourceKind::Fed { width: n("width", 800), height: n("height", 600) }, sound)
         }
         other => return Err(other.to_string()),
     })
@@ -931,6 +1069,134 @@ pub fn camera_device(kind: &str, settings: &Value) -> Option<String> {
     })
 }
 
+/// Native OBS camera source `id` and device-setting key accepted by [`import`] on this OS.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[must_use]
+pub fn native_camera_kind_and_key() -> (&'static str, &'static str) {
+    #[cfg(target_os = "macos")]
+    {
+        ("av_capture_input_v2", "device")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ("dshow_input", "video_device_id")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ("v4l2_input", "device_id")
+    }
+}
+
+/// Whether `kind` is an OBS/Ferrocast audio filter id (lives on the source, never overridden
+/// per scene item).
+#[must_use]
+pub fn is_audio_filter_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "gain_filter"
+            | "invert_polarity_filter"
+            | "noise_gate_filter"
+            | "compressor_filter"
+            | "limiter_filter"
+            | "expander_filter"
+            | "upward_compressor_filter"
+            | "basic_eq_filter"
+            | "ferrocast_deepfilter"
+            | "noise_suppress_filter"
+            | "noise_suppress_filter_v2"
+            | "ferrocast_vst"
+    )
+}
+
+fn push_video_filter(
+    flt: &Value,
+    owner: &str,
+    next_id: &mut u64,
+    effects: &mut Vec<crate::Effect>,
+    out: &mut Imported,
+) -> bool {
+    if flt.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
+    let fs = flt.get("settings").cloned().unwrap_or(Value::Null);
+    if kind == "mask_filter" || kind == "mask_filter_v2" {
+        // Its picture becomes a source of its own, shown in no scene.
+        match mask_from(kind, &fs, *next_id) {
+            Some((e, path)) => {
+                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                out.sources.push(ImportedSource {
+                    id: *next_id,
+                    name: format!("{owner}: {fname}"),
+                    kind: SourceKind::Image(path),
+                    sound: None,
+                    sound_effects: Vec::new(),
+                    global: false,
+                });
+                *next_id += 1;
+                effects.push(e);
+            }
+            None => out.skipped.push(format!("{owner}: the filter {kind} (no picture chosen)")),
+        }
+        return true;
+    }
+    if kind == "ferrocast_remove_background" && !cfg!(any(target_os = "macos", target_os = "windows")) {
+        out.skipped.push(format!("{owner}: the filter {kind} (on a Mac and Windows only so far)"));
+        return true;
+    }
+    if kind == "ferrocast_remove_background" {
+        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+        out.sources.push(ImportedSource {
+            id: *next_id,
+            name: format!("{owner}: {fname}"),
+            kind: SourceKind::Fed { width: 320, height: 180 },
+            sound: None,
+            sound_effects: Vec::new(),
+            global: false,
+        });
+        let int = |k: &str, d: i64, lo: i64, hi: i64| fs.get(k).and_then(Value::as_i64).unwrap_or(d).clamp(lo, hi);
+        effects.push(Effect::Cutout {
+            mask: *next_id,
+            blur: int("mode", 0, 0, 1) == 1,
+            blur_px: int("blur", 24, 2, 100) as f32,
+            soft: int("soft", 10, 0, 40) as f32 / 100.0,
+        });
+        *next_id += 1;
+        return true;
+    }
+    if kind == "ferrocast_shader" {
+        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+        match shader_from(&fs) {
+            Ok(e) => effects.push(e),
+            Err(why) => out.skipped.push(format!("{owner}: the shader effect \"{fname}\" ({why})")),
+        }
+        return true;
+    }
+    if let Some(e) = effect_from(kind, &fs) {
+        effects.push(e);
+        return true;
+    }
+    false
+}
+
+fn parse_video_effects(
+    filters: &[Value],
+    owner: &str,
+    next_id: &mut u64,
+    effects: &mut Vec<crate::Effect>,
+    out: &mut Imported,
+) {
+    for flt in filters {
+        if push_video_filter(flt, owner, next_id, effects, out) {
+            continue;
+        }
+        let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
+        if !is_audio_filter_kind(kind) {
+            out.skipped.push(format!("{owner}: the filter {kind}"));
+        }
+    }
+}
+
 /// [`import`], with `before` giving what each source (by name) was running as: a capture
 /// waiting for its pick keeps that.
 pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Option<SourceKind>) -> Imported {
@@ -964,6 +1230,12 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
     let mut clones: Vec<(String, String, bool, Vec<crate::Effect>)> = Vec::new();
     // Each camera or capture card opened, by device, and the source that opens it.
     let mut devices: Vec<(String, String)> = Vec::new();
+    // OBS source UUIDs (for resolving `sidechain_source` when saved as a UUID instead of a name).
+    let mut source_uuids: Vec<(u64, String)> = Vec::new();
+    // Placeholder tokens (`u64::MAX - idx`) placed in `sound_effects` for sidechained compressors
+    // so filter-chain order is preserved and targets are resolved once every source and global
+    // channel has its ID (`AuxAudioDevice1` often sits after scene sources).
+    let mut pending_sidechains: Vec<(u64, String)> = Vec::new();
     for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -973,69 +1245,31 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
         let settings = s.get("settings").cloned().unwrap_or(Value::Null);
         let (mut effects, mut sound_effects) = (Vec::new(), Vec::new());
         for flt in s.get("filters").and_then(Value::as_array).into_iter().flatten() {
-            if flt.get("enabled").and_then(Value::as_bool) == Some(false) {
+            if push_video_filter(flt, &name, &mut next_id, &mut effects, &mut out) {
                 continue;
             }
             let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
             let fs = flt.get("settings").cloned().unwrap_or(Value::Null);
-            if kind == "mask_filter" || kind == "mask_filter_v2" {
-                // Its picture becomes a source of its own, shown in no scene.
-                match mask_from(kind, &fs, next_id) {
-                    Some((e, path)) => {
-                        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                        out.sources.push(ImportedSource {
-                            id: next_id,
-                            name: format!("{name}: {fname}"),
-                            kind: SourceKind::Image(path),
-                            sound: None,
-                            sound_effects: Vec::new(),
-                            global: false,
-                        });
-                        next_id += 1;
-                        effects.push(e);
+            if kind == "ferrocast_vst" {
+                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                if crate::afx::plugins_disabled() {
+                    out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (disabled in Safe Mode)"));
+                } else {
+                    match vst_effect(&name, fname, &fs) {
+                        Some(e) => sound_effects.push(e),
+                        None => out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (none picked)")),
                     }
-                    None => out.skipped.push(format!("{name}: the filter {kind} (no picture chosen)")),
                 }
-            } else if kind == "ferrocast_remove_background" && !cfg!(any(target_os = "macos", target_os = "windows")) {
-                // Nothing finds the person here yet: left out, not a picture cut away.
-                out.skipped.push(format!("{name}: the filter {kind} (on a Mac and Windows only so far)"));
-            } else if kind == "ferrocast_remove_background" {
-                // The person mask comes in as a picture of its own (the app finds the person
-                // and hands it in), shown in no scene.
-                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                out.sources.push(ImportedSource {
-                    id: next_id,
-                    name: format!("{name}: {fname}"),
-                    kind: SourceKind::Fed { width: 320, height: 180 },
-                    sound: None,
-                    sound_effects: Vec::new(),
-                    global: false,
-                });
-                let int =
-                    |k: &str, d: i64, lo: i64, hi: i64| fs.get(k).and_then(Value::as_i64).unwrap_or(d).clamp(lo, hi);
-                effects.push(Effect::Cutout {
-                    mask: next_id,
-                    blur: int("mode", 0, 0, 1) == 1,
-                    blur_px: int("blur", 24, 2, 100) as f32,
-                    soft: int("soft", 10, 0, 40) as f32 / 100.0,
-                });
-                next_id += 1;
-            } else if kind == "ferrocast_shader" {
-                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                match shader_from(&fs) {
-                    Ok(e) => effects.push(e),
-                    Err(why) => out.skipped.push(format!("{name}: the shader effect \"{fname}\" ({why})")),
-                }
-            } else if let Some(e) = effect_from(kind, &fs) {
-                effects.push(e);
-            } else if kind == "ferrocast_vst" {
-                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                match vst_effect(&name, fname, &fs) {
-                    Some(e) => sound_effects.push(e),
-                    None => out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (none picked)")),
-                }
+            } else if kind == "compressor_filter"
+                && let Some(sc) = sidechain_source(&fs)
+            {
+                let tok = u64::MAX - pending_sidechains.len() as u64;
+                pending_sidechains.push((tok, sc.to_string()));
+                sound_effects.push(compressor_from(&fs, Some(tok)));
             } else if let Some(e) = audio_effect_from(kind, &fs) {
                 sound_effects.push(e);
+            } else if matches!(kind, "noise_suppress_filter" | "noise_suppress_filter_v2" | "ferrocast_deepfilter") {
+                // 0 dB / 0 strength means intentionally off (bypassed), not an unsupported filter.
             } else {
                 out.skipped.push(format!("{name}: the filter {kind}"));
             }
@@ -1044,6 +1278,13 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
         // Strong noise removal on the same mic): run once, at the stronger setting. Two in a
         // row cleaned no more and held the voice back twice as long, and the whole mix waited
         // for it (165 ms, 18 Nov).
+        if sound_effects.iter().any(|e| matches!(e, AudioEffect::Denoise { .. })) {
+            // Strong removal on the same mic already cleans: RNNoise would be a second pass.
+            sound_effects.retain(|e| !matches!(e, AudioEffect::Rnnoise { .. }));
+        } else {
+            let mut seen = false;
+            sound_effects.retain(|e| !matches!(e, AudioEffect::Rnnoise { .. }) || !std::mem::replace(&mut seen, true));
+        }
         let strongest = sound_effects
             .iter()
             .filter_map(|e| if let AudioEffect::Denoise { strength } = e { Some(*strength) } else { None })
@@ -1105,7 +1346,15 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                         Some(2) => Monitoring::AndOutput,
                         _ => Monitoring::Off,
                     },
+                    // OBS's per-source push-to-talk / push-to-mute, with their release delays (ms).
+                    push_to_talk: push_gate(s, "push-to-talk"),
+                    push_to_mute: push_gate(s, "push-to-mute"),
                 });
+                if sound.is_some()
+                    && let Some(u) = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty())
+                {
+                    source_uuids.push((next_id, u.to_string()));
+                }
                 out.sources.push(ImportedSource {
                     id: next_id,
                     name: name.clone(),
@@ -1118,6 +1367,81 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                 next_id += 1;
             }
             Err(what) => out.skipped.push(format!("{name}: {what}")),
+        }
+    }
+    // Resolve OBS sidechained compressors (`sidechain_source` by name or UUID) directly onto each
+    // source's `AudioEffect::Compressor { sidechain: Some(target_id) }` once every source and
+    // global channel has its ID. Missing targets and self-loops are dropped (never self-compressed);
+    // multi-source cycles are detected with the same deterministic breaker `Mixer` uses.
+    if !pending_sidechains.is_empty() {
+        let audio_index: Vec<(u64, String)> =
+            out.sources.iter().filter(|s| s.sound.is_some()).map(|s| (s.id, s.name.clone())).collect();
+        let resolve_target = |sc_ref: &str| -> Option<u64> {
+            audio_index
+                .iter()
+                .find(|(_, n)| n == sc_ref)
+                .map(|(id, _)| *id)
+                .or_else(|| source_uuids.iter().find(|(_, u)| u.eq_ignore_ascii_case(sc_ref)).map(|(id, _)| *id))
+        };
+        let mut deps: Vec<(u64, u64)> = Vec::new();
+        for src in &mut out.sources {
+            let src_id = src.id;
+            let src_name = src.name.clone();
+            let has_sound = src.sound.is_some();
+            src.sound_effects.retain_mut(|eff| {
+                let AudioEffect::Compressor { sidechain: Some(sc), .. } = eff else {
+                    return true;
+                };
+                let Some((_, sc_ref)) = pending_sidechains.iter().find(|(tok, _)| tok == sc) else {
+                    return true;
+                };
+                if !has_sound {
+                    return false;
+                }
+                let Some(target_id) = resolve_target(sc_ref) else {
+                    out.skipped.push(format!("{src_name}: sidechain source \"{sc_ref}\" not found"));
+                    return false;
+                };
+                if target_id == src_id {
+                    out.skipped.push(format!("{src_name}: sidechain compressor can't duck itself"));
+                    if !out.sidechain_cycles.iter().any(|(a, b)| a == &src_name && b == &src_name) {
+                        out.sidechain_cycles.push((src_name.clone(), src_name.clone()));
+                    }
+                    return false;
+                }
+                *sc = target_id;
+                deps.push((src_id, target_id));
+                true
+            });
+        }
+        if !deps.is_empty() {
+            let mut nodes: Vec<u64> = audio_index.iter().map(|(id, _)| *id).collect();
+            nodes.sort_unstable();
+            let mut order = Vec::new();
+            let mut broken = Vec::new();
+            let mut scratch = crate::mix::TopoScratch::default();
+            crate::mix::resolve_sidechain_order(&nodes, &deps, &mut order, &mut broken, &mut scratch);
+            for &(src_id, key_id) in &broken {
+                let src_name = audio_index.iter().find(|(id, _)| *id == src_id).map(|(_, n)| n.clone());
+                let key_name = audio_index.iter().find(|(id, _)| *id == key_id).map(|(_, n)| n.clone());
+                if let (Some(src_name), Some(key_name)) = (src_name, key_name) {
+                    out.skipped.push(format!("{src_name}: sidechain loop with \"{key_name}\" was broken"));
+                    if !out.sidechain_cycles.iter().any(|(a, b)| a == &src_name && b == &key_name) {
+                        out.sidechain_cycles.push((src_name, key_name));
+                    }
+                }
+                // Silence the exact edge reported in `sidechain_cycles` (ID 0 is never a valid
+                // source ID, so `Mixer` routes `KeyRoute::Silence` regardless of live ID order).
+                if let Some(src) = out.sources.iter_mut().find(|s| s.id == src_id) {
+                    for eff in &mut src.sound_effects {
+                        if let AudioEffect::Compressor { sidechain: Some(sc), .. } = eff
+                            && *sc == key_id
+                        {
+                            *sc = 0;
+                        }
+                    }
+                }
+            }
         }
     }
     // Clones show their source's picture (no second copy of it, no second sound) with their own
@@ -1160,6 +1484,21 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
             };
             si.visible = it.get("visible").and_then(Value::as_bool).unwrap_or(true);
             si.item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
+            // Where it is shown: the stream, the recording or both (the default, and any collection
+            // from before it existed).
+            si.show = crate::engine::Show::from_name(it.get("ferrocast_show").and_then(Value::as_str).unwrap_or(""));
+            if let Some(override_filters) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                let mut override_effects = Vec::new();
+                parse_video_effects(
+                    override_filters,
+                    &format!("{name}#{}", si.item_id),
+                    &mut next_id,
+                    &mut override_effects,
+                    &mut out,
+                );
+                si.effects = override_effects;
+                si.own_effects = true;
+            }
             si.filter = Filter::from_name(it.get("scale_filter").and_then(Value::as_str).unwrap_or("disable"));
             si.blend = Blend::from_name(it.get("blend_type").and_then(Value::as_str).unwrap_or("normal"));
             items.push(si);
@@ -1183,12 +1522,91 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
     out
 }
 
+/// Whether this OBS source (as the collection document has it) makes sound the mixer hears: what
+/// the import decides per kind and platform (a Windows display capture or a camera has none, a
+/// Mac display capture plays what the Mac plays). A source the import can't build yet (no file or
+/// app picked) counts as having sound, so it can still be picked.
+#[must_use]
+pub fn source_has_sound(source: &Value, canvas: (u32, u32)) -> bool {
+    let id = source.get("versioned_id").or_else(|| source.get("id")).and_then(Value::as_str).unwrap_or_default();
+    let settings = source.get("settings").cloned().unwrap_or(Value::Null);
+    kind_from(id, &settings, canvas, &[]).map_or(true, |(_, sound)| sound)
+}
+
+/// Detects sidechain compressor cycles directly from an OBS scene collection document, using the
+/// same deterministic cycle-breaking order as [`crate::mix::Mixer`]. Returns `(source, key)` pairs
+/// whose sidechain edge is severed to silence.
+pub fn sidechain_cycles(doc: &Value) -> Vec<(String, String)> {
+    // Borrowed, not cloned: the Studio asks on every stats poll (about once a second).
+    let sources: &[Value] = doc.get("sources").and_then(Value::as_array).map_or(&[], Vec::as_slice);
+    let channels = CHANNELS.iter().filter_map(|k| doc.get(*k));
+    let mut entries: Vec<(u64, String, Option<String>, Vec<String>)> = Vec::new();
+    let mut next_id = 1u64;
+    for s in sources.iter().chain(channels) {
+        let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
+        if id == "scene" || id == "group" {
+            continue;
+        }
+        let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
+        let mut keys = Vec::new();
+        for flt in s.get("filters").and_then(Value::as_array).into_iter().flatten() {
+            if flt.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
+            if kind == "compressor_filter"
+                && let Some(fs) = flt.get("settings")
+                && let Some(sc) = sidechain_source(fs)
+            {
+                keys.push(sc.to_string());
+            }
+        }
+        entries.push((next_id, name, uuid, keys));
+        next_id += 1;
+    }
+    let mut deps: Vec<(u64, u64)> = Vec::new();
+    for (src_id, _, _, keys) in &entries {
+        for sc_ref in keys {
+            let target = entries.iter().find(|(_, n, _, _)| n == sc_ref).map(|(id, ..)| *id).or_else(|| {
+                entries
+                    .iter()
+                    .find(|(_, _, u, _)| u.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(sc_ref)))
+                    .map(|(id, ..)| *id)
+            });
+            if let Some(tid) = target {
+                deps.push((*src_id, tid));
+            }
+        }
+    }
+    if deps.is_empty() {
+        return Vec::new();
+    }
+    let nodes: Vec<u64> = entries.iter().map(|(id, ..)| *id).collect();
+    let mut order = Vec::new();
+    let mut broken = Vec::new();
+    let mut scratch = crate::mix::TopoScratch::default();
+    crate::mix::resolve_sidechain_order(&nodes, &deps, &mut order, &mut broken, &mut scratch);
+    broken
+        .into_iter()
+        .filter_map(|(u, v)| {
+            let sn = entries.iter().find(|(id, ..)| *id == u).map(|(_, n, ..)| n.clone())?;
+            let kn = entries.iter().find(|(id, ..)| *id == v).map(|(_, n, ..)| n.clone())?;
+            Some((sn, kn))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
 
-    /// OBS's RNNoise ignores the level: held gentle here (24 dB) however deep it's set; Speex
-    /// keeps its level (19 Nov, live: RNNoise at -48 became 48 dB of noise removal, a muffled
-    /// voice).
+    /// OBS's RNNoise stays gentle (held to 24 dB, strength 40: it ignores the level in OBS, and 48
+    /// dB of it made a voice muffled, 19 Nov); Speex keeps its level at 0.6 dB a step, as every
+    /// saved scene has always meant (-30 dB is strength 50, 30 dB); 0 dB turns it off completely
+    /// (zero delay, not reported as skipped). Nothing a saved scene says changes meaning.
     #[test]
     fn obs_rnnoise_stays_gentle_and_speex_keeps_its_level() {
         use super::{AudioEffect, audio_effect_from};
@@ -1199,16 +1617,65 @@ mod tests {
             Some(AudioEffect::Denoise { strength }) => strength,
             other => panic!("{other:?}"),
         };
-        assert_eq!(at("rnnoise", -48), 40, "24 dB");
-        assert_eq!(at("rnnoise", -12), 20, "less than that stays");
-        assert_eq!(at("speex", -48), 80, "48 dB");
+        let rn = |db: i64| {
+            audio_effect_from(
+                "noise_suppress_filter_v2",
+                &serde_json::json!({ "method": "rnnoise", "suppress_level": db }),
+            )
+        };
+        assert_eq!(rn(-48), Some(AudioEffect::Rnnoise { amount: 100 }), "RNNoise has its own engine");
+        assert_eq!(rn(-12), Some(AudioEffect::Rnnoise { amount: 100 }), "OBS ignores the level for it");
+        assert_eq!(at("speex", -48), 80);
+        assert_eq!(at("speex", -30), 50, "30 dB, as saved");
+        assert_eq!(at("speex", -12), 20);
+        assert_eq!(at("speex", -60), 100);
+        // Omitted suppress_level on RNNoise (OBS hides it): the default, 24 dB.
+        assert_eq!(
+            audio_effect_from("noise_suppress_filter_v2", &serde_json::json!({ "method": "rnnoise" })),
+            Some(AudioEffect::Rnnoise { amount: 100 })
+        );
+        // 0 dB turns noise suppression off completely (no filter, no 82.7 ms delay).
+        assert_eq!(
+            audio_effect_from(
+                "noise_suppress_filter_v2",
+                &serde_json::json!({ "method": "rnnoise", "suppress_level": 0 })
+            ),
+            None
+        );
+        assert_eq!(audio_effect_from("ferrocast_deepfilter", &serde_json::json!({ "strength": 0 })), None);
+        // A saved strength is taken as it is; a missing one is the default.
+        assert_eq!(
+            audio_effect_from("ferrocast_deepfilter", &serde_json::json!({ "strength": 50 })),
+            Some(AudioEffect::Denoise { strength: 50 })
+        );
+        assert_eq!(
+            audio_effect_from("ferrocast_deepfilter", &serde_json::json!({})),
+            Some(AudioEffect::Denoise { strength: 40 })
+        );
+        // Speex: every integer step from -1 to -60 dB maps strictly monotonically (no dead zone).
+        let mut prev = 0u32;
+        for db in 1..=60 {
+            let s = at("speex", -db);
+            assert!(s > prev, "speex: -{db} dB mapped to {s}, same as previous {prev}");
+            prev = s;
+        }
         // No method saved: the older filter is Speex (its level kept), v2 RNNoise (CodeRabbit).
         let none = |kind: &str| match audio_effect_from(kind, &serde_json::json!({ "suppress_level": -48 })) {
             Some(AudioEffect::Denoise { strength }) => strength,
             other => panic!("{other:?}"),
         };
         assert_eq!(none("noise_suppress_filter"), 80);
-        assert_eq!(none("noise_suppress_filter_v2"), 40);
+        assert_eq!(
+            audio_effect_from("noise_suppress_filter_v2", &serde_json::json!({ "suppress_level": -48 })),
+            Some(AudioEffect::Rnnoise { amount: 100 })
+        );
+        // Bypassed 0 dB filter is not reported in `skipped`.
+        let doc = serde_json::json!({ "sources": [
+            { "id": "color_source", "name": "S", "settings": {},
+              "filters": [{ "id": "noise_suppress_filter_v2", "name": "Off", "settings": { "method": "rnnoise", "suppress_level": 0 } }] }
+        ] });
+        let got = super::import(&doc, (64, 64));
+        assert!(got.skipped.is_empty(), "0 dB filter must not appear in skipped: {:?}", got.skipped);
     }
 
     /// A screen capture switched to Window or App with nothing picked yet keeps what it ran
@@ -1364,11 +1831,48 @@ mod tests {
         );
         assert!(matches!(kind(json!({ "local_file": "" })), Ok(SourceKind::Color { .. })));
         match kind(json!({ "local_file": "/rec/Replay.mp4", "looping": true })) {
-            Ok(SourceKind::Media { path, looping }) => {
+            Ok(SourceKind::Media { path, options }) => {
                 assert_eq!(path, std::path::PathBuf::from("/rec/Replay.mp4"));
-                assert!(!looping, "a replay plays once");
+                assert!(!options.looping, "a replay plays once");
             }
             other => panic!("a media file: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ffmpeg_source_reads_all_five_media_options() {
+        let kind = |set: Value| kind_from("ffmpeg_source", &set, (1920, 1080), &[]).map(|k| k.0);
+        // OBS defaults when omitted.
+        match kind(json!({ "local_file": "/a.mp4" })) {
+            Ok(SourceKind::Media { options, .. }) => {
+                assert!(!options.looping);
+                assert!(options.restart_on_activate);
+                assert!(!options.close_when_inactive);
+                assert!(options.clear_on_media_end);
+                assert_eq!(options.speed_percent, 100);
+                assert!(options.hw_decode);
+            }
+            other => panic!("expected Media: {other:?}"),
+        }
+        // Explicit overrides and speed clamping.
+        match kind(json!({
+            "local_file": "/b.mkv",
+            "looping": true,
+            "restart_on_activate": false,
+            "close_when_inactive": true,
+            "clear_on_media_end": false,
+            "speed_percent": 350,
+            "hw_decode": false,
+        })) {
+            Ok(SourceKind::Media { options, .. }) => {
+                assert!(options.looping);
+                assert!(!options.restart_on_activate);
+                assert!(options.close_when_inactive);
+                assert!(!options.clear_on_media_end);
+                assert_eq!(options.speed_percent, 200);
+                assert!(!options.hw_decode);
+            }
+            other => panic!("expected Media: {other:?}"),
         }
     }
 
@@ -1434,6 +1938,27 @@ mod tests {
 
     fn main_items(im: &Imported) -> Vec<SceneItem> {
         im.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default()
+    }
+
+    /// Where an item is shown (`ferrocast_show`) comes over with it; an item without it, a
+    /// collection from before, is shown everywhere as it was.
+    #[test]
+    fn an_item_keeps_where_it_is_shown() {
+        let sources = vec![
+            json!({ "id": "color_source_v3", "name": "Red", "settings": { "width": 64, "height": 36, "color": 4278190335u32 } }),
+            json!({ "id": "scene", "name": "Main", "settings": { "items": [
+                { "name": "Red", "id": 1 },
+                { "name": "Red", "id": 2, "ferrocast_show": "stream" },
+                { "name": "Red", "id": 3, "ferrocast_show": "recording" },
+                { "name": "Red", "id": 4, "ferrocast_show": "both" },
+                { "name": "Red", "id": 5, "ferrocast_show": "everywhere" },
+                { "name": "Red", "id": 6, "ferrocast_show": 7 },
+            ] } }),
+        ];
+        let im = import(&json!({ "current_program_scene": "Main", "sources": sources }), (1920, 1080));
+        let shown: Vec<crate::engine::Show> = main_items(&im).iter().map(|i| i.show).collect();
+        use crate::engine::Show::{Both, Recording, Stream};
+        assert_eq!(shown, [Both, Stream, Recording, Both, Both, Both]);
     }
 
     #[test]
@@ -1572,6 +2097,20 @@ mod tests {
         assert_eq!(uuid(kind(json!({ "type": 0, "display": 9 }))), (9, None));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_monitor_capture_keeps_its_monitor_id() {
+        let kind = |set: Value| kind_from("monitor_capture", &set, (1920, 1080), &[]).map(|k| k.0);
+        let got = |k: Result<SourceKind, String>| match k {
+            Ok(SourceKind::Screen { display, uuid, .. }) => (display, uuid),
+            other => panic!("{other:?}"),
+        };
+        let id = r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}";
+        assert_eq!(got(kind(json!({ "monitor": 1, "monitor_id": id }))), (1, Some(id.into())));
+        assert_eq!(got(kind(json!({ "monitor_id": id }))), (u32::MAX, Some(id.into())));
+        assert_eq!(got(kind(json!({ "monitor": 0, "monitor_id": "DUMMY" }))), (0, None));
+    }
+
     /// Every method of a Mac screen capture brings its sound, as OBS's: a window its app's,
     /// an app its own, a screen what the Mac plays (owner, 12 Nov: switched from Window to
     /// Screen, the source went silent).
@@ -1646,7 +2185,7 @@ mod tests {
                   "settings": { "color": 0xFF00_80FFu32 },
                   "filters": [{ "id": "sharpness_filter", "versioned_id": "sharpness_filter_v2", "settings": {} },
                               { "id": "gain_filter", "settings": { "db": 3.0 } },
-                              { "id": "gpu_delay", "settings": {} }] },
+                              { "id": "gpu_delay", "settings": { "delay_ms": 100 } }] },
                 { "id": "browser_source", "name": "Web", "settings": {} },
                 { "id": "scene", "name": "Two", "settings": { "items": [
                     { "name": "One", "pos": { "x": 10.0, "y": 20.0 }, "scale": { "x": 0.5, "y": 0.5 }, "visible": true } ] } },
@@ -1661,20 +2200,46 @@ mod tests {
         assert_eq!(got.sources.len(), 2, "the web page comes over, for the app to render");
         assert_eq!(got.sources[0].kind, SourceKind::Color { width: 640, height: 360, rgba: [0xFF, 0x80, 0, 0xFF] });
         assert_eq!(got.sources[1].kind, SourceKind::Fed { width: 800, height: 600 });
-        assert!(got.skipped.iter().any(|s| s.contains("gpu_delay")));
+        assert!(!got.skipped.iter().any(|s| s.contains("gpu_delay")), "Render Delay comes over now");
         let names: Vec<&str> = got.scenes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["One", "Two"]);
         let back = &got.scenes[0].1[0];
         assert!(!back.visible);
         assert_eq!(back.blend, Blend::Screen);
         assert_eq!(back.filter, Filter::Lanczos);
-        assert_eq!(back.effects.len(), 1);
+        assert_eq!(back.effects.len(), 2, "sharpen, and the render delay");
         assert_eq!((back.placement.rotation, back.placement.bounds, back.placement.crop[0]), (30.0, Bounds::Fit, 4));
         assert_eq!(got.scenes[0].1.len(), 2, "the web page's item stays (its pictures come from the app)");
         let nested = &got.scenes[1].1[0];
         assert_eq!(nested.scene.as_deref(), Some("One"));
         assert_eq!((nested.placement.x, nested.placement.scale_x), (10.0, 0.5));
         assert_eq!(nested.group, None);
+    }
+
+    #[test]
+    fn the_delay_filters_come_over_with_their_times() {
+        let doc = json!({ "sources": [
+            { "id": "color_source", "name": "Cam", "settings": {},
+              "filters": [{ "id": "gpu_delay", "settings": { "delay_ms": 200 } },
+                          { "id": "async_delay_filter", "settings": { "delay_ms": 1500 } },
+                          { "id": "gpu_delay", "settings": { "delay_ms": 9999 } }] },
+            { "id": "scene", "name": "S", "settings": { "items": [{ "name": "Cam" }] } }] });
+        let got = import(&doc, (64, 64));
+        assert!(got.skipped.is_empty(), "nothing left out: {:?}", got.skipped);
+        let e = &got.scenes[0].1[0].effects;
+        assert_eq!(
+            e[..],
+            [
+                Effect::Delay { ms: 200, audio: false },
+                Effect::Delay { ms: 1500, audio: true },
+                Effect::Delay { ms: 500, audio: false },
+            ],
+            "Render Delay holds pictures only and stops at 500 ms; the async one takes the sound too"
+        );
+        assert_eq!(
+            effect_from("ferrocast_video_delay", &json!({ "delay_ms": 30000, "audio": true })),
+            Some(Effect::Delay { ms: 20_000, audio: true })
+        );
     }
 
     #[test]
@@ -1711,6 +2276,33 @@ mod tests {
         assert!(got.skipped.iter().any(|s| s.starts_with("One app")));
     }
 
+    /// A web page's sound is in the mixer only with "Control audio" on (`reroute_audio`), as in
+    /// OBS: without it the page is a picture.
+    #[test]
+    fn a_web_page_has_sound_only_with_its_audio_controlled() {
+        let page = |settings: Value| json!({ "id": "browser_source", "settings": settings });
+        assert!(!source_has_sound(&page(json!({ "url": "http://x" })), (1920, 1080)));
+        assert!(!source_has_sound(&page(json!({ "reroute_audio": false })), (1920, 1080)));
+        assert!(source_has_sound(&page(json!({ "reroute_audio": true })), (1920, 1080)));
+    }
+
+    /// OBS's per-source push-to-talk and push-to-mute, with their release delays, come over: on
+    /// only when its switch is on, the delay in ms (at most 5 s), none when it is off or absent.
+    #[test]
+    fn push_to_talk_and_push_to_mute_come_over_with_their_delays() {
+        use super::push_gate;
+        let s = json!({ "push-to-talk": true, "push-to-talk-delay": 250, "push-to-mute": false,
+            "push-to-mute-delay": 400 });
+        assert_eq!(push_gate(&s, "push-to-talk"), Some(250));
+        assert_eq!(push_gate(&s, "push-to-mute"), None, "its switch is off: the delay alone means nothing");
+        assert_eq!(push_gate(&json!({}), "push-to-talk"), None);
+        assert_eq!(push_gate(&json!({ "push-to-mute": true }), "push-to-mute"), Some(0), "no delay saved");
+        assert_eq!(
+            push_gate(&json!({ "push-to-mute": true, "push-to-mute-delay": 999_999 }), "push-to-mute"),
+            Some(5000)
+        );
+    }
+
     #[test]
     fn groups_come_over_once() {
         let doc = json!({ "sources": [
@@ -1725,6 +2317,21 @@ mod tests {
         let main = &got.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default();
         assert_eq!(main.len(), 1, "the backup copy is left out");
         assert_eq!((main[0].scene.as_deref(), main[0].group), (Some("Pair"), Some((120, 80))));
+    }
+
+    /// OBS's RNNoise next to Strong noise removal on one mic: only the strong one stays.
+    #[test]
+    fn rnnoise_next_to_strong_removal_runs_once() {
+        let doc = serde_json::json!({ "sources": [
+            { "id": "coreaudio_input_capture", "name": "Mic", "settings": { "device_id": "default" },
+              "filters": [
+                { "id": "noise_suppress_filter_v2", "name": "A", "settings": { "method": "rnnoise" } },
+                { "id": "ferrocast_deepfilter", "name": "B", "settings": { "strength": 40 } } ] },
+            { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Mic" }] } } ] });
+        let got = import(&doc, (1920, 1080));
+        // The fixture is a Mac microphone; elsewhere it isn't imported (as the test above).
+        let Some(mic) = got.sources.iter().find(|s| s.name == "Mic") else { return };
+        assert_eq!(mic.sound_effects, vec![AudioEffect::Denoise { strength: 40 }]);
     }
 
     /// Noise removal twice on one mic runs once, at the stronger setting.
@@ -1742,5 +2349,766 @@ mod tests {
         let denoise: Vec<_> = mic.sound_effects.iter().filter(|e| matches!(e, AudioEffect::Denoise { .. })).collect();
         assert_eq!(denoise.len(), 1, "{:?}", mic.sound_effects);
         assert_eq!(mic.sound_effects.len(), 2, "the gain stays");
+    }
+
+    /// An OBS compressor with `sidechain_source` imports as a sidechained `AudioEffect::Compressor`
+    /// keyed by the target source ID (by name or UUID, even when the mic sits later in
+    /// `AuxAudioDevice1`) instead of the global `level::Ducker`, while `"none"` / `""` stay a
+    /// self-compressor, missing targets and self-loops are skipped (never self-compressing), and
+    /// A↔B cycles are detected and broken deterministically.
+    #[test]
+    fn source_has_sound_follows_the_import() {
+        let has = |v: serde_json::Value| source_has_sound(&v, (1920, 1080));
+        assert!(has(json!({ "id": "ffmpeg_source", "settings": { "local_file": "/a.mp4" } })));
+        // A source the import can't build yet can still be picked.
+        assert!(has(json!({ "id": "ffmpeg_source", "settings": {} })));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                !has(json!({ "id": "av_capture_input", "settings": { "device": "cam" } })),
+                "a camera has no sound"
+            );
+            assert!(has(json!({ "id": "screen_capture", "settings": { "type": 0 } })), "a Mac display plays sound");
+        }
+    }
+
+    #[test]
+    fn sidechain_compressor_imports_as_sidechain_effect_not_global_ducker() {
+        // Direct unit check on audio_effect_from.
+        assert_eq!(
+            audio_effect_from(
+                "compressor_filter",
+                &json!({ "ratio": 20.0, "threshold": -32.0, "sidechain_source": "Mic/Aux" }),
+            ),
+            None,
+            "sidechained compressor must never become a self-compressor"
+        );
+        for no_sc in [
+            json!({ "ratio": 4.0 }),
+            json!({ "ratio": 4.0, "sidechain_source": "" }),
+            json!({ "ratio": 4.0, "sidechain_source": "none" }),
+        ] {
+            assert!(
+                matches!(
+                    audio_effect_from("compressor_filter", &no_sc),
+                    Some(AudioEffect::Compressor { sidechain: None, .. })
+                ),
+                "normal compressor stays: {no_sc}"
+            );
+        }
+
+        // Full OBS collection import (works on every OS via `ffmpeg_source` media audio).
+        let mic_uuid = "11111111-2222-3333-4444-555555555555";
+        let doc = json!({
+            "sources": [
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Game Audio",
+                    "settings": { "local_file": "/game.mp4" },
+                    "filters": [
+                        { "id": "gain_filter", "name": "Pre", "settings": { "db": 0.0 } },
+                        {
+                            "id": "compressor_filter",
+                            "name": "Lower when I talk",
+                            "settings": {
+                                "ratio": 20.0,
+                                "threshold": -32.0,
+                                "attack_time": 10,
+                                "release_time": 600,
+                                "output_gain": 0.0,
+                                "sidechain_source": "Mic/Aux"
+                            }
+                        },
+                        { "id": "limiter_filter", "name": "Post", "settings": { "threshold": -1.0 } }
+                    ]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Music By UUID",
+                    "settings": { "local_file": "/uuid-music.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "Duck by UUID",
+                        "settings": {
+                            "ratio": 10.0,
+                            "threshold": -24.0,
+                            "attack_time": 6,
+                            "release_time": 200,
+                            "sidechain_source": "11111111-2222-3333-4444-555555555555"
+                        }
+                    }]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Music Missing SC",
+                    "settings": { "local_file": "/music.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "Broken Duck",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "DeletedMic" }
+                    }]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Self Duck",
+                    "settings": { "local_file": "/self.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "Loop",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "Self Duck" }
+                    }]
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": {
+                        "items": [
+                            { "name": "Game Audio" },
+                            { "name": "Music By UUID" },
+                            { "name": "Music Missing SC" },
+                            { "name": "Self Duck" }
+                        ]
+                    }
+                }
+            ],
+            "AuxAudioDevice1": {
+                "id": "ffmpeg_source",
+                "name": "Mic/Aux",
+                "uuid": mic_uuid,
+                "settings": { "local_file": "/mic.mp4" }
+            }
+        });
+        let got = import(&doc, (1920, 1080));
+        let game = got.sources.iter().find(|s| s.name == "Game Audio").expect("game missing");
+        let uuid_music = got.sources.iter().find(|s| s.name == "Music By UUID").expect("uuid music missing");
+        let mic = got.sources.iter().find(|s| s.name == "Mic/Aux").expect("mic missing");
+        let broken = got.sources.iter().find(|s| s.name == "Music Missing SC").expect("broken missing");
+        let self_duck = got.sources.iter().find(|s| s.name == "Self Duck").expect("self duck missing");
+
+        assert!(got.ducking.is_none(), "OBS sidechain must NOT go to global Ducker: {:?}", got.ducking);
+        assert_eq!(
+            game.sound_effects,
+            vec![
+                AudioEffect::Gain { db: 0.0 },
+                AudioEffect::Compressor {
+                    ratio: 20.0,
+                    threshold_db: -32.0,
+                    attack_ms: 10.0,
+                    release_ms: 600.0,
+                    output_db: 0.0,
+                    sidechain: Some(mic.id),
+                },
+                AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
+            ],
+            "sidechained compressor keeps exact OBS parameters and filter chain position"
+        );
+        assert_eq!(
+            uuid_music.sound_effects,
+            vec![AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 6.0,
+                release_ms: 200.0,
+                output_db: 0.0,
+                sidechain: Some(mic.id),
+            }],
+            "sidechain_source resolves source UUIDs too"
+        );
+        assert!(
+            broken.sound_effects.is_empty(),
+            "missing sidechain must NOT self-compress: {:?}",
+            broken.sound_effects
+        );
+        assert!(
+            self_duck.sound_effects.is_empty(),
+            "self-sidechain must NOT self-compress: {:?}",
+            self_duck.sound_effects
+        );
+        assert!(
+            got.skipped.iter().any(|s| s.contains("DeletedMic")),
+            "missing sidechain reported in skipped: {:?}",
+            got.skipped
+        );
+        assert!(
+            got.sidechain_cycles.contains(&("Self Duck".into(), "Self Duck".into())),
+            "self-loop reported in sidechain_cycles: {:?}",
+            got.sidechain_cycles
+        );
+
+        // Behavioral check through Mixer: loud Game Audio with silent Mic is NOT self-compressed,
+        // and ducks cleanly via OBS sidechain compression once Mic speaks (without global Ducker).
+        let rate = 48_000u32;
+        let mut m = crate::mix::Mixer::new(rate, 0);
+        m.set(game.id, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(mic.id, SourceSettings { tracks: 0b10, ..Default::default() });
+        m.set_effects(game.id, &game.sound_effects);
+        let t0 = 1_000_000_000u64;
+        m.mix_until(t0);
+        let secs = 2 * rate as usize;
+        // Loud game audio (0.5 amplitude = -6 dBFS, way over -32 dB threshold).
+        m.push(game.id, &vec![0.5f32; secs * 2], 2, rate, t0);
+        // Mic silent for first 1 s, then talks at 0.3 amplitude for second 1 s.
+        let mut mic_pcm = vec![0.0f32; secs * 2];
+        for i in (rate as usize)..secs {
+            let v = (i as f32 * 300.0 * std::f32::consts::TAU / rate as f32).sin() * 0.3;
+            mic_pcm[i * 2] = v;
+            mic_pcm[i * 2 + 1] = v;
+        }
+        m.push(mic.id, &mic_pcm, 2, rate, t0);
+        let blocks = m.mix_until(t0 + secs as u64 * 1_000_000_000 / u64::from(rate));
+        let quiet_mic_block = &blocks[blocks.len() / 4];
+        let talking_mic_block = &blocks[blocks.len() * 3 / 4];
+        assert!(
+            (quiet_mic_block.tracks[0][0] - 0.5).abs() < 1e-4,
+            "game audio untouched when mic silent (not self-compressed): {}",
+            quiet_mic_block.tracks[0][0]
+        );
+        assert!(
+            talking_mic_block.tracks[0][0] < 0.1,
+            "game audio ducked when mic speaks: {}",
+            talking_mic_block.tracks[0][0]
+        );
+
+        // Mutual A <-> B cycle is detected and broken deterministically in both import() and sidechain_cycles().
+        let cycle_doc = json!({
+            "sources": [
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Music",
+                    "settings": { "local_file": "/a.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "DuckA",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "Voice" }
+                    }]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Voice",
+                    "settings": { "local_file": "/b.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "DuckB",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "Music" }
+                    }]
+                },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Music" }, { "name": "Voice" }] } }
+            ]
+        });
+        let cyc = import(&cycle_doc, (1920, 1080));
+        assert_eq!(cyc.sidechain_cycles, vec![("Voice".into(), "Music".into())]);
+        assert!(cyc.skipped.iter().any(|s| s.contains("Voice") && s.contains("Music")), "{:?}", cyc.skipped);
+        assert_eq!(sidechain_cycles(&cycle_doc), vec![("Voice".into(), "Music".into())]);
+    }
+
+    /// Every OBS audio filter JSON imports into the exact `AudioEffect` parameters in OBS units
+    /// (ms, dB, ratio), with OBS defaults when omitted and OBS range clamping on extreme values.
+    #[test]
+    fn obs_audio_filters_import_exact_units_defaults_and_ranges() {
+        let empty = json!({});
+
+        // Defaults (omitted settings match OBS C defaults verbatim).
+        assert_eq!(audio_effect_from("gain_filter", &empty), Some(AudioEffect::Gain { db: 0.0 }));
+        assert_eq!(audio_effect_from("invert_polarity_filter", &empty), Some(AudioEffect::InvertPolarity));
+        assert_eq!(
+            audio_effect_from("noise_gate_filter", &empty),
+            Some(AudioEffect::NoiseGate {
+                open_db: -26.0,
+                close_db: -32.0,
+                attack_ms: 25.0,
+                hold_ms: 200.0,
+                release_ms: 150.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("compressor_filter", &empty),
+            Some(AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -18.0,
+                attack_ms: 6.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: None,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("limiter_filter", &empty),
+            Some(AudioEffect::Limiter { threshold_db: -6.0, release_ms: 60.0 })
+        );
+        assert_eq!(
+            audio_effect_from("expander_filter", &empty),
+            Some(AudioEffect::Expander {
+                ratio: 2.0,
+                threshold_db: -40.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                rms: true,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("expander_filter", &json!({ "presets": "gate" })),
+            Some(AudioEffect::Expander {
+                ratio: 10.0,
+                threshold_db: -40.0,
+                attack_ms: 10.0,
+                release_ms: 125.0,
+                output_db: 0.0,
+                rms: true,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("upward_compressor_filter", &empty),
+            Some(AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                knee_db: 10.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("basic_eq_filter", &empty),
+            Some(AudioEffect::Eq3 { low_db: 0.0, mid_db: 0.0, high_db: 0.0 })
+        );
+
+        // Explicit OBS settings preserve units cleanly (dB, ms, ratio, peak detector).
+        assert_eq!(audio_effect_from("gain_filter", &json!({ "db": 6.5 })), Some(AudioEffect::Gain { db: 6.5 }));
+        assert_eq!(
+            audio_effect_from(
+                "noise_gate_filter",
+                &json!({ "open_threshold": -24.5, "close_threshold": -28.0, "attack_time": 12, "hold_time": 180, "release_time": 90 })
+            ),
+            Some(AudioEffect::NoiseGate {
+                open_db: -24.5,
+                close_db: -28.0,
+                attack_ms: 12.0,
+                hold_ms: 180.0,
+                release_ms: 90.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "compressor_filter",
+                &json!({ "ratio": 4.5, "threshold": -22.0, "attack_time": 15, "release_time": 120, "output_gain": 3.5 })
+            ),
+            Some(AudioEffect::Compressor {
+                ratio: 4.5,
+                threshold_db: -22.0,
+                attack_ms: 15.0,
+                release_ms: 120.0,
+                output_db: 3.5,
+                sidechain: None,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("limiter_filter", &json!({ "threshold": -1.0, "release_time": 80 })),
+            Some(AudioEffect::Limiter { threshold_db: -1.0, release_ms: 80.0 })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "expander_filter",
+                &json!({ "presets": "expander", "ratio": 3.5, "threshold": -35.0, "attack_time": 8, "release_time": 90, "output_gain": 1.5, "detector": "Peak" })
+            ),
+            Some(AudioEffect::Expander {
+                ratio: 3.5,
+                threshold_db: -35.0,
+                attack_ms: 8.0,
+                release_ms: 90.0,
+                output_db: 1.5,
+                rms: false,
+            })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "upward_compressor_filter",
+                &json!({ "ratio": 0.35, "threshold": -25.0, "attack_time": 15, "release_time": 75, "output_gain": -2.0, "knee_width": 6.0 })
+            ),
+            Some(AudioEffect::UpwardCompressor {
+                ratio: 0.35,
+                threshold_db: -25.0,
+                attack_ms: 15.0,
+                release_ms: 75.0,
+                output_db: -2.0,
+                knee_db: 6.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("basic_eq_filter", &json!({ "low": 4.0, "mid": -2.5, "high": 3.0 })),
+            Some(AudioEffect::Eq3 { low_db: 4.0, mid_db: -2.5, high_db: 3.0 })
+        );
+
+        // Out-of-range hand-edited values clamp to OBS bounds.
+        assert_eq!(audio_effect_from("gain_filter", &json!({ "db": 99.0 })), Some(AudioEffect::Gain { db: 30.0 }));
+        assert_eq!(audio_effect_from("gain_filter", &json!({ "db": -99.0 })), Some(AudioEffect::Gain { db: -30.0 }));
+        assert_eq!(
+            audio_effect_from("basic_eq_filter", &json!({ "low": -50.0, "mid": 0.0, "high": 50.0 })),
+            Some(AudioEffect::Eq3 { low_db: -20.0, mid_db: 0.0, high_db: 20.0 })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "compressor_filter",
+                &json!({ "ratio": 100.0, "threshold": 12.0, "attack_time": 9000, "release_time": 9000, "output_gain": 60.0 })
+            ),
+            Some(AudioEffect::Compressor {
+                ratio: 32.0,
+                threshold_db: 0.0,
+                attack_ms: 500.0,
+                release_ms: 1000.0,
+                output_db: 32.0,
+                sidechain: None,
+            })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "expander_filter",
+                &json!({ "ratio": 50.0, "threshold": -99.0, "attack_time": 500, "release_time": 5000, "output_gain": -50.0 })
+            ),
+            Some(AudioEffect::Expander {
+                ratio: 20.0,
+                threshold_db: -60.0,
+                attack_ms: 100.0,
+                release_ms: 1000.0,
+                output_db: -32.0,
+                rms: true,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("upward_compressor_filter", &json!({ "ratio": 2.0, "knee_width": 99.0 })),
+            Some(AudioEffect::UpwardCompressor {
+                ratio: 1.0,
+                threshold_db: -20.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                knee_db: 20.0,
+            })
+        );
+    }
+
+    /// Importing an OBS scene collection with a full voice chain (gain +6, gate -32/-26,
+    /// compressor 10:1 @ -18, limiter -1) yields identical filter order, parameters, and audio output.
+    #[test]
+    fn obs_voice_chain_json_import_produces_same_sound_as_obs() {
+        let doc = json!({
+            "sources": [
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Mic",
+                    "settings": { "local_file": "/mic.wav" },
+                    "filters": [
+                        { "id": "gain_filter", "name": "Gain", "enabled": true, "settings": { "db": 6.0 } },
+                        {
+                            "id": "noise_gate_filter",
+                            "name": "Gate",
+                            "enabled": true,
+                            "settings": {
+                                "open_threshold": -26.0,
+                                "close_threshold": -32.0,
+                                "attack_time": 25,
+                                "hold_time": 200,
+                                "release_time": 150
+                            }
+                        },
+                        { "id": "invert_polarity_filter", "name": "Bypassed", "enabled": false, "settings": {} },
+                        {
+                            "id": "compressor_filter",
+                            "name": "Comp",
+                            "enabled": true,
+                            "settings": {
+                                "ratio": 10.0,
+                                "threshold": -18.0,
+                                "attack_time": 6,
+                                "release_time": 60,
+                                "output_gain": 0.0
+                            }
+                        },
+                        { "id": "limiter_filter", "name": "Lim", "enabled": true, "settings": { "threshold": -1.0, "release_time": 60 } }
+                    ]
+                },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Mic" }] } }
+            ]
+        });
+        let got = import(&doc, (1920, 1080));
+        let mic = got.sources.iter().find(|s| s.name == "Mic").expect("Mic imported");
+        let expected = [
+            AudioEffect::Gain { db: 6.0 },
+            AudioEffect::NoiseGate {
+                open_db: -26.0,
+                close_db: -32.0,
+                attack_ms: 25.0,
+                hold_ms: 200.0,
+                release_ms: 150.0,
+            },
+            AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -18.0,
+                attack_ms: 6.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: None,
+            },
+            AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
+        ];
+        assert_eq!(mic.sound_effects, expected, "imported chain must match OBS order and skip disabled filters");
+
+        // Run a dynamic signal through imported chain vs direct chain and confirm bit-identical audio.
+        let mut sig = vec![0.0f32; 48_000];
+        for (i, v) in sig.iter_mut().enumerate().take(24_000) {
+            *v = 0.4 * (std::f32::consts::TAU * 300.0 * i as f32 / 48_000.0).sin();
+        }
+        let run_chain = |effects: &[AudioEffect]| {
+            let mut fs: Vec<_> = effects.iter().map(|&e| crate::afx::AudioFilter::new(e, 48_000)).collect();
+            let (mut l, mut r) = (sig.clone(), sig.clone());
+            for (a, b) in l.chunks_mut(480).zip(r.chunks_mut(480)) {
+                for f in &mut fs {
+                    f.process([a, b]);
+                }
+            }
+            l
+        };
+        let a = run_chain(&mic.sound_effects);
+        let b = run_chain(&expected);
+        assert_eq!(a, b);
+    }
+
+    /// OBS v1 video filter IDs (`chroma_key_filter`, `color_key_filter`, `color_filter`,
+    /// `luma_key_filter`, `sharpness_filter`) import with exact OBS v1 opacity/brightness/color
+    /// conversions, and v2 keyer smoothness/spill clamp >= 1.0 to avoid shader 0/0 NaNs.
+    #[test]
+    fn color_correction_contrast_gives_each_obs_versions_picture() {
+        // The picture our filter makes: the colour times the v2 multiplier, then the brightness
+        // (`color_matrix` applied as a scale and a shift).
+        let ours = |c: f32, brightness: f32, p: f32| {
+            let m = if c < 0.0 { 1.0 / (1.0 - c) } else { c + 1.0 };
+            m * p + brightness
+        };
+        let imported = |kind: &str, c: f64, b: f64| match effect_from(kind, &json!({ "contrast": c, "brightness": b }))
+        {
+            Some(Effect::ColorCorrection { contrast, brightness, .. }) => (contrast, brightness),
+            other => panic!("{other:?}"),
+        };
+        for c in [-0.9_f64, -0.5, -0.25, 0.0, 0.5, 2.0] {
+            for p in [0.2_f32, 0.5, 0.8] {
+                // OBS v1 (color_correction_filter_update_v1): (p - 0.5)(c + 1) + 0.5, plus brightness.
+                let (k, b) = imported("color_filter", c, 0.1);
+                let v1 = ours(k, b, p);
+                let want = (p - 0.5) * (c as f32 + 1.0) + 0.5 + 0.1;
+                assert!((v1 - want).abs() < 1e-5, "v1 contrast {c}, pixel {p}: {v1} not {want}");
+                // OBS v2 (…_update_v2): the colour times 1/(1-c) below 0, c+1 above, no pivot.
+                let (k, b) = imported("color_filter_v2", c, 0.1);
+                assert_eq!((k, b), (c as f32, 0.1), "v2 settings are ours as they are");
+                let m = if c < 0.0 { 1.0 / (1.0 - c as f32) } else { c as f32 + 1.0 };
+                assert!((ours(k, b, p) - (p * m + 0.1)).abs() < 1e-5);
+            }
+        }
+        // The documented example: v2 contrast -0.5 turns a 0.8 pixel into 0.533 and 0.2 into 0.133.
+        let (k, b) = imported("color_filter_v2", -0.5, 0.0);
+        assert!((ours(k, b, 0.8) - 0.5333).abs() < 1e-3 && (ours(k, b, 0.2) - 0.1333).abs() < 1e-3);
+        // v1 at or below -1 (multiplier 0 or less in OBS) is the flattest, never inverted.
+        for c in [-1.0_f64, -1.5, -2.0] {
+            let (k, b) = imported("color_filter", c, 0.0);
+            let (lo, hi) = (ours(k, b, 0.2), ours(k, b, 0.8));
+            assert!(hi >= lo && hi - lo < 0.02, "v1 {c}: {lo} {hi}");
+        }
+    }
+
+    #[test]
+    fn obs_v1_and_v2_video_filters_import_with_correct_scaling() {
+        // v1 Chroma Key: opacity 0..100 -> 0..1, brightness * 0.5, zero smoothness clamped to 1.0.
+        assert_eq!(
+            effect_from("chroma_key_filter", &json!({ "opacity": 50, "brightness": 0.4, "smoothness": 0, "spill": 0 })),
+            Some(Effect::ChromaKey {
+                key: [0, 255, 0],
+                similarity: 400.0,
+                smoothness: 1.0,
+                spill: 1.0,
+                opacity: 0.5,
+                contrast: 0.0,
+                brightness: 0.2,
+                gamma: 0.0,
+            })
+        );
+        // v1 Color Key.
+        assert_eq!(
+            effect_from("color_key_filter", &json!({ "opacity": 80, "brightness": -0.6 })),
+            Some(Effect::ColorKey {
+                key: [0, 255, 0],
+                similarity: 80.0,
+                smoothness: 50.0,
+                opacity: 0.8,
+                contrast: 0.0,
+                brightness: -0.3,
+                gamma: 0.0,
+            })
+        );
+        // v1 Color Correction: opacity 0..100 -> 0..1, single ABGR `color` splits into multiply + premul add.
+        assert_eq!(
+            effect_from("color_filter", &json!({ "opacity": 75, "color": 0x8000_64C8u64 })),
+            Some(Effect::ColorCorrection {
+                gamma: 0.0,
+                contrast: 0.0,
+                brightness: 0.0,
+                saturation: 0.0,
+                hue_shift: 0.0,
+                opacity: 0.75,
+                multiply: 0x0000_64C8,
+                add: 0x0000_3264,
+            })
+        );
+        // v1 Luma Key & Sharpen.
+        assert_eq!(
+            effect_from("luma_key_filter", &json!({ "luma_min": 0.2, "luma_max": 0.9 })),
+            Some(Effect::LumaKey { max: 0.9, min: 0.2, max_smooth: 0.0, min_smooth: 0.0 })
+        );
+        assert_eq!(
+            effect_from("sharpness_filter", &json!({ "sharpness": 0.25 })),
+            Some(Effect::Sharpen { sharpness: 0.25 })
+        );
+    }
+
+    // The fixture is a Mac microphone with a camera; the override logic isn't per OS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn item_video_filter_override_replaces_source_filters_while_audio_stays_shared() {
+        assert!(is_audio_filter_kind("gain_filter"));
+        assert!(is_audio_filter_kind("ferrocast_deepfilter"));
+        assert!(is_audio_filter_kind("ferrocast_vst"));
+        assert!(!is_audio_filter_kind("ferrocast_rounded_corners"));
+        assert!(!is_audio_filter_kind("ferrocast_remove_background"));
+
+        let edge = json!([{ "id": "ferrocast_border", "name": "Edge", "settings": { "width": 6 } }]);
+        let doc = json!({
+            "current_program_scene": "Main",
+            "sources": [
+                {
+                    "id": "coreaudio_input_capture",
+                    "name": "MicAndCam",
+                    "settings": {},
+                    "mixers": 1,
+                    "filters": [
+                        { "id": "gain_filter", "name": "Boost", "settings": { "db": 3.0 } },
+                        { "id": "ferrocast_rounded_corners", "name": "Round", "settings": { "radius": 10 } }
+                    ]
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": { "items": [{ "id": 1, "name": "MicAndCam" }] }
+                },
+                {
+                    "id": "scene",
+                    "name": "Vertical",
+                    "settings": { "items": [{ "id": 2, "name": "MicAndCam", "ferrocast_filters": edge }] }
+                },
+                {
+                    "id": "scene",
+                    "name": "Clean",
+                    "settings": { "items": [{ "id": 3, "name": "MicAndCam", "ferrocast_filters": [] }] }
+                }
+            ]
+        });
+        let im = import(&doc, (1920, 1080));
+        assert!(im.skipped.is_empty(), "{:?}", im.skipped);
+        let src = im.sources.iter().find(|s| s.name == "MicAndCam").unwrap();
+        assert!(matches!(src.sound_effects.as_slice(), [AudioEffect::Gain { db }] if (*db - 3.0).abs() < 0.01));
+        let main = im.scenes.iter().find(|(n, _)| n == "Main").unwrap().1.clone();
+        let vert = im.scenes.iter().find(|(n, _)| n == "Vertical").unwrap().1.clone();
+        let clean = im.scenes.iter().find(|(n, _)| n == "Clean").unwrap().1.clone();
+        assert!(
+            matches!(main[0].effects.as_slice(), [Effect::RoundedCorners { radius }] if (*radius - 10.0).abs() < 0.01)
+        );
+        assert!(matches!(vert[0].effects.as_slice(), [Effect::Border { width, .. }] if (*width - 6.0).abs() < 0.01));
+        assert!(clean[0].effects.is_empty(), "empty item override must clear source video filters for that item only");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn item_override_cutout_creates_distinct_mask_sources_per_item() {
+        let doc = json!({
+            "current_program_scene": "Main",
+            "sources": [
+                {
+                    "id": "color_source_v3",
+                    "name": "Cam",
+                    "settings": { "width": 320, "height": 180 },
+                    "filters": []
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": {
+                        "items": [{
+                            "id": 1,
+                            "name": "Cam",
+                            "ferrocast_filters": [{ "id": "ferrocast_remove_background", "name": "Cut", "settings": { "soft": 10 } }]
+                        }]
+                    }
+                },
+                {
+                    "id": "scene",
+                    "name": "Vertical",
+                    "settings": {
+                        "items": [{
+                            "id": 2,
+                            "name": "Cam",
+                            "ferrocast_filters": [{ "id": "ferrocast_remove_background", "name": "Cut", "settings": { "soft": 20 } }]
+                        }]
+                    }
+                }
+            ]
+        });
+        let im = import(&doc, (1920, 1080));
+        let main = im.scenes.iter().find(|(n, _)| n == "Main").unwrap().1.clone();
+        let vert = im.scenes.iter().find(|(n, _)| n == "Vertical").unwrap().1.clone();
+        let m1 = match main[0].effects.as_slice() {
+            [Effect::Cutout { mask, .. }] => *mask,
+            other => panic!("expected main cutout, got {other:?}"),
+        };
+        let m2 = match vert[0].effects.as_slice() {
+            [Effect::Cutout { mask, .. }] => *mask,
+            other => panic!("expected vertical cutout, got {other:?}"),
+        };
+        assert_ne!(m1, m2);
+        let n1 = im.sources.iter().find(|s| s.id == m1).map(|s| s.name.as_str());
+        let n2 = im.sources.iter().find(|s| s.id == m2).map(|s| s.name.as_str());
+        assert_eq!(n1, Some("Main#1: Cut"));
+        assert_eq!(n2, Some("Vertical#2: Cut"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn native_camera_kind_and_key_imports_on_host_and_rejects_foreign_kinds() {
+        let (kind, key) = native_camera_kind_and_key();
+        let make_doc = |k: &str, setting_key: &str| {
+            serde_json::json!({
+                "sources": [{
+                    "id": k,
+                    "name": "Cam",
+                    "settings": { setting_key: "/no/such/cam" }
+                }]
+            })
+        };
+        let native = import(&make_doc(kind, key), (1920, 1080));
+        assert!(native.skipped.is_empty(), "native camera kind {kind}/{key} skipped: {:?}", native.skipped);
+        assert!(
+            native
+                .sources
+                .iter()
+                .any(|s| s.name == "Cam" && matches!(&s.kind, SourceKind::Camera(spec) if spec.id == "/no/such/cam")),
+            "native camera kind {kind}/{key} did not preserve device id"
+        );
+        for (other_kind, other_key) in
+            [("av_capture_input_v2", "device"), ("dshow_input", "video_device_id"), ("v4l2_input", "device_id")]
+        {
+            if other_kind != kind {
+                let foreign = import(&make_doc(other_kind, other_key), (1920, 1080));
+                assert!(
+                    foreign.sources.is_empty(),
+                    "foreign camera kind {other_kind} unexpectedly imported on host OS"
+                );
+            }
+        }
     }
 }

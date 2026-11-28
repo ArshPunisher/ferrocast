@@ -144,7 +144,8 @@ async fn main() {
         .with_tts(tts, tts_cap)
         .with_smart(smart, smart_cap)
         .with_smart_backup(smart_backup, smart_backup_cap)
-        .with_admin(admin);
+        .with_admin(admin)
+        .with_facebook(ferrocast_relay::facebook::Config::from_env());
     let remote_cfg = ferrocast_relay::remote::RemoteConfig::from_env();
     match (&remote_cfg.origin, remote_cfg.dashboard_dir.is_some()) {
         (Some(o), true) => tracing::info!(origin = %o, "the dashboard from anywhere is on"),
@@ -326,6 +327,14 @@ async fn main() {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
             ferrocast_relay::cloud::sweep(&cloud).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+    let crash = state.clone();
+    tokio::spawn(async move {
+        // Crash reports: bundles after 90 days, everything after a year.
+        loop {
+            ferrocast_relay::crash::sweep(&crash).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

@@ -187,32 +187,25 @@ impl Engine {
     async fn counter_changed(&self, name: &str, value: i64) {
         self.studio().counters.lock().unwrap_or_else(|p| p.into_inner()).insert(name.to_string(), value);
         self.studio_frame("counter", &json!({ "name": name, "value": value }));
-        let Ok(overlays) = self.db(repo::overlays::list).await else { return };
-        let mut vars = Vars::new();
-        self.counter_vars(&mut vars);
+        let Ok(overlays) = self.db(|s| repo::overlays::list_with_widget_kind(s, "label")).await else { return };
         for o in overlays {
-            let labels: serde_json::Map<String, Value> = o
-                .widgets
-                .iter()
-                .filter(|w| w.kind == WidgetKind::Label)
-                .filter_map(|w| {
-                    let tpl = w.config.get("template").and_then(Value::as_str)?;
-                    if !chatbot::counters_in(tpl).iter().any(|c| c == name) {
-                        return None;
-                    }
-                    let source = w.config.get("source").and_then(Value::as_str).unwrap_or("");
-                    let mut v = vars.clone();
-                    v.insert("value".into(), self.state().session.label(source));
-                    let text = Template::parse(tpl).map(|t| t.render(&v)).unwrap_or_default();
-                    Some((w.id.clone(), json!(text)))
-                })
-                .collect();
+            let has_counter = o.widgets.iter().any(|w| {
+                w.kind == WidgetKind::Label
+                    && w.config
+                        .get("template")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tpl| chatbot::counters_in(tpl).iter().any(|c| c == name))
+            });
+            if !has_counter {
+                continue;
+            }
+            let (labels, label_trains) = self.overlay_labels_and_trains(&o).await;
             if !labels.is_empty() {
                 self.send_overlay(OverlayFrame::new(
                     Audience::Overlay(o.id.clone()),
                     self.next_seq(),
                     "state",
-                    &json!({ "labels": labels }),
+                    &json!({ "labels": labels, "label_trains": label_trains }),
                 ));
             }
         }

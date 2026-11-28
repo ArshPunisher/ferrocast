@@ -31,6 +31,7 @@ pub enum Platform {
     Twitch,
     Youtube,
     Kick,
+    Facebook,
     /// A tip page payment (the provider is on the `Tip` kind).
     Tips,
     /// Generated inside Ferrocast (bot replies, timers, panic mode notices).
@@ -52,6 +53,7 @@ impl Platform {
             Platform::Twitch => "Twitch",
             Platform::Youtube => "YouTube",
             Platform::Kick => "Kick",
+            Platform::Facebook => "Facebook",
             Platform::Tips => "Tips",
             Platform::Ferrocast => "Ferrocast",
         }
@@ -357,6 +359,12 @@ pub enum EventKind {
     AdBreak {
         seconds: u32,
     },
+    /// Live tally update or closure pushed by a platform-native poll.
+    NativePoll {
+        poll_id: String,
+        counts: Vec<u64>,
+        ended: bool,
+    },
 
     // connection health
     Connector(ConnectorStatus),
@@ -391,6 +399,7 @@ impl EventKind {
             EventKind::StreamOnline { .. } => "stream_online",
             EventKind::StreamOffline => "stream_offline",
             EventKind::AdBreak { .. } => "ad_break",
+            EventKind::NativePoll { .. } => "native_poll",
             EventKind::Connector(_) => "connector",
             EventKind::Unknown { .. } => "unknown",
         }

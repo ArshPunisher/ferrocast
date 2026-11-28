@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferrocast_connector::{Connector, ConnectorError, max_chat_chars, split_chat};
 use ferrocast_core::alert::AlertRule;
@@ -54,12 +55,7 @@ impl Engine {
                 tracing::warn!(%err, what, "platform action failed");
                 engine.send_live(LiveFrame::new(
                     "notice",
-                    &Notice {
-                        key: None,
-                        level: NoticeLevel::Warn,
-                        message: format!("Couldn't {what} on {platform}: {err}"),
-                        action: None,
-                    },
+                    &Notice::new(NoticeLevel::Warn, format!("{platform}: couldn't {what}")).detail(err.to_string()),
                 ));
             }
         });
@@ -198,6 +194,19 @@ impl Engine {
 
     pub async fn delete_message(&self, platform: Platform, message_id: &str) -> Result<(), EngineError> {
         let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
+        // Facebook's delete is by object id, and the Page's token can delete a post or a live
+        // video too: only a comment that came in on the live video here is deleted.
+        if platform == Platform::Facebook {
+            let id = message_id.to_string();
+            let known = self.db(move |s| ferrocast_store::repo::events::by_source(s, Platform::Facebook, &id)).await?;
+            if known.is_none() {
+                return Err(EngineError::Missing {
+                    code: "facebook_comment_unknown",
+                    message: "Ferrocast hasn't seen that comment on your Page.",
+                    hint: "Only comments that came in on your live video can be deleted here.",
+                });
+            }
+        }
         c.delete_message(message_id).await?;
         self.hide_message(platform, message_id);
         Ok(())
@@ -215,6 +224,9 @@ impl Engine {
         }
         let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
         c.timeout(user_id, seconds, reason).await?;
+        self.clear_highlight_if_user_id(platform, user_id);
+        self.purge_chat_tts_user(platform, user_id);
+        self.cleanup_pending_tts_for_user(platform, user_id).await;
         self.count_timeout(platform, user_id).await;
         Ok(())
     }
@@ -309,14 +321,31 @@ impl Engine {
         }
         let mut targets = vec![(platform, user_id.to_string())];
         targets.extend(entry.linked.iter().cloned());
+        // Platforms that don't let apps ban (Facebook): nothing was banned there.
+        let mut unsupported = 0usize;
         for (p, uid) in targets {
             match self.connector(p) {
                 Some(c) => match c.ban(&uid, reason.as_deref()).await {
-                    Ok(()) => out.ok.push(p),
-                    Err(e) => out.failed.push(Failure { platform: p, reason: e.to_string() }),
+                    Ok(()) => {
+                        self.clear_highlight_if_user_id(p, &uid);
+                        self.purge_chat_tts_user(p, &uid);
+                        self.cleanup_pending_tts_for_user(p, &uid).await;
+                        out.ok.push(p);
+                    }
+                    Err(e) => {
+                        if matches!(e, ConnectorError::NotSupported { .. }) {
+                            unsupported += 1;
+                        }
+                        out.failed.push(Failure { platform: p, reason: e.to_string() });
+                    }
                 },
                 None => out.failed.push(Failure { platform: p, reason: format!("{p} isn't connected") }),
             }
+        }
+        // Nothing was banned anywhere because every platform said it can't: don't write down a
+        // ban that did not happen (the person would show as banned and still be commenting).
+        if out.ok.is_empty() && unsupported > 0 && unsupported == out.failed.len() {
+            return Ok(out);
         }
         let _one_at_a_time = self.config_lock().await;
         let mut list = self.state().bans.clone();
@@ -418,9 +447,17 @@ impl Engine {
             applied.push(AppliedModes { platform: pp.platform, modes });
         }
         {
-            let mut st = self.state_mut();
-            st.panic_on = on;
-            st.tts_paused = plan.pause_tts;
+            let _tts_op = self.inner.tts_op.lock().await;
+            {
+                let mut st = self.state_mut();
+                st.panic_on = on;
+                st.tts_paused = plan.pause_tts;
+            }
+            if plan.pause_tts {
+                self.stop_chat_tts();
+            } else {
+                self.wake_chat_tts();
+            }
         }
         if on && plan.pause_alerts {
             self.queue_pause().await;
@@ -429,17 +466,18 @@ impl Engine {
         }
         // Every open dashboard shows the same switches and one clear line (R-22).
         self.send_live(LiveFrame::new("panic", &json!({ "on": on, "plan": cfg })));
-        let message = if on {
-            "Panic mode is on. Chat is locked down and alerts are paused.".to_string()
+        let (message, what) = if on {
+            ("Panic mode is on", "Chat is locked down and alerts are paused.")
         } else {
-            "Panic mode is off. Chat and alerts are back to normal.".to_string()
+            ("Panic mode is off", "Chat and alerts are back to normal.")
         };
-        let (level, message) = if failed.is_empty() {
-            (if on { NoticeLevel::Warn } else { NoticeLevel::Info }, message)
+        let notice = if failed.is_empty() {
+            Notice::new(if on { NoticeLevel::Warn } else { NoticeLevel::Info }, message).detail(what)
         } else {
-            (NoticeLevel::Error, format!("{message} Some changes didn't apply: {}.", failed.join("; ")))
+            Notice::new(NoticeLevel::Error, format!("{message}, some changes failed"))
+                .detail(format!("{what} Some changes didn't apply: {}.", failed.join("; ")))
         };
-        self.send_live(LiveFrame::new("notice", &Notice { key: Some("panic".into()), level, message, action: None }));
+        self.send_live(LiveFrame::new("notice", &notice.key("panic")));
         Ok(PanicResult { on, applied })
     }
 
@@ -474,33 +512,176 @@ impl Engine {
         self.state().tts.clone()
     }
 
-    pub async fn save_tts(&self, p: TtsPolicy) -> Result<TtsPolicy, EngineError> {
+    pub async fn save_tts(&self, mut p: TtsPolicy) -> Result<TtsPolicy, EngineError> {
         let _one_at_a_time = self.config_lock().await;
         if p.max_chars == 0 || p.max_chars > 500 {
             return Err(EngineError::Invalid("TTS can read 1 to 500 characters.".into()));
         }
+        p.chat.command = p.chat.command.trim().to_string();
+        if let Err(err) = p.chat.validate() {
+            return Err(EngineError::Invalid(err));
+        }
         let saved = p.clone();
         self.db(move |s| repo::settings::set(s, "tts", &saved)).await?;
-        self.state_mut().tts = p.clone();
+        {
+            let _tts_op = self.inner.tts_op.lock().await;
+            self.state_mut().tts = p.clone();
+            if !p.enabled || !p.chat.enabled {
+                self.stop_chat_tts();
+            } else {
+                self.wake_chat_tts();
+            }
+        }
         Ok(p)
+    }
+
+    pub(crate) async fn cleanup_pending_tts_for_user(&self, platform: Platform, user_id: &str) {
+        if user_id.is_empty() {
+            return;
+        }
+        let key = (platform, user_id.to_string());
+        let uid = user_id.to_string();
+        match self.db(move |s| repo::events::drop_pending_tts_for_user(s, platform, &uid)).await {
+            Ok(n) => {
+                self.inner.blocked_pending_tts_users.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+                if n > 0 {
+                    self.push_tts_pending().await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%platform, user_id, error = %err, "couldn't drop pending chat TTS items for moderated user");
+                self.inner.blocked_pending_tts_users.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+                self.send_live(LiveFrame::new(
+                    "notice",
+                    &Notice::new(NoticeLevel::Warn, "Couldn't clear held chat TTS for moderated user").detail(
+                        "Pending approval items for that user are blocked and cleanup will retry automatically.",
+                    ),
+                ));
+                let eng = self.clone();
+                let uid_retry = user_id.to_string();
+                tokio::spawn(async move {
+                    for _ in 0..3 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let uid = uid_retry.clone();
+                        match eng.db(move |s| repo::events::drop_pending_tts_for_user(s, platform, &uid)).await {
+                            Ok(n) => {
+                                eng.inner
+                                    .blocked_pending_tts_users
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&(platform, uid_retry));
+                                if n > 0 {
+                                    eng.push_tts_pending().await;
+                                }
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                });
+            }
+        }
     }
 
     /// Approves (reads aloud via the alert overlays) or rejects a held TTS message.
     pub async fn decide_tts(&self, id: &str, approve: bool) -> Result<(), EngineError> {
         let pid = id.to_string();
+        if !approve {
+            let _ = self
+                .db(move |s| repo::events::take_pending_tts(s, &pid))
+                .await?
+                .ok_or(EngineError::NotFound("TTS message"))?;
+            self.push_tts_pending().await;
+            return Ok(());
+        }
+        let peek_id = pid.clone();
+        let peeked = self
+            .db(move |s| repo::events::get_pending_tts(s, &peek_id))
+            .await?
+            .ok_or(EngineError::NotFound("TTS message"))?;
+        let eid = peeked.event_id.clone();
+        let ev = self.db(move |s| repo::events::get(s, &eid)).await.ok().flatten();
+        let chat_actor = ev.as_ref().and_then(|e| match &e.kind {
+            ferrocast_core::event::EventKind::ChatMessage { actor, .. } => Some((e, actor)),
+            _ => None,
+        });
+        if let Some((chat_ev, actor)) = chat_actor {
+            if let Some(uid) = actor.id.as_deref().filter(|s| !s.is_empty()) {
+                let blocked = self
+                    .inner
+                    .blocked_pending_tts_users
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&(chat_ev.platform, uid.to_string()));
+                if blocked {
+                    let uid_owned = uid.to_string();
+                    let p = chat_ev.platform;
+                    match self.db(move |s| repo::events::drop_pending_tts_for_user(s, p, &uid_owned)).await {
+                        Ok(n) => {
+                            self.inner
+                                .blocked_pending_tts_users
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&(p, uid.to_string()));
+                            if n > 0 {
+                                self.push_tts_pending().await;
+                            }
+                            return Err(EngineError::NotFound("TTS message"));
+                        }
+                        Err(_) => {
+                            return Err(EngineError::Conflict(
+                                "Pending TTS cleanup is still retrying after moderation.".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Honor pause, mute, and chat-TTS enabled controls before consuming the held item.
+            let (item, generation) = {
+                let _tts_op = self.inner.tts_op.lock().await;
+                let muted = self.inner.queue.lock().await.is_muted();
+                let allowed = {
+                    let st = self.state();
+                    !st.tts_paused && st.tts.enabled && st.tts.chat.enabled
+                };
+                if muted || !allowed {
+                    return Err(EngineError::Conflict("Chat TTS is paused, muted, or turned off.".into()));
+                }
+                let take_id = pid.clone();
+                let consumed = self
+                    .db(move |s| repo::events::take_pending_tts(s, &take_id))
+                    .await?
+                    .ok_or(EngineError::NotFound("TTS message"))?;
+                let chat_item = crate::chat_tts::ChatTtsItem {
+                    id: consumed.id,
+                    event_id: consumed.event_id,
+                    source_id: chat_ev.source_id.clone(),
+                    platform: chat_ev.platform,
+                    actor_id: actor.id.clone(),
+                    text: consumed.text,
+                };
+                let generation = self.start_approved_chat_tts(&chat_item);
+                (chat_item, generation)
+            };
+            self.push_tts_pending().await;
+            let (media_id, duration_ms) = self.speak_local_to_media(&item.text).await;
+            self.publish_chat_tts_after_synth(generation, &item, media_id, duration_ms).await;
+            return Ok(());
+        }
+
         let item = self
             .db(move |s| repo::events::take_pending_tts(s, &pid))
             .await?
             .ok_or(EngineError::NotFound("TTS message"))?;
-        if approve {
-            let audio = self.speak_to_media(&item.text).await;
-            self.send_overlay(crate::frames::OverlayFrame::new(
-                crate::frames::Audience::Alerts,
-                self.next_seq(),
-                "tts",
-                &json!({ "id": item.id, "text": item.text, "audio": audio }),
-            ));
-        }
+        crate::studio::voice_commands::reading_aloud(&item.text, now().0);
+        let audio = self.speak_to_media(&item.text).await;
+        self.send_overlay(crate::frames::OverlayFrame::new(
+            crate::frames::Audience::Alerts,
+            self.next_seq(),
+            "tts",
+            &json!({ "id": item.id, "text": item.text, "audio": audio }),
+        ));
         self.push_tts_pending().await;
         Ok(())
     }
@@ -631,6 +812,7 @@ impl Engine {
             "connectors": st.connectors,
             "panic": st.panic_on,
             "session": st.session,
+            "safe_mode": self.safe_mode_status(),
         })
     }
 

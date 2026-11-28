@@ -467,3 +467,30 @@ async fn unticking_a_screen_later_takes_it_out_and_the_dialog_starts_from_last_t
     assert!(!scene_names(&st).iter().any(|n| n.ends_with("Ending") && n.contains('·')));
     assert!(items(&st, "Gameplay").contains(&("Alert box".into(), true)), "hide_old [] is kept");
 }
+
+#[tokio::test]
+async fn installing_a_theme_keeps_unique_overlay_name_when_duplicate_exists() {
+    let (e, _d, st) = setup().await;
+    // User already created a manual overlay with the exact target name of Forge's In game screen.
+    let manual = e.create_overlay("In game (Forge)", ferrocast_core::overlay::Preset::Blank).await.unwrap();
+    let existing_prism = e.create_overlay("In game (Prism)", ferrocast_core::overlay::Preset::Blank).await.unwrap();
+
+    e.apply_theme_to_obs("builtin.forge", None).await.unwrap();
+    let overlays = e.overlays().await.unwrap();
+    let names: Vec<&str> = overlays.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(overlays.iter().filter(|o| o.name == "In game (Forge)").count(), 1, "must not collide: {names:?}");
+    assert!(names.contains(&"In game (Forge) 2"), "must keep unique suffix on install: {names:?}");
+    assert!(
+        st.lock().unwrap().inputs.iter().any(|i| i.name == "Ferrocast: In game (Forge) 2"),
+        "OBS input must keep unique suffix"
+    );
+
+    // Switching themes also avoids colliding with an unrelated existing overlay of the target name.
+    e.apply_theme_to_obs("builtin.prism", None).await.unwrap();
+    let after = e.overlays().await.unwrap();
+    let after_names: Vec<&str> = after.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(after.iter().filter(|o| o.name == "In game (Prism)").count(), 1, "switch collision: {after_names:?}");
+    assert!(after.iter().any(|o| o.id == manual.id && o.name == "In game (Forge)"));
+    assert!(after.iter().any(|o| o.id == existing_prism.id && o.name == "In game (Prism)"));
+    assert!(after_names.contains(&"In game (Prism) 2"), "switched overlay must keep unique name: {after_names:?}");
+}

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now};
 
-const WEBHOOK_KEY: &str = "discord-webhook";
+pub(crate) const WEBHOOK_KEY: &str = "discord-webhook";
 /// One post per platform per this long: a stream that drops and comes back isn't news.
 const REPOST_AFTER_MS: i64 = 30 * 60 * 1000;
 
@@ -157,15 +157,10 @@ impl Engine {
             if let Err(f) = engine.post_discord(&url, &text, cfg.mention_everyone).await {
                 engine.send_live(LiveFrame::new(
                     "notice",
-                    &Notice {
-                        key: Some("discord".into()),
-                        level: NoticeLevel::Warn,
-                        message: format!("The Discord go-live post didn't go out. {}", f.error),
-                        action: Some(crate::frames::NoticeAction {
-                            label: "Discord settings".into(),
-                            href: "#/settings/discord".into(),
-                        }),
-                    },
+                    &Notice::new(NoticeLevel::Warn, "The Discord go-live post failed")
+                        .key("discord")
+                        .detail(f.error.to_string())
+                        .action("Discord settings", "#/settings/discord"),
                 ));
             }
         });

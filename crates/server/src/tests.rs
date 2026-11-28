@@ -471,6 +471,36 @@ async fn settings_save_what_was_sent_and_name_bad_fields() {
     assert_eq!(r.put("/api/v1/settings", json!([1])).await.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The dashboard's ten looks are a setting; `dark` and `light` stay as aliases of Slate and Daylight.
+#[tokio::test]
+async fn settings_take_each_of_the_ten_themes_and_still_the_old_three() {
+    let r = start().await;
+    for theme in [
+        "system",
+        "dark",
+        "light",
+        "graphite",
+        "slate",
+        "moonlight",
+        "forest",
+        "ember",
+        "obsidian",
+        "daylight",
+        "mist",
+        "linen",
+        "contrast",
+    ] {
+        let res = r.put("/api/v1/settings", json!({ "theme": theme })).await;
+        assert_eq!(res.status(), StatusCode::OK, "{theme}");
+        let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
+        assert_eq!(s["theme"], theme);
+    }
+    let bad = r.put("/api/v1/settings", json!({ "theme": "Slate" })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "ids are lower case");
+    let v: Value = bad.json().await.unwrap();
+    assert!(v["error"]["message"].as_str().unwrap().starts_with("theme"), "{v}");
+}
+
 #[tokio::test]
 async fn tts_goals_and_commands_speak_the_dashboards_language() {
     let r = start().await;
@@ -494,6 +524,55 @@ async fn tts_goals_and_commands_speak_the_dashboards_language() {
     let bad = r.put("/api/v1/tts", json!({ "enabled": true, "min_amount": -1, "max_chars": 200 })).await;
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     assert!(r.get("/api/v1/tts/pending").await.json::<Value>().await.unwrap().as_array().unwrap().is_empty());
+
+    // Chat TTS defaults, partial merges, trimming, and validation bounds.
+    let initial: Value = r.get("/api/v1/tts").await.json().await.unwrap();
+    assert_eq!(initial["chat"]["enabled"], false);
+    assert_eq!(initial["chat"]["mode"], "subs_mods");
+    assert_eq!(initial["chat"]["command"], "!tts");
+    assert_eq!(initial["chat"]["cooldown_s"], 15);
+    assert_eq!(initial["chat"]["global_cooldown_s"], 3);
+    assert_eq!(initial["chat"]["queue_limit"], 5);
+    assert_eq!(initial["chat"]["max_chars"], 160);
+    assert_eq!(initial["chat"]["skip_links"], true);
+    assert_eq!(initial["chat"]["skip_emote_spam"], true);
+
+    let first_patch: Value = r
+        .put(
+            "/api/v1/tts",
+            json!({ "enabled": true, "chat": { "enabled": true, "mode": "command", "command": "  !voice  " } }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_patch["chat"]["enabled"], true);
+    assert_eq!(first_patch["chat"]["mode"], "command");
+    assert_eq!(first_patch["chat"]["command"], "!voice");
+    assert_eq!(first_patch["chat"]["cooldown_s"], 15);
+
+    let partial: Value =
+        r.put("/api/v1/tts", json!({ "chat": { "cooldown_s": 45, "skip_links": false } })).await.json().await.unwrap();
+    assert_eq!(partial["chat"]["enabled"], true);
+    assert_eq!(partial["chat"]["mode"], "command");
+    assert_eq!(partial["chat"]["command"], "!voice");
+    assert_eq!(partial["chat"]["cooldown_s"], 45);
+    assert_eq!(partial["chat"]["skip_links"], false);
+
+    for (payload, expected_prefix) in [
+        (json!({ "chat": { "command": "voice" } }), "chat.command"),
+        (json!({ "chat": { "cooldown_s": 301 } }), "chat.cooldown_s"),
+        (json!({ "chat": { "global_cooldown_s": 61 } }), "chat.global_cooldown_s"),
+        (json!({ "chat": { "queue_limit": 0 } }), "chat.queue_limit"),
+        (json!({ "chat": { "queue_limit": 21 } }), "chat.queue_limit"),
+        (json!({ "chat": { "max_chars": 9 } }), "chat.max_chars"),
+        (json!({ "chat": { "max_chars": 301 } }), "chat.max_chars"),
+    ] {
+        let invalid = r.put("/api/v1/tts", payload).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let body: Value = invalid.json().await.unwrap();
+        assert!(body["error"]["message"].as_str().unwrap_or("").starts_with(expected_prefix), "{body}");
+    }
 
     let g: Value = r
         .post("/api/v1/goals", json!({ "title": "Mic", "kind": "tips", "target": 5000, "currency": "INR" }))
@@ -858,7 +937,11 @@ async fn poll_routes_validate_and_refuse_races() {
     use reqwest::Method;
     let r = start().await;
     assert_eq!(r.get("/api/v1/polls/current").await.json::<Value>().await.unwrap(), Value::Null);
+    let caps = r.get("/api/v1/polls/capabilities").await;
+    assert_eq!(caps.status(), StatusCode::OK);
+    assert_eq!(caps.json::<Value>().await.unwrap(), json!({ "platforms": [] }));
     for (m, path) in [
+        (Method::GET, "/api/v1/polls/capabilities"),
         (Method::GET, "/api/v1/polls/current"),
         (Method::POST, "/api/v1/polls"),
         (Method::POST, "/api/v1/polls/current/end"),
@@ -926,6 +1009,32 @@ async fn poll_routes_validate_and_refuse_races() {
     assert_eq!(error_code(gone).await, (StatusCode::NOT_FOUND, "poll_not_found".into()));
     let fresh = r.post("/api/v1/polls", ok).await;
     assert_eq!(fresh.status(), StatusCode::CREATED, "a new poll after the last one ended");
+    assert!(r.post("/api/v1/polls/current/end", json!({})).await.status().is_success());
+
+    // Omitted `duration_s` defaults to 60s; explicit JSON `null` creates a No-timer poll.
+    let defaulted = r.post("/api/v1/polls", json!({ "question": "Default?", "options": ["A", "B"] })).await;
+    assert_eq!(defaulted.status(), StatusCode::CREATED);
+    let dv: Value = defaulted.json().await.unwrap();
+    assert!(dv["ends_at"].is_i64(), "omitted duration_s defaults to timed: {dv}");
+    assert!(r.post("/api/v1/polls/current/end", json!({})).await.status().is_success());
+
+    let bad_fb =
+        r.post("/api/v1/polls", json!({ "question": "Bad?", "options": ["A", "B"], "chat_fallback": "yes" })).await;
+    assert_eq!(bad_fb.status(), StatusCode::BAD_REQUEST);
+
+    let untimed = r
+        .post("/api/v1/polls", json!({ "question": "No timer?", "options": ["Stay", "Go"], "duration_s": null }))
+        .await;
+    assert_eq!(untimed.status(), StatusCode::CREATED);
+    let uv: Value = untimed.json().await.unwrap();
+    assert_eq!(uv["ends_at"], Value::Null, "explicit null creates an untimed poll");
+    assert_eq!(r.post("/api/v1/polls/current/end", json!({})).await.status(), StatusCode::OK);
+
+    // Disabling chat fallback refuses to start when no connected platform supports native polls.
+    let no_fb = r
+        .post("/api/v1/polls", json!({ "question": "Native only?", "options": ["A", "B"], "chat_fallback": false }))
+        .await;
+    assert_eq!(error_code(no_fb).await.0, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1393,6 +1502,207 @@ async fn a_failed_install_says_why_and_can_be_tried_again() {
 }
 
 #[tokio::test]
+async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_active() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferrocast_engine::studio_host::{
+        LocalCaptureBlock, PreviewRect, StudioAct, StudioHost, StudioSettings, StudioStatus,
+    };
+
+    #[derive(Debug, Default)]
+    struct CaptureStateHost {
+        recording: AtomicBool,
+        replay: AtomicBool,
+        hold_replay: tokio::sync::Mutex<()>,
+        replay_entered: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl StudioHost for CaptureStateHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn settings(&self) -> StudioSettings {
+            StudioSettings::default()
+        }
+        async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record(&self, on: bool) -> Result<Value, String> {
+            self.recording.store(on, Ordering::Release);
+            Ok(Value::Null)
+        }
+        async fn record_source(&self, _name: String, on: bool) -> Result<Value, String> {
+            self.recording.store(on, Ordering::Release);
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn replay(&self, on: bool) -> Result<Value, String> {
+            if on {
+                self.replay_entered.notify_one();
+                let _hold = self.hold_replay.lock().await;
+            }
+            self.replay.store(on, Ordering::Release);
+            Ok(Value::Null)
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(json!({ "devices": [] }))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        fn local_capture_block(&self) -> LocalCaptureBlock {
+            LocalCaptureBlock {
+                recording: self.recording.load(Ordering::Acquire),
+                replay: self.replay.load(Ordering::Acquire),
+            }
+        }
+    }
+
+    let r = start().await;
+    let host = Arc::new(CaptureStateHost::default());
+    r.engine.set_studio_host(host.clone());
+    r.engine.attach_updater();
+    r.engine.set_available_update(Some(found("9.9.9")));
+
+    // Active local recording blocks both install and update_view without conflating Engine::is_live().
+    host.recording.store(true, Ordering::Release);
+    assert!(!r.engine.is_live(), "local recording must not report stream live status");
+    assert!(r.engine.update_blocked(), "local recording must block updates");
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(v["blocked_while_live"], json!(true));
+    let rec_install = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(rec_install.status(), StatusCode::CONFLICT);
+    let rec_body: Value = rec_install.json().await.unwrap();
+    assert_eq!(rec_body["error"]["code"], "live");
+    assert!(
+        rec_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("record"),
+        "expected recording message, got {rec_body}"
+    );
+
+    // Active replay buffer also blocks both install and update_view.
+    host.recording.store(false, Ordering::Release);
+    host.replay.store(true, Ordering::Release);
+    assert!(r.engine.update_blocked(), "active replay buffer must block updates");
+    let rep_install = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(rep_install.status(), StatusCode::CONFLICT);
+    let rep_body: Value = rep_install.json().await.unwrap();
+    assert_eq!(rep_body["error"]["code"], "live");
+    assert!(
+        rep_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("replay"),
+        "expected replay message, got {rep_body}"
+    );
+
+    // Stop replay so download succeeds and becomes Ready, then confirm restart refuses for recording and replay.
+    host.replay.store(false, Ordering::Release);
+    assert_eq!(r.post("/api/v1/updates/install", json!({})).await.status(), StatusCode::ACCEPTED);
+    r.engine.update_ready("9.9.9");
+
+    host.recording.store(true, Ordering::Release);
+    let rec_restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(rec_restart.status(), StatusCode::CONFLICT);
+    let rec_restart_body: Value = rec_restart.json().await.unwrap();
+    assert_eq!(rec_restart_body["error"]["code"], "live");
+    assert!(
+        rec_restart_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("record"),
+        "expected recording restart refusal, got {rec_restart_body}"
+    );
+
+    host.recording.store(false, Ordering::Release);
+    host.replay.store(true, Ordering::Release);
+    let rep_restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(rep_restart.status(), StatusCode::CONFLICT);
+    let rep_restart_body: Value = rep_restart.json().await.unwrap();
+    assert_eq!(rep_restart_body["error"]["code"], "live");
+    assert!(
+        rep_restart_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("replay"),
+        "expected replay restart refusal, got {rep_restart_body}"
+    );
+
+    host.replay.store(false, Ordering::Release);
+    // An in-flight replay/recording start holding `output_gate` must block restart admission too.
+    let hold_replay = host.hold_replay.lock().await;
+    let entered = host.replay_entered.notified();
+    let starting_rep = tokio::spawn({
+        let eng = r.engine.clone();
+        async move { eng.studio_replay(true).await }
+    });
+    tokio::pin!(starting_rep);
+    tokio::select! {
+        () = entered => {},
+        res = &mut starting_rep => panic!("studio_replay returned before entering host: {res:?}"),
+    }
+    let starting_restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(starting_restart.status(), StatusCode::CONFLICT);
+    assert_eq!(starting_restart.json::<Value>().await.unwrap()["error"]["code"], "live");
+    drop(hold_replay);
+    starting_rep.await.unwrap().unwrap();
+    r.engine.studio_replay(false).await.unwrap();
+
+    assert_eq!(r.post("/api/v1/updates/restart", json!({})).await.status(), StatusCode::ACCEPTED);
+    // Once restart is admitted under `output_gate`, late recording/replay starts are refused until failure/reset.
+    let late_rec = r.engine.studio_record(true).await.unwrap_err();
+    assert!(
+        matches!(late_rec, ferrocast_engine::EngineError::Refused { code: "updating", .. }),
+        "expected updating refusal after restart admission, got {late_rec:?}"
+    );
+    let late_rep = r.engine.studio_replay(true).await.unwrap_err();
+    assert!(
+        matches!(late_rep, ferrocast_engine::EngineError::Refused { code: "updating", .. }),
+        "expected updating refusal on replay after restart admission, got {late_rep:?}"
+    );
+    let late_src_rec = r.engine.studio_record_source("Cam", true).await.unwrap_err();
+    assert!(
+        matches!(late_src_rec, ferrocast_engine::EngineError::Refused { code: "updating", .. }),
+        "expected updating refusal on isolated record after restart admission, got {late_src_rec:?}"
+    );
+
+    r.engine.update_failed("restart aborted");
+    assert_eq!(r.post("/api/v1/updates/restart", json!({})).await.status(), StatusCode::CONFLICT);
+    r.engine.studio_replay(true).await.expect("failure resets update_committing lock");
+    r.engine.studio_replay(false).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_daily_backup_is_taken_at_start_and_listed_with_its_reason() {
     let r = start().await;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1700,7 +2010,15 @@ async fn a_custom_destination_gets_the_stream_end_to_end() {
         .iter()
         .map(|d| json!({ "id": d["id"], "enabled": d["id"] != id.as_str() && d["enabled"].as_bool().unwrap() }))
         .collect();
-    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": order })).await.status(), StatusCode::OK);
+    // It was the only one ticked, so taking it away asks first and changes nothing...
+    let ask = r.put("/api/v1/golive/destinations", json!({ "destinations": order.clone() })).await;
+    assert_eq!(ask.status(), StatusCode::CONFLICT);
+    assert_eq!(ask.json::<Value>().await.unwrap()["error"]["code"], "golive_last_destination");
+    // ...and confirmed, it stops at once while the stream goes on.
+    assert_eq!(
+        r.put("/api/v1/golive/destinations", json!({ "destinations": order, "confirm_last": true })).await.status(),
+        StatusCode::OK
+    );
     assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), got.recv()).await.unwrap(), Some(Got::Closed));
     // Removed: gone from the list, its key deleted.
     let gone = r
@@ -1758,4 +2076,1445 @@ async fn chat_shows_this_stream_not_the_last_one() {
     let chat: Value = r.get("/api/v1/chat").await.json().await.unwrap();
     let ids: Vec<&str> = chat.as_array().unwrap().iter().filter_map(|e| e["source_id"].as_str()).collect();
     assert_eq!(ids, ["just now"]);
+}
+
+#[tokio::test]
+async fn diagnostics_routes_export_redacted_zip_and_enforce_validation() {
+    use std::io::Read;
+
+    let r = start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let logs = r._dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("ferrocast.log"),
+        "2026-11-22T03:30:00Z ERROR user=route@test.example ip=198.51.100.77 token=routeSecret999\n",
+    )
+    .unwrap();
+
+    // Unauthenticated denied
+    assert_eq!(
+        r.anonymous(reqwest::Method::GET, "/api/v1/diagnostics/preview").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Preview returns structured JSON with likely_causes right on it
+    let preview = r.get("/api/v1/diagnostics/preview").await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let pv: Value = preview.json().await.unwrap();
+    assert!(pv["likely_causes"].is_array());
+    assert!(pv["app"]["version"].is_string());
+    let pv_text = pv.to_string();
+    assert!(
+        !pv_text.contains("route@test.example")
+            && !pv_text.contains("198.51.100.77")
+            && !pv_text.contains("routeSecret999")
+    );
+
+    // Missing / invalid folder returns 400
+    let bad_dir = r.post("/api/v1/diagnostics/report", json!({ "folder": "/no/such/ferrocast-folder-xyz" })).await;
+    assert_eq!(error_code(bad_dir).await.0, StatusCode::BAD_REQUEST);
+
+    // Valid folder writes real zip archive
+    let created = r.post("/api/v1/diagnostics/report", json!({ "folder": folder.path().display().to_string() })).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let body: Value = created.json().await.unwrap();
+    assert_eq!(body["cancelled"], false);
+    let out_file = std::path::PathBuf::from(body["path"].as_str().unwrap());
+    assert!(out_file.is_file());
+    let mut arc = zip::ZipArchive::new(std::fs::File::open(&out_file).unwrap()).unwrap();
+    let mut summary = String::new();
+    arc.by_name("SUMMARY.txt").unwrap().read_to_string(&mut summary).unwrap();
+    assert!(summary.contains("=== LIKELY CAUSES ==="));
+
+    // Binary .zip endpoint also works for browsers
+    let zip_res = r.post("/api/v1/diagnostics/report.zip", json!({})).await;
+    assert_eq!(zip_res.status(), StatusCode::OK);
+    assert_eq!(zip_res.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("application/zip"));
+    let bytes = zip_res.bytes().await.unwrap();
+    let arc2 = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    assert!(arc2.len() >= 2);
+}
+
+#[tokio::test]
+async fn the_pending_crash_report_routes_answer_on_this_pc() {
+    let r = start().await;
+    assert_eq!(
+        r.anonymous(reqwest::Method::GET, "/api/v1/diagnostics/pending-report").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let v: Value = r.get("/api/v1/diagnostics/pending-report").await.json().await.unwrap();
+    assert_eq!(v, json!({ "pending": false, "kind": null, "created_ms": null, "preview_text": null }));
+    // Nothing to send: 404 with the app's error shape.
+    let res = r.post("/api/v1/diagnostics/pending-report/send", json!({})).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "no_pending_report");
+    // A report that isn't the one shown is refused before anything is sent.
+    let res = r.post("/api/v1/diagnostics/pending-report/send", json!({ "created_ms": 5 })).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "nothing waiting, whatever was shown");
+    // Delete with nothing there is still a clean 204.
+    let res = r
+        .client
+        .delete(format!("{}/api/v1/diagnostics/pending-report", r.base))
+        .bearer_auth(&r.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // The setting is in /settings with its default.
+    let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
+    assert_eq!(s["crash_reports"], "ask");
+    let bad = r.put("/api/v1/settings", json!({ "crash_reports": "maybe" })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn diagnostics_routes_reject_non_loopback_peers_and_expose_content_disposition() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_folder = tempfile::tempdir().unwrap();
+    let engine =
+        Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+    let sessions = std::sync::Arc::new(crate::auth::Sessions::new());
+    let paired_token = sessions.pair(&sessions.new_code()).unwrap();
+    let state = crate::AppState {
+        engine,
+        sessions,
+        guard: crate::auth::Guard { port: 47820, lan: true, dev_origins: vec!["http://localhost:5173".into()] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
+    };
+    let app = crate::router(state);
+    let lan_peer: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+
+    // Paired LAN client (non-loopback) must get 403 on all diagnostics routes.
+    for (method, path, body) in [
+        ("GET", "/api/v1/diagnostics/preview", String::new()),
+        ("POST", "/api/v1/diagnostics/report", serde_json::json!({ "folder": out_folder.path() }).to_string()),
+        ("POST", "/api/v1/diagnostics/report.zip", "{}".into()),
+        ("GET", "/api/v1/diagnostics/pending-report", String::new()),
+        ("POST", "/api/v1/diagnostics/pending-report/send", "{}".into()),
+        ("DELETE", "/api/v1/diagnostics/pending-report", String::new()),
+    ] {
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "192.168.1.50:47820")
+            .header("authorization", format!("Bearer {paired_token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(lan_peer));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "LAN peer unexpectedly allowed on {method} {path}");
+    }
+
+    // Missing ConnectInfo (e.g. non-TCP/synthetic caller) must also fail closed with 403.
+    let no_ip_req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/v1/diagnostics/preview")
+        .header("host", "127.0.0.1:47820")
+        .header("authorization", format!("Bearer {paired_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(no_ip_req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    // Loopback peer gets 200 and dev-origin CORS exposes Content-Disposition.
+    let loopback_peer: SocketAddr = "127.0.0.1:54322".parse().unwrap();
+    let mut local_req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/diagnostics/report.zip")
+        .header("host", "127.0.0.1:47820")
+        .header("origin", "http://localhost:5173")
+        .header("authorization", format!("Bearer {paired_token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    local_req.extensions_mut().insert(ConnectInfo(loopback_peer));
+    let ok_res = app.oneshot(local_req).await.unwrap();
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    let exposed = ok_res
+        .headers()
+        .get(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        exposed.to_ascii_lowercase().contains("content-disposition"),
+        "exposed headers missing Content-Disposition: {exposed:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlays_validate_new_label_options_and_reject_bad_train_settings() {
+    let r = start().await;
+    let created: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Labels", "preset": "blank" })).await.json().await.unwrap();
+    let id = created["id"].as_str().unwrap();
+
+    let mut bad = created.clone();
+    bad["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "hype_train", "template": "{value}", "theme": "molten", "train_window_s": 2 }
+    }]);
+    let res_bad = r.put(&format!("/api/v1/overlays/{id}"), bad).await;
+    assert_eq!(error_code(res_bad).await.0, StatusCode::BAD_REQUEST);
+
+    let mut ok_ov = created.clone();
+    ok_ov["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone": "Europe/London", "timezone_offset_min": 0 }
+    }]);
+    let res_ok = r.put(&format!("/api/v1/overlays/{id}"), ok_ov).await;
+    assert_eq!(res_ok.status(), StatusCode::OK);
+
+    let mut bad_tz = created.clone();
+    bad_tz["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone": "Mars/Olympus" }
+    }]);
+    let res_bad_tz = r.put(&format!("/api/v1/overlays/{id}"), bad_tz).await;
+    assert_eq!(error_code(res_bad_tz).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn preview_socket_hides_real_credits_and_the_pinned_message() {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis, Platform};
+    let r = start().await;
+    let o: Value = r.post("/api/v1/overlays", json!({ "name": "Priv", "preset": "blank" })).await.json().await.unwrap();
+    let mut edit = o.clone();
+    edit["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 0, "y": 0, "w": 800, "h": 600, "config": {} },
+        { "id": "hl", "kind": "chat_highlight", "x": 0, "y": 700, "w": 800, "h": 200, "config": {} }
+    ]);
+    let url = o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    assert_eq!(r.put(&format!("/api/v1/overlays/{}", o["id"].as_str().unwrap()), edit).await.status(), StatusCode::OK);
+    let t0 = ferrocast_engine::now().0;
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("pv-f".into()),
+            Millis(t0 - 2000),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "RealFollower") },
+        ))
+        .await;
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("pv-m".into()),
+            Millis(t0 - 1000),
+            EventKind::ChatMessage {
+                actor: Actor::named(Platform::Twitch, "RealChatter"),
+                content: Content::plain("secret pinned words"),
+                reply_to: None,
+                is_action: false,
+            },
+        ))
+        .await;
+    let chat: Value = r.get("/api/v1/chat?limit=5").await.json().await.unwrap();
+    let id = chat.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(r.post("/api/v1/chat/highlight", json!({ "event_id": id })).await.status(), StatusCode::OK);
+
+    let (mut real, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+    let real_snap = next_json(&mut real).await;
+    assert!(real_snap.to_string().contains("RealFollower"), "the real overlay sees the roster: {real_snap}");
+    let (mut test, _) = tokio_tungstenite::connect_async(format!("{url}?test")).await.unwrap();
+    let snap = next_json(&mut test).await;
+    let text = snap.to_string();
+    for secret in ["RealFollower", "RealChatter", "secret pinned words"] {
+        assert!(!text.contains(secret), "a ?test preview must not carry {secret}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn new_widget_configs_validate_and_isolate_overlay_socket_feeds() {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Platform};
+    use reqwest::Method;
+    let r = start().await;
+
+    // 1. Auth required on /credits and /chat/highlight.
+    for (m, p) in [
+        (Method::GET, "/api/v1/credits"),
+        (Method::GET, "/api/v1/chat/highlight"),
+        (Method::POST, "/api/v1/chat/highlight"),
+        (Method::DELETE, "/api/v1/chat/highlight"),
+    ] {
+        assert_eq!(error_code(r.anonymous(m, p).await).await.0, StatusCode::UNAUTHORIZED, "{p}");
+    }
+    assert_eq!(r.get("/api/v1/chat/highlight").await.json::<Value>().await.unwrap(), Value::Null);
+
+    // 2. Overlay widget validation rejects invalid speeds, physics, sections, and caps.
+    let base_overlay: Value =
+        r.post("/api/v1/overlays", json!({ "name": "TestNew", "preset": "blank" })).await.json().await.unwrap();
+    let oid = base_overlay["id"].as_str().unwrap().to_string();
+    let mut bad_ew = base_overlay.clone();
+    bad_ew["widgets"] = json!([
+        { "id": "ew", "kind": "emote_wall", "x": 0, "y": 0, "w": 800, "h": 600, "config": { "max_emotes": 500, "physics": "bounce" } }
+    ]);
+    assert_eq!(r.put(&format!("/api/v1/overlays/{oid}"), bad_ew).await.status(), StatusCode::BAD_REQUEST);
+
+    let mut bad_ec = base_overlay.clone();
+    bad_ec["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 0, "y": 0, "w": 800, "h": 600, "config": { "sections": ["followers"], "speed": 999 } }
+    ]);
+    assert_eq!(r.put(&format!("/api/v1/overlays/{oid}"), bad_ec).await.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Create overlays tailored to each new widget + a baseline chat_only overlay.
+    let hl_ov: Value =
+        r.post("/api/v1/overlays", json!({ "name": "HL", "preset": "blank" })).await.json().await.unwrap();
+    let mut hl_edit = hl_ov.clone();
+    hl_edit["widgets"] = json!([
+        { "id": "hl", "kind": "chat_highlight", "x": 40, "y": 800, "w": 620, "h": 220, "config": { "theme": "molten", "duration_s": null, "font_size": 24, "show_badges": true, "show_platform": true } }
+    ]);
+    assert_eq!(
+        r.put(&format!("/api/v1/overlays/{}", hl_ov["id"].as_str().unwrap()), hl_edit).await.status(),
+        StatusCode::OK
+    );
+
+    let ec_ov: Value =
+        r.post("/api/v1/overlays", json!({ "name": "EC", "preset": "blank" })).await.json().await.unwrap();
+    let mut ec_edit = ec_ov.clone();
+    ec_edit["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 100, "y": 100, "w": 800, "h": 700, "config": { "theme": "molten", "sections": ["followers", "mods"], "speed": 60, "font": "system", "loop": true } }
+    ]);
+    assert_eq!(
+        r.put(&format!("/api/v1/overlays/{}", ec_ov["id"].as_str().unwrap()), ec_edit).await.status(),
+        StatusCode::OK
+    );
+
+    let ew_ov: Value =
+        r.post("/api/v1/overlays", json!({ "name": "EW", "preset": "blank" })).await.json().await.unwrap();
+    let mut ew_edit = ew_ov.clone();
+    ew_edit["widgets"] = json!([
+        { "id": "ew", "kind": "emote_wall", "x": 0, "y": 0, "w": 1920, "h": 1080, "config": { "theme": "molten", "platforms": [], "max_emotes": 40, "size": 56, "lifetime_s": 6, "physics": "rain" } }
+    ]);
+    assert_eq!(
+        r.put(&format!("/api/v1/overlays/{}", ew_ov["id"].as_str().unwrap()), ew_edit).await.status(),
+        StatusCode::OK
+    );
+
+    let chat_only: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Plain", "preset": "chat_only" })).await.json().await.unwrap();
+
+    // Seed an earlier chat message BEFORE opening emote_wall socket (must NOT backfill emote wall snapshot).
+    let t0 = ferrocast_engine::now().0;
+    let mut old_msg = Event::live(
+        Platform::Twitch,
+        Some("m-old".into()),
+        ferrocast_core::event::Millis(t0 - 1000),
+        EventKind::ChatMessage {
+            actor: Actor::named(Platform::Twitch, "OldChatter"),
+            content: Content::plain("hello earlier"),
+            reply_to: None,
+            is_action: false,
+        },
+    );
+    old_msg.id = "ev-old".into();
+    r.engine.ingest(old_msg).await;
+    let chat_log: Value = r.get("/api/v1/chat?limit=10").await.json().await.unwrap();
+    let old_id = chat_log.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+
+    let open = |o: &Value| o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws_hl, _) = tokio_tungstenite::connect_async(open(&hl_ov)).await.unwrap();
+    let (mut ws_ec, _) = tokio_tungstenite::connect_async(open(&ec_ov)).await.unwrap();
+    let (mut ws_ew, _) = tokio_tungstenite::connect_async(open(&ew_ov)).await.unwrap();
+    let (mut ws_chat, _) = tokio_tungstenite::connect_async(open(&chat_only)).await.unwrap();
+
+    let snap_hl: Value = serde_json::from_str(ws_hl.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let snap_ec: Value = serde_json::from_str(ws_ec.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let snap_ew: Value = serde_json::from_str(ws_ew.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let snap_chat: Value = serde_json::from_str(ws_chat.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+
+    assert!(snap_hl["data"]["state"]["chat_highlight"].is_null());
+    assert!(snap_ec["data"]["state"]["credits"].is_object());
+    assert!(snap_chat["data"]["state"]["credits"].is_null());
+    assert_eq!(snap_ew["data"]["state"]["chat"].as_array().unwrap().len(), 0, "emote_wall needs no chat backfill");
+
+    // 4. Pin highlight validation + live state push strictly to ChatHighlight overlay.
+    let bad_pin = r.post("/api/v1/chat/highlight", json!({ "event_id": 123 })).await;
+    assert_eq!(bad_pin.status(), StatusCode::BAD_REQUEST);
+    let bad_dur = r.post("/api/v1/chat/highlight", json!({ "event_id": old_id, "duration_s": 2 })).await;
+    assert_eq!(bad_dur.status(), StatusCode::BAD_REQUEST);
+    let missing_pin = r.post("/api/v1/chat/highlight", json!({ "event_id": "nope" })).await;
+    assert_eq!(error_code(missing_pin).await, (StatusCode::NOT_FOUND, "highlight_not_found".into()));
+
+    let pin_res = r.post("/api/v1/chat/highlight", json!({ "event_id": old_id, "duration_s": 45 })).await;
+    assert_eq!(pin_res.status(), StatusCode::OK);
+    let pinned: Value = pin_res.json().await.unwrap();
+    assert_eq!(pinned["event_id"], old_id);
+
+    let hl_frame: Value = serde_json::from_str(ws_hl.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(hl_frame["type"], "state");
+    assert_eq!(hl_frame["data"]["chat_highlight"]["content"]["text"], "hello earlier");
+
+    // Emote wall + EndCredits + ChatOnly should NOT receive the chat_highlight frame!
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(120), ws_ew.next()).await.is_err());
+
+    // 5. Dismiss highlight -> sends null to ChatHighlight overlay.
+    let del = r.client.delete(format!("{}/api/v1/chat/highlight", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let clear_frame: Value = serde_json::from_str(ws_hl.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(clear_frame["type"], "state");
+    assert!(clear_frame["data"]["chat_highlight"].is_null());
+
+    // 6. Live follow + live emote chat -> EndCredits gets credits frame, EmoteWall gets live chat event.
+    let follow_ev = Event::live(
+        Platform::Twitch,
+        Some("f-live".into()),
+        ferrocast_core::event::Millis(t0 + 10),
+        EventKind::Follow { actor: Actor::named(Platform::Twitch, "CreditFollower") },
+    );
+    r.engine.ingest(follow_ev).await;
+    let ec_frame: Value = serde_json::from_str(ws_ec.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(ec_frame["type"], "state");
+    assert_eq!(ec_frame["data"]["credits"]["followers"][0]["name"], "CreditFollower");
+    let cr_http: Value = r.get("/api/v1/credits").await.json().await.unwrap();
+    assert_eq!(cr_http["followers"][0]["name"], "CreditFollower");
+
+    let mut emote_msg = Event::live(
+        Platform::Twitch,
+        Some("m-em".into()),
+        ferrocast_core::event::Millis(t0 + 20),
+        EventKind::ChatMessage {
+            actor: Actor::named(Platform::Twitch, "EmoteChatter"),
+            content: Content {
+                text: "Kappa".into(),
+                fragments: vec![ferrocast_core::event::Fragment::Emote {
+                    provider: ferrocast_core::event::EmoteProvider::Native,
+                    id: "25".into(),
+                    name: "Kappa".into(),
+                    url: "https://static-cdn.jtvnw.net/emoticons/v2/25/static/dark/2.0".into(),
+                    zero_width: false,
+                }],
+            },
+            reply_to: None,
+            is_action: false,
+        },
+    );
+    emote_msg.id = "ev-em-1".into();
+    r.engine.ingest(emote_msg).await;
+    let ew_frame: Value = serde_json::from_str(ws_ew.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(ew_frame["type"], "event");
+    assert_eq!(ew_frame["data"]["kind"]["content"]["fragments"][0]["name"], "Kappa");
+}
+
+#[tokio::test]
+async fn queue_controls_pause_mute_skip_and_their_state() {
+    let r = start().await;
+    let q: Value = r.get("/api/v1/queue").await.json().await.unwrap();
+    assert_eq!((q["paused"].as_bool(), q["muted"].as_bool()), (Some(false), Some(false)), "{q}");
+    for (path, key, want) in [
+        ("/api/v1/queue/pause", "paused", true),
+        ("/api/v1/queue/mute", "muted", true),
+        ("/api/v1/queue/unmute", "muted", false),
+        ("/api/v1/queue/resume", "paused", false),
+    ] {
+        let res = r.post(path, json!({})).await;
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let q: Value = res.json().await.unwrap();
+        assert_eq!(q[key].as_bool(), Some(want), "{path}: {q}");
+    }
+    // Idempotent, and skipping with nothing playing is fine.
+    assert_eq!(r.post("/api/v1/queue/mute", json!({})).await.status(), StatusCode::OK);
+    let q: Value = r.post("/api/v1/queue/mute", json!({})).await.json().await.unwrap();
+    assert_eq!(q["muted"], true);
+    assert_eq!(r.post("/api/v1/queue/skip", json!({})).await.status(), StatusCode::OK);
+    // Without the session token every one is refused.
+    for p in ["/api/v1/queue/mute", "/api/v1/queue/unmute", "/api/v1/queue/skip"] {
+        assert_eq!(r.anonymous(reqwest::Method::POST, p).await.status(), StatusCode::UNAUTHORIZED, "{p}");
+    }
+    assert_eq!(r.get("/api/v1/queue/mute").await.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn alert_rules_take_weight_and_interrupt_and_refuse_bad_weights() {
+    let r = start().await;
+    let rules: Value = r.get("/api/v1/alert-rules").await.json().await.unwrap();
+    let mut rule = rules[0].clone();
+    assert!(rule["variations"][0]["weight"].is_number() && rule["interrupt"] == false, "{rule}");
+    rule["interrupt"] = json!(true);
+    rule["variations"][0]["weight"] = json!(7);
+    let id = rule["id"].as_str().unwrap().to_string();
+    let res = r.put(&format!("/api/v1/alert-rules/{id}"), rule.clone()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let back: Value = res.json().await.unwrap();
+    assert_eq!((back["interrupt"].as_bool(), back["variations"][0]["weight"].as_u64()), (Some(true), Some(7)));
+    rule["variations"][0]["weight"] = json!(1001);
+    let res = r.put(&format!("/api/v1/alert-rules/{id}"), rule).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let e: Value = res.json().await.unwrap();
+    assert!(e.to_string().contains("weight"), "{e}");
+}
+
+#[tokio::test]
+async fn creating_a_rule_checks_weight_and_interrupt_too() {
+    let r = start().await;
+    let rules: Value = r.get("/api/v1/alert-rules").await.json().await.unwrap();
+    let mut base = rules[0].clone();
+    base["id"] = json!("mine");
+    base["name"] = json!("Mine");
+    for (what, edit) in
+        [("over the limit", json!(1001)), ("negative", json!(-1)), ("fractional", json!(1.5)), ("text", json!("heavy"))]
+    {
+        let mut rule = base.clone();
+        rule["variations"][0]["weight"] = edit;
+        let res = r.post("/api/v1/alert-rules", rule).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{what}");
+    }
+    let mut rule = base.clone();
+    rule["interrupt"] = json!("yes");
+    assert_eq!(
+        r.post("/api/v1/alert-rules", rule).await.status(),
+        StatusCode::BAD_REQUEST,
+        "interrupt must be a boolean"
+    );
+    let mut ok = base.clone();
+    ok["variations"][0]["weight"] = json!(1000);
+    ok["interrupt"] = json!(true);
+    assert_eq!(r.post("/api/v1/alert-rules", ok).await.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn the_schedule_routes_plan_list_and_delete_with_plain_errors() {
+    let r = start().await;
+    let soon = ferrocast_engine::now().0 + 3_600_000;
+    // A past time is a 400 that names the field.
+    let bad = r
+        .post("/api/v1/schedule", json!({ "info": { "title": "Show" }, "platforms": ["twitch"], "start_ms": 1000 }))
+        .await;
+    assert_eq!(bad.status(), 400);
+    let e: Value = bad.json().await.unwrap();
+    assert!(e["error"]["message"].as_str().unwrap().starts_with("start"), "{e}");
+    // A good plan is 201 and is listed.
+    let ok = r
+        .post(
+            "/api/v1/schedule",
+            json!({ "info": { "title": "Show" }, "platforms": ["twitch", "facebook"], "start_ms": soon }),
+        )
+        .await;
+    assert_eq!(ok.status(), 201);
+    let item: Value = ok.json().await.unwrap();
+    assert_eq!(item["broadcasts"].as_array().unwrap().len(), 2);
+    assert_eq!(item["reminded"], false);
+    let list: Value = r.get("/api/v1/schedule").await.json().await.unwrap();
+    assert_eq!(list["streams"].as_array().unwrap().len(), 1);
+    // Nothing went live.
+    let st: Value = r.get("/api/v1/status").await.json().await.unwrap();
+    assert!(st["live"].as_object().unwrap().values().all(|v| v == &json!(false)), "{st}");
+    // Delete, then an unknown id is 404.
+    let id = item["id"].as_str().unwrap();
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/schedule/{id}", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/schedule/{id}", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // An unknown field is refused, not ignored.
+    let odd = r
+        .post("/api/v1/schedule", json!({ "info": { "title": "x" }, "platforms": ["tiktok"], "start_ms": soon }))
+        .await;
+    assert!(odd.status().is_client_error());
+}
+
+#[tokio::test]
+async fn accounts_include_login_and_platform_urls() {
+    use ferrocast_store::repo::settings::{Account, save_account};
+    let r = start().await;
+    r.engine
+        .db(|s| {
+            save_account(
+                s,
+                &Account {
+                    platform: "twitch".into(),
+                    user_id: "t1".into(),
+                    login: "NovaGG".into(),
+                    display_name: "Nova GG".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 1,
+                },
+            )?;
+            save_account(
+                s,
+                &Account {
+                    platform: "youtube".into(),
+                    user_id: "UC_HANDLE".into(),
+                    login: "@NovaPlays".into(),
+                    display_name: "Nova Plays".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 2,
+                },
+            )?;
+            save_account(
+                s,
+                &Account {
+                    platform: "kick".into(),
+                    user_id: "k1".into(),
+                    login: "nova_kick".into(),
+                    display_name: "NovaKick".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 3,
+                },
+            )?;
+            save_account(
+                s,
+                &Account {
+                    platform: "facebook".into(),
+                    user_id: "fb1".into(),
+                    login: "Nova Page".into(),
+                    display_name: "Nova Page".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 4,
+                },
+            )
+        })
+        .await
+        .unwrap();
+
+    let list: Vec<Value> = r.get("/api/v1/accounts").await.json().await.unwrap();
+    let by = |p: &str| list.iter().find(|a| a["platform"] == p).unwrap().clone();
+    assert_eq!(by("twitch")["login"], "NovaGG");
+    assert_eq!(by("twitch")["url"], "twitch.tv/novagg");
+    assert_eq!(by("youtube")["login"], "@NovaPlays");
+    assert_eq!(by("youtube")["url"], "youtube.com/@NovaPlays");
+    assert_eq!(by("kick")["login"], "nova_kick");
+    assert_eq!(by("kick")["url"], "kick.com/nova_kick");
+    assert_eq!(by("facebook")["login"], "Nova Page");
+    assert!(by("facebook")["url"].is_null());
+
+    // Legacy YouTube row without an @handle falls back to /channel/<id> instead of display title.
+    r.engine
+        .db(|s| {
+            save_account(
+                s,
+                &Account {
+                    platform: "youtube".into(),
+                    user_id: "UC_LEGACY_1234567890".into(),
+                    login: "Nova Plays Live".into(),
+                    display_name: "Nova Plays Live".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 5,
+                },
+            )
+        })
+        .await
+        .unwrap();
+    let list2: Vec<Value> = r.get("/api/v1/accounts").await.json().await.unwrap();
+    let yt2 = list2.iter().find(|a| a["platform"] == "youtube").unwrap();
+    assert_eq!(yt2["url"], "youtube.com/channel/UC_LEGACY_1234567890");
+}
+
+#[tokio::test]
+async fn links_endpoints_validate_persist_and_push_overlay_state() {
+    use ferrocast_store::repo::settings::{Account, save_account};
+    let r = start().await;
+    let init = r.get("/api/v1/links").await;
+    assert_eq!(init.status(), StatusCode::OK);
+    let init_v: Value = init.json().await.unwrap();
+    assert!(init_v["resolved"]["socials"].as_array().unwrap().is_empty());
+
+    for (payload, field) in [
+        (json!({ "discord": "javascript:alert(1)" }), "discord"),
+        (json!({ "website": "  JaVaScRiPt:void(0)" }), "website"),
+        (json!({ "instagram": "bad\nline" }), "instagram"),
+        (json!({ "x": "bad\0nul" }), "x"),
+        (json!({ "tiktok": "a".repeat(121) }), "tiktok"),
+        (
+            json!({ "custom": (0..7).map(|i| json!({ "label": format!("L{i}"), "value": "x.com/a" })).collect::<Vec<_>>() }),
+            "custom",
+        ),
+        (json!({ "custom": [{ "label": "", "value": "x.com/a" }] }), "custom"),
+    ] {
+        let bad = r.put("/api/v1/links", payload).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "expected 400 for {field}");
+        let err: Value = bad.json().await.unwrap();
+        let msg = err["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains(field), "expected error naming {field}: {err}");
+    }
+
+    r.engine
+        .db(|s| {
+            save_account(
+                s,
+                &Account {
+                    platform: "twitch".into(),
+                    user_id: "t1".into(),
+                    login: "novaplays".into(),
+                    display_name: "NovaPlays".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 1,
+                },
+            )
+        })
+        .await
+        .unwrap();
+
+    let ov: Value = r.post("/api/v1/overlays", json!({ "name": "Main" })).await.json().await.unwrap();
+    let ws_url = ov["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let snap: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(snap["data"]["state"]["links"]["twitch"], "twitch.tv/novaplays");
+    assert_eq!(snap["data"]["state"]["links"]["channel_name"], "NovaPlays");
+
+    let saved = r
+        .put(
+            "/api/v1/links",
+            json!({
+                "discord": "https://discord.gg/nova/",
+                "instagram": "@novagram",
+                "schedule_text": "Fridays, 8 PM",
+                "custom": [{ "label": "Merch", "value": "https://shop.nova.gg/" }]
+            }),
+        )
+        .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_v: Value = saved.json().await.unwrap();
+    assert_eq!(saved_v["discord"], "https://discord.gg/nova/");
+    assert_eq!(saved_v["resolved"]["discord"], "discord.gg/nova");
+    assert_eq!(saved_v["resolved"]["instagram"], "instagram.com/novagram");
+    assert_eq!(saved_v["resolved"]["next_stream"], "Fridays, 8 PM");
+
+    let next_state = async |ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >| loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        let f: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if f["type"] == "state" && f["data"].get("links").is_some() {
+            break f["data"]["links"].clone();
+        }
+    };
+    let pushed = next_state(&mut ws).await;
+    assert_eq!(pushed["discord"], "discord.gg/nova");
+    assert_eq!(pushed["next_stream"], "Fridays, 8 PM");
+
+    // Creating a scheduled stream pushes an updated resolved next_stream to open overlays.
+    let soon =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 2 * 86_400_000;
+    let created = r
+        .post("/api/v1/schedule", json!({ "info": { "title": "Cozy Fri" }, "platforms": ["twitch"], "start_ms": soon }))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let sched_item: Value = created.json().await.unwrap();
+    let pushed_sched = next_state(&mut ws).await;
+    assert_eq!(pushed_sched["next_stream_at"], soon);
+
+    // Deleting the scheduled stream restores the schedule_text fallback and pushes again.
+    let sid = sched_item["id"].as_str().unwrap();
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/schedule/{sid}", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let pushed_back = next_state(&mut ws).await;
+    assert!(pushed_back["next_stream_at"].is_null());
+    assert_eq!(pushed_back["next_stream"], "Fridays, 8 PM");
+
+    // Partial PUT preserves omitted known fields AND unknown future keys, while "" clears and non-strings 400.
+    let with_future = r.put("/api/v1/links", json!({ "bluesky": "bsky.app/profile/nova" })).await;
+    assert_eq!(with_future.status(), StatusCode::OK);
+    let old_client_patch = r.put("/api/v1/links", json!({ "x": "novaplays" })).await;
+    assert_eq!(old_client_patch.status(), StatusCode::OK);
+    let patch_v: Value = old_client_patch.json().await.unwrap();
+    assert_eq!(patch_v["x"], "novaplays");
+    assert_eq!(patch_v["discord"], "https://discord.gg/nova/");
+    assert_eq!(patch_v["schedule_text"], "Fridays, 8 PM");
+    assert_eq!(patch_v["custom"], json!([{ "label": "Merch", "value": "https://shop.nova.gg/" }]));
+    assert_eq!(patch_v["bluesky"], "bsky.app/profile/nova");
+
+    let cleared_x = r.put("/api/v1/links", json!({ "x": "" })).await;
+    assert_eq!(cleared_x.status(), StatusCode::OK);
+    let cleared_v: Value = cleared_x.json().await.unwrap();
+    assert!(cleared_v["x"].is_null());
+    assert_eq!(cleared_v["discord"], "https://discord.gg/nova/");
+    assert_eq!(r.put("/api/v1/links", json!({ "discord": 123 })).await.status(), StatusCode::BAD_REQUEST);
+
+    // Verify persistence in a fresh Engine started on the same store dir.
+    drop(ws);
+    let dir = r._dir;
+    drop(r.engine);
+    let fresh =
+        Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+    let from_disk = fresh.links().await.unwrap();
+    assert_eq!(from_disk.links.discord.as_deref(), Some("https://discord.gg/nova/"));
+    assert_eq!(json!(from_disk)["bluesky"], "bsky.app/profile/nova");
+}
+
+#[tokio::test]
+async fn links_and_labels_enforce_auth_and_scopes() {
+    let r = start().await;
+    assert_eq!(r.anonymous(reqwest::Method::GET, "/api/v1/links").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r.anonymous(reqwest::Method::PUT, "/api/v1/links").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r.anonymous(reqwest::Method::GET, "/api/v1/labels").await.status(), StatusCode::UNAUTHORIZED);
+
+    let key_v: Value = r
+        .post("/api/v1/api-keys", json!({ "name": "Chat", "scopes": ["chat"], "expires_at": null }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let tok = key_v["token"].as_str().unwrap();
+    assert_eq!(
+        r.client
+            .put(format!("{}/api/v1/links", r.base))
+            .bearer_auth(tok)
+            .json(&json!({ "discord": "x" }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        r.client.get(format!("{}/api/v1/links", r.base)).bearer_auth(tok).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        r.client.get(format!("{}/api/v1/labels", r.base)).bearer_auth(tok).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn corrupt_creator_links_row_does_not_black_out_overlay_snapshots() {
+    let r = start().await;
+    r.engine
+        .db(|s| {
+            s.write(|tx| {
+                tx.execute(
+                    "INSERT INTO settings(key, value, updated_at) VALUES ('creator_links', '{corrupt-json', 1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let ov: Value = r.post("/api/v1/overlays", json!({ "name": "Main" })).await.json().await.unwrap();
+    let ws_url = ov["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let snap: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["type"], "snapshot");
+    assert!(snap["data"]["overlay"].is_object(), "overlay must not null out: {snap}");
+    assert!(snap["data"]["state"]["links"]["socials"].is_array());
+}
+
+#[tokio::test]
+async fn labels_endpoint_returns_real_labels_and_empty_when_unseen() {
+    use ferrocast_core::event::{Actor, Event, EventKind, Millis, PaymentStatus, Platform, TipProvider};
+    use ferrocast_core::money::Money;
+    let r = start().await;
+    let empty = r.get("/api/v1/labels").await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(empty.json::<Value>().await.unwrap(), json!({}));
+
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("f1".into()),
+            Millis(1),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "LunaLagoon") },
+        ))
+        .await;
+    r.engine
+        .ingest(Event::live(
+            Platform::Tips,
+            Some("t1".into()),
+            Millis(2),
+            EventKind::Tip {
+                actor: Actor::named(Platform::Tips, "Asha"),
+                money: Money::new(1000, "USD"),
+                message: None,
+                provider: TipProvider::Stripe,
+                payment_ref: "p1".into(),
+                status: PaymentStatus::Captured,
+            },
+        ))
+        .await;
+
+    let labels: Value = r.get("/api/v1/labels").await.json().await.unwrap();
+    assert_eq!(labels["latest_follower"], "LunaLagoon");
+    assert_eq!(labels["latest_tip"], "Asha $10");
+    assert_eq!(labels["session_follows"], "1");
+    assert_eq!(labels["alltime_follows"], "1");
+
+    // Monthly totals respect ?tz_offset_min=... across UTC month boundary.
+    let now_utc =
+        Millis(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64);
+    let (s_0, _) = ferrocast_core::labels::month_bounds(now_utc, 0);
+    let (s_840, _) = ferrocast_core::labels::month_bounds(now_utc, 840);
+    let edge_ts = if s_840 < s_0 { s_0.0 - 60_000 } else { s_0.0 + 60_000 };
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("f-boundary".into()),
+            Millis(edge_ts),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "BoundaryFan") },
+        ))
+        .await;
+    let utc_labels: Value = r.get("/api/v1/labels?tz_offset_min=0").await.json().await.unwrap();
+    let shifted_labels: Value = r.get("/api/v1/labels?tz_offset_min=840").await.json().await.unwrap();
+    assert_ne!(utc_labels["monthly_follows"], shifted_labels["monthly_follows"]);
+}
+
+#[tokio::test]
+async fn overlay_test_preview_socket_receives_live_links_state_updates() {
+    let r = start().await;
+    let ov: Value = r.post("/api/v1/overlays", json!({ "name": "LivePreview" })).await.json().await.unwrap();
+    let url = ov["url"].as_str().unwrap().replace("http://", "ws://") + "ws?test";
+    let (mut test_ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let snap: Value = serde_json::from_str(test_ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["type"], "snapshot");
+
+    assert_eq!(
+        r.put("/api/v1/links", json!({ "discord": "https://discord.gg/liveview/" })).await.status(),
+        StatusCode::OK
+    );
+
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let msg = test_ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            if v["type"] == "state" && v["data"].get("links").is_some() {
+                break v["data"]["links"].clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(updated["discord"], "discord.gg/liveview");
+}
+
+#[tokio::test]
+async fn put_links_refuses_to_overwrite_corrupt_creator_links_row() {
+    let r = start().await;
+    let corrupt_json = r#"{"discord":"discord.gg/keepme","x":123}"#;
+    r.engine
+        .db(move |s| {
+            s.write(|tx| {
+                tx.execute(
+                    "INSERT INTO settings(key, value, updated_at) VALUES ('creator_links', ?1, 1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [corrupt_json],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let res = r.put("/api/v1/links", json!({ "twitch": "twitch.tv/nova" })).await;
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let err: Value = res.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "storage");
+    let msg = err["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.to_lowercase().contains("my links") && msg.to_lowercase().contains("read"),
+        "expected clear message on failed PUT /links read: {err}"
+    );
+
+    let stored_after: String = r
+        .engine
+        .db(|s| {
+            s.read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = 'creator_links'", [], |r| r.get(0))?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored_after, corrupt_json);
+
+    // Best-effort GET /api/v1/links display path still returns 200 with empty fallback.
+    assert_eq!(r.get("/api/v1/links").await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn golive_quality_options_and_put_quality_cover_every_status_code() {
+    use async_trait::async_trait;
+    use ferrocast_engine::studio_host::{
+        EncodeGroupSpec, FilePick, HostBudgetInfo, Hub, PreviewRect, StudioAct, StudioHost, StudioSettings,
+        StudioStatus,
+    };
+    use ferrocast_testkit::rtmp::{Obs, platform};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    #[derive(Debug, Default)]
+    struct HttpMockStudioHost {
+        settings: Mutex<StudioSettings>,
+        budget: Mutex<Option<HostBudgetInfo>>,
+        supports_groups: AtomicBool,
+        streaming: AtomicBool,
+        started: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+        started_notify: Notify,
+        idr_gates: Mutex<HashMap<String, Arc<Notify>>>,
+    }
+
+    #[async_trait]
+    impl StudioHost for HttpMockStudioHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(StudioStatus::default())
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn settings(&self) -> StudioSettings {
+            self.settings.lock().unwrap().clone()
+        }
+        async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
+            *self.settings.lock().unwrap() = s;
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            self.streaming.store(true, Ordering::Release);
+            Ok(json!({ "active": true }))
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.streaming.store(false, Ordering::Release);
+            let mut started = self.started.lock().unwrap();
+            for (_, t) in started.drain() {
+                t.abort();
+            }
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(if self.streaming.load(Ordering::Acquire) { json!({ "active": true }) } else { Value::Null })
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn pick_file(&self, _p: FilePick) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        fn supports_encode_groups(&self) -> bool {
+            self.supports_groups.load(Ordering::Acquire)
+        }
+        async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+            self.budget.lock().unwrap().clone()
+        }
+        async fn start_encode_group(&self, spec: EncodeGroupSpec, hub: Arc<Hub>) -> Result<bool, String> {
+            if !self.supports_encode_groups() {
+                return Ok(false);
+            }
+            self.streaming.store(true, Ordering::Release);
+            hub.start();
+            hub.video(0, vec![0x17u8, 0x00, 0x00, 0x00, 0x00].into());
+            hub.audio(0, vec![0xAFu8, 0x00, 0x12, 0x10].into());
+            let gate = self.idr_gates.lock().unwrap().get(&spec.id).cloned();
+            let id = spec.id.clone();
+            let pump = tokio::spawn(async move {
+                if let Some(g) = gate {
+                    g.notified().await;
+                }
+                hub.note_encoded_idr();
+                hub.video(33, vec![0x17u8, 0x01, 0x00, 0x00, 0x01].into());
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+            self.started.lock().unwrap().insert(id, pump);
+            self.started_notify.notify_waiters();
+            Ok(true)
+        }
+        async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+            if let Some(t) = self.started.lock().unwrap().remove(id) {
+                t.abort();
+            }
+            Ok(())
+        }
+    }
+
+    let r = start().await;
+
+    // 401 unauthorized without session bearer token on both GET & PUT.
+    assert_eq!(
+        error_code(r.anonymous(reqwest::Method::GET, "/api/v1/golive/quality-options").await).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        error_code(r.anonymous(reqwest::Method::PUT, "/api/v1/golive/destinations/kick/quality").await).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 403 forbidden when Origin header violates CSRF rules on PUT.
+    let bad_origin = r
+        .client
+        .put(format!("{}/api/v1/golive/destinations/kick/quality", r.base))
+        .bearer_auth(&r.token)
+        .header("Origin", "https://evil.example")
+        .json(&json!({ "mode": "same_as_main" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+    // 415 unsupported media type without application/json content-type.
+    let wrong_ct = r
+        .client
+        .put(format!("{}/api/v1/golive/destinations/kick/quality", r.base))
+        .bearer_auth(&r.token)
+        .header("Content-Type", "text/plain")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_code(wrong_ct).await, (StatusCode::UNSUPPORTED_MEDIA_TYPE, "wrong_content_type".into()));
+
+    // Attach Studio host (1440p60 H264, Apple Silicon 2 engines so multi-encode works).
+    let host = Arc::new(HttpMockStudioHost::default());
+    *host.settings.lock().unwrap() =
+        StudioSettings { width: 2560, height: 1440, fps: 60, video_kbps: 16_000, ..Default::default() };
+    *host.budget.lock().unwrap() = Some(HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        vertical_on: true,
+        vertical_size: Some((1080, 1920)),
+        host_sig: "mac-m2-http".into(),
+        ..Default::default()
+    });
+    host.supports_groups.store(true, Ordering::Release);
+    r.engine.set_studio_host(host.clone());
+
+    // 200 GET /golive/quality-options returns full options tree, hard Kick cap, soft Twitch note.
+    let opts_res = r.get("/api/v1/golive/quality-options").await;
+    assert_eq!(opts_res.status(), StatusCode::OK);
+    let opts: Value = opts_res.json().await.unwrap();
+    assert_eq!(opts["source"], "studio");
+    assert_eq!(opts["main"]["width"], 2560);
+    assert_eq!(opts["vertical"]["width"], 1080);
+    assert_eq!(opts["destinations"]["kick"]["custom_limits"]["max_height"], 1080);
+    assert!(
+        opts["destinations"]["twitch"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == "1440p60_6000" && o["note"].as_str().unwrap().contains("recommended 1080p"))
+    );
+
+    // 404 unknown destination id.
+    let res_404 = r.put("/api/v1/golive/destinations/does_not_exist/quality", json!({ "mode": "same_as_main" })).await;
+    assert_eq!(error_code(res_404).await, (StatusCode::NOT_FOUND, "not_found".into()));
+
+    // 400 malformed JSON, unknown fields (deny_unknown_fields), invalid custom dims/fps/kbps/upscale/vp9.
+    assert_eq!(
+        error_code(r.raw(reqwest::Method::PUT, "/api/v1/golive/destinations/kick/quality", "{bad").await).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    for bad_body in [
+        json!({ "mode": "same_as_main", "extra": 1 }),
+        json!({ "mode": "same_as_main", "width": null }),
+        json!({ "mode": "same_as_main", "codec": null }),
+        json!({ "mode": "same_as_main", "kbps": 3000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "extra": true }),
+        json!({ "mode": "custom", "width": 1281, "height": 720, "fps": 30, "kbps": 3000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 45, "kbps": 3000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 100 }),
+        json!({ "mode": "custom", "width": 3840, "height": 2160, "fps": 60, "kbps": 8000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "codec": "vp9" }),
+    ] {
+        let res = r.put("/api/v1/golive/destinations/kick/quality", bad_body.clone()).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "expected 400 for {bad_body}");
+    }
+
+    // 422 platform_limit_exceeded and golive_quality_locked domain rejections.
+    let over_kick = r
+        .put(
+            "/api/v1/golive/destinations/kick/quality",
+            json!({ "mode": "custom", "width": 2560, "height": 1440, "fps": 60, "kbps": 8000 }),
+        )
+        .await;
+    assert_eq!(error_code(over_kick).await, (StatusCode::UNPROCESSABLE_ENTITY, "platform_limit_exceeded".into()));
+    let locked_av1 = r
+        .put(
+            "/api/v1/golive/destinations/youtube/quality",
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "codec": "av1" }),
+        )
+        .await;
+    assert_eq!(error_code(locked_av1).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_quality_locked".into()));
+
+    // 200 PUT custom quality offline + additive GoLiveView fields.
+    let put_ok = r
+        .put(
+            "/api/v1/golive/destinations/kick/quality",
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3500, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(put_ok.status(), StatusCode::OK);
+    let view: Value = put_ok.json().await.unwrap();
+    let kick_v = view["destinations"].as_array().unwrap().iter().find(|d| d["id"] == "kick").unwrap();
+    assert_eq!(kick_v["quality"]["mode"], "custom");
+    assert_eq!(kick_v["resolved_quality"]["width"], 1280);
+    assert_eq!(kick_v["resolved_quality"]["kbps"], 3500);
+    assert_eq!(kick_v["switching_quality"], false);
+    assert!(view["encode_budget"]["status"].is_string());
+    assert!(view["encode_groups"].is_array());
+
+    // 200 reset back to same_as_main.
+    let reset_ok = r.put("/api/v1/golive/destinations/kick/quality", json!({ "mode": "same_as_main" })).await;
+    assert_eq!(reset_ok.status(), StatusCode::OK);
+
+    // Set up enabled custom RTMP destination to verify HTTP 422 budget exceeded, 200 live switch, & 409 concurrent switch.
+    let (p1, mut got1) = platform("http-q1").await;
+    let custom1: Value = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "C1", "url": format!("rtmp://127.0.0.1:{p1}/app"), "key": "http-q1" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let c1_id = custom1["id"].as_str().unwrap().to_string();
+
+    // 422 offline encode_budget_exceeded: tighten host to Windows NVENC pre-550 (2 effective sessions), add 2nd custom.
+    let (p2, _got2) = platform("http-q2").await;
+    let custom2: Value = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "C2", "url": format!("rtmp://127.0.0.1:{p2}/app"), "key": "http-q2" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let c2_id = custom2["id"].as_str().unwrap().to_string();
+    let (p3, _got3) = platform("http-q3").await;
+    let custom3: Value = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "C3", "url": format!("rtmp://127.0.0.1:{p3}/app"), "key": "http-q3" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let c3_id = custom3["id"].as_str().unwrap().to_string();
+    let order: Vec<Value> = r.get("/api/v1/golive").await.json::<Value>().await.unwrap()["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let id = d["id"].as_str().unwrap();
+            json!({ "id": id, "enabled": id == c1_id || id == c2_id || id == c3_id })
+        })
+        .collect();
+    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": order })).await.status(), StatusCode::OK);
+
+    // Pin c2 to 720p60, shrink NVENC to 2 effective sessions (driver <531 -> 3 max, 1 spare = 2),
+    // then pushing c3 to a 3rd group (480p30) -> 422.
+    *host.settings.lock().unwrap() =
+        StudioSettings { width: 1920, height: 1080, fps: 60, video_kbps: 8_000, ..Default::default() };
+    *host.budget.lock().unwrap() = Some(HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        nvidia_driver_major: Some(525),
+        cpu_cores: 8,
+        host_sig: "win-525".into(),
+        ..Default::default()
+    });
+    assert_eq!(
+        r.put(
+            &format!("/api/v1/golive/destinations/{c2_id}/quality"),
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 60, "kbps": 4500, "codec": "h264" }),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let over_budget_res = r
+        .put(
+            &format!("/api/v1/golive/destinations/{c3_id}/quality"),
+            json!({ "mode": "custom", "width": 852, "height": 480, "fps": 30, "kbps": 1500, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(error_code(over_budget_res).await, (StatusCode::UNPROCESSABLE_ENTITY, "encode_budget_exceeded".into()));
+
+    // Restore Apple Silicon 4-engine headroom and go live with c1, then verify HTTP 200 live switch & HTTP 409 concurrent switch.
+    *host.budget.lock().unwrap() = Some(HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2-live".into(),
+        ..Default::default()
+    });
+    let only_c1: Vec<Value> = r.get("/api/v1/golive").await.json::<Value>().await.unwrap()["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| json!({ "id": d["id"], "enabled": d["id"] == c1_id }))
+        .collect();
+    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": only_c1 })).await.status(), StatusCode::OK);
+
+    r.engine.studio_stream(true).await.unwrap();
+    let live_put = r
+        .put(
+            &format!("/api/v1/golive/destinations/{c1_id}/quality"),
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(live_put.status(), StatusCode::OK);
+    let live_view: Value = live_put.json().await.unwrap();
+    let live_c1 = live_view["destinations"].as_array().unwrap().iter().find(|d| d["id"] == c1_id).unwrap();
+    assert_eq!(live_c1["resolved_quality"]["width"], 1280);
+
+    // 409 conflict while a live switch for the same destination is awaiting its keyframe.
+    let target_480 = json!({ "mode": "custom", "width": 852, "height": 480, "fps": 30, "kbps": 1500, "codec": "h264" });
+    let gate_inserted;
+    {
+        let mut p_in = r.engine.golive_planner_input(r.engine.cached_pc_budget());
+        if let Some(pd) = p_in.destinations.iter_mut().find(|d| d.id == c1_id) {
+            pd.quality =
+                ferrocast_engine::golive::DestinationQuality::Custom(ferrocast_engine::golive::CustomQuality {
+                    width: 852,
+                    height: 480,
+                    fps: 30,
+                    kbps: 1500,
+                    codec: Some(ferrocast_engine::golive::VideoCodec::H264),
+                });
+        }
+        let gid = ferrocast_engine::golive::plan_encodes(&p_in).destinations[&c1_id].group_id.clone();
+        let notify = Arc::new(Notify::new());
+        host.idr_gates.lock().unwrap().insert(gid.clone(), notify.clone());
+        gate_inserted = Some((gid, notify));
+    }
+    let (gated_gid, gate_notify) = gate_inserted.unwrap();
+
+    let url = format!("{}/api/v1/golive/destinations/{c1_id}/quality", r.base);
+    let fut1 = r.client.put(&url).bearer_auth(&r.token).json(&target_480).send();
+    let client2 = r.client.clone();
+    let tok2 = r.token.clone();
+    let h1 = tokio::spawn(fut1);
+    loop {
+        let notified = host.started_notify.notified();
+        if host.started.lock().unwrap().contains_key(&gated_gid) || h1.is_finished() {
+            break;
+        }
+        notified.await;
+    }
+    let res_409 = client2.put(&url).bearer_auth(&tok2).json(&json!({ "mode": "same_as_main" })).send().await.unwrap();
+    assert_eq!(error_code(res_409).await, (StatusCode::CONFLICT, "conflict".into()));
+
+    // Release IDR gate so first switch finishes 200 cleanly, then stop Studio.
+    gate_notify.notify_waiters();
+    assert_eq!(h1.await.unwrap().unwrap().status(), StatusCode::OK);
+    r.engine.studio_stream(false).await.unwrap();
+
+    // 422 OBS live mode refusal (`golive_needs_new_encode`), even when Studio settings default to 30 fps
+    // and the request specifies a 60 fps Custom preset.
+    *host.settings.lock().unwrap() =
+        StudioSettings { width: 1920, height: 1080, fps: 30, video_kbps: 6_000, ..Default::default() };
+    r.engine.start_golive(0).await;
+    let ing: Value = r.get("/api/v1/golive/ingest").await.json().await.unwrap();
+    let key = ing["key"].as_str().unwrap();
+    let ingest_port: u16 =
+        ing["server"].as_str().unwrap().rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let mut obs = Obs::publish(ingest_port, "live", key).await.unwrap();
+    let _ = obs.keyframes_until_seen(&mut got1).await;
+    let obs_opts: Value = r.get("/api/v1/golive/quality-options").await.json().await.unwrap();
+    assert_eq!(obs_opts["source"], "obs");
+    assert!(obs_opts["destinations"][&c1_id]["locked_reason"].is_string());
+    let obs_422 =
+        r.put(&format!("/api/v1/golive/destinations/{c1_id}/quality"), json!({ "mode": "same_as_main" })).await;
+    assert_eq!(error_code(obs_422).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_needs_new_encode".into()));
+    let obs_422_custom = r
+        .put(
+            &format!("/api/v1/golive/destinations/{c1_id}/quality"),
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 60, "kbps": 4500, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(error_code(obs_422_custom).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_needs_new_encode".into()));
+}
+
+#[test]
+fn poll_spec_max_length_and_asyncapi_status_tts_stop_match_runtime() {
+    let openapi = crate::spec::openapi();
+    assert_eq!(openapi["components"]["schemas"]["PollSpec"]["properties"]["question"]["maxLength"], 120);
+    let asyncapi = crate::spec::asyncapi();
+    assert!(
+        asyncapi["channels"]["live"]["messages"]["status"]["payload"]["properties"]["data"]["properties"]
+            .get("viewers")
+            .is_some(),
+        "AsyncAPI status payload must document viewers"
+    );
+    assert!(
+        asyncapi["channels"]["overlay"]["messages"]["tts_stop"]["payload"]["properties"]["data"]["properties"]
+            .get("ids")
+            .is_some(),
+        "AsyncAPI tts_stop payload must document ids"
+    );
 }

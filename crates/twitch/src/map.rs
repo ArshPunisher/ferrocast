@@ -16,6 +16,8 @@ pub struct Sub {
     pub version: &'static str,
     /// Which ids go into the condition.
     pub condition: Condition,
+    /// Optional subscriptions (such as native poll events) skip silently if the token lacks scope.
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,24 +46,38 @@ impl Sub {
 /// Everything we listen to. Signed-in streamer is broadcaster, moderator and chat user, so
 /// every subscription costs 0 against Twitch's limit.
 pub const SUBSCRIPTIONS: &[Sub] = &[
-    Sub { kind: "channel.chat.message", version: "1", condition: Condition::BroadcasterAndUser },
-    Sub { kind: "channel.chat.message_delete", version: "1", condition: Condition::BroadcasterAndUser },
-    Sub { kind: "channel.chat.clear_user_messages", version: "1", condition: Condition::BroadcasterAndUser },
-    Sub { kind: "channel.follow", version: "2", condition: Condition::BroadcasterAndModerator },
-    Sub { kind: "channel.subscribe", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "channel.subscription.message", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "channel.subscription.gift", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "channel.cheer", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "channel.raid", version: "1", condition: Condition::ToBroadcaster },
+    Sub { kind: "channel.chat.message", version: "1", condition: Condition::BroadcasterAndUser, optional: false },
+    Sub {
+        kind: "channel.chat.message_delete",
+        version: "1",
+        condition: Condition::BroadcasterAndUser,
+        optional: false,
+    },
+    Sub {
+        kind: "channel.chat.clear_user_messages",
+        version: "1",
+        condition: Condition::BroadcasterAndUser,
+        optional: false,
+    },
+    Sub { kind: "channel.follow", version: "2", condition: Condition::BroadcasterAndModerator, optional: false },
+    Sub { kind: "channel.subscribe", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "channel.subscription.message", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "channel.subscription.gift", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "channel.cheer", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "channel.raid", version: "1", condition: Condition::ToBroadcaster, optional: false },
     Sub {
         kind: "channel.channel_points_custom_reward_redemption.add",
         version: "1",
         condition: Condition::Broadcaster,
+        optional: false,
     },
-    Sub { kind: "channel.ban", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "stream.online", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "stream.offline", version: "1", condition: Condition::Broadcaster },
-    Sub { kind: "channel.ad_break.begin", version: "1", condition: Condition::Broadcaster },
+    Sub { kind: "channel.ban", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "stream.online", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "stream.offline", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "channel.ad_break.begin", version: "1", condition: Condition::Broadcaster, optional: false },
+    Sub { kind: "channel.poll.begin", version: "1", condition: Condition::Broadcaster, optional: true },
+    Sub { kind: "channel.poll.progress", version: "1", condition: Condition::Broadcaster, optional: true },
+    Sub { kind: "channel.poll.end", version: "1", condition: Condition::Broadcaster, optional: true },
 ];
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -259,6 +275,25 @@ pub fn map(kind: &str, message_id: &str, event: &Value, at: Millis) -> Event {
         "stream.offline" => EventKind::StreamOffline,
         "channel.ad_break.begin" => {
             EventKind::AdBreak { seconds: u32::try_from(n(event, "duration_seconds")).unwrap_or(0) }
+        }
+        "channel.poll.begin" | "channel.poll.progress" | "channel.poll.end" => {
+            let Some(poll_id) = s(event, "id").map(String::from) else {
+                return Event::live(
+                    Platform::Twitch,
+                    Some(message_id.to_string()),
+                    at,
+                    EventKind::Unknown { name: kind.to_string() },
+                );
+            };
+            let counts = event
+                .get("choices")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().map(|c| n(c, "votes")).collect())
+                .unwrap_or_default();
+            let status = s(event, "status").unwrap_or("");
+            let ended = kind == "channel.poll.end"
+                || matches!(status, "completed" | "terminated" | "archived" | "moderated" | "invalid");
+            EventKind::NativePoll { poll_id, counts, ended }
         }
         other => EventKind::Unknown { name: other.to_string() },
     };

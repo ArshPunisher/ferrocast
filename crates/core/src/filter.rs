@@ -242,6 +242,38 @@ const SOLICITATION: &[&str] = &[
     "remove the space",
 ];
 
+/// Checks whether `text` matches any custom blocked word in `cfg.words`, ignoring
+/// `cfg.exempt_roles`.
+pub fn blocked_word(cfg: &FilterConfig, text: &str) -> Option<String> {
+    if !cfg.words.enabled || cfg.words.list.is_empty() {
+        return None;
+    }
+    let folded = cfg.words.lookalikes.then(|| fold(text));
+    blocked_word_in(cfg, text, folded.as_deref())
+}
+
+fn blocked_word_in(cfg: &FilterConfig, text: &str, folded: Option<&str>) -> Option<String> {
+    if !cfg.words.enabled || cfg.words.list.is_empty() {
+        return None;
+    }
+    let plain = (!cfg.words.lookalikes).then(|| normalize_invisible_nfkc(text).to_lowercase());
+    for term in &cfg.words.list {
+        let hit = if let Some(folded) = folded {
+            let needle = fold(term);
+            !needle.is_empty() && contains_term(folded, &needle)
+        } else if let Some(plain) = &plain {
+            let needle = normalize_invisible_nfkc(term.trim()).to_lowercase();
+            !needle.is_empty() && contains_plain(plain, &needle)
+        } else {
+            false
+        };
+        if hit {
+            return Some(term.clone());
+        }
+    }
+    None
+}
+
 /// Checks one message. `emotes` is the number of emote fragments.
 pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Verdict {
     if actor.roles.0 & cfg.exempt_roles.0 != 0 {
@@ -249,23 +281,8 @@ pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Ve
     }
     let mut v = Verdict::allow();
     let folded = fold(text);
-    if cfg.words.enabled {
-        let plain = text.to_lowercase();
-        for term in &cfg.words.list {
-            let hit = if cfg.words.lookalikes {
-                let needle = fold(term);
-                !needle.is_empty() && contains_term(&folded, &needle)
-            } else {
-                let needle = term.trim().to_lowercase();
-                !needle.is_empty() && contains_plain(&plain, &needle)
-            };
-            if hit {
-                v = v.worse(Verdict {
-                    action: cfg.action(cfg.words.action),
-                    reason: format!("blocked term \"{term}\""),
-                });
-            }
-        }
+    if let Some(term) = blocked_word_in(cfg, text, cfg.words.lookalikes.then_some(folded.as_str())) {
+        v = v.worse(Verdict { action: cfg.action(cfg.words.action), reason: format!("blocked term \"{term}\"") });
     }
     if cfg.solicitation.enabled {
         // Whole words only: "hi do emotes work" must not read as "i do emotes". A phrase
@@ -343,6 +360,12 @@ fn contains_plain(text: &str, needle: &str) -> bool {
 /// Folds text for matching (see module docs). Output is lowercase ASCII-ish words
 /// separated by single spaces.
 pub fn fold(text: &str) -> String {
+    fold_with(text, |_| false)
+}
+
+/// Folds text like [`fold`] while preserving double occurrences of characters where
+/// `keep_double` returns true.
+pub(crate) fn fold_with(text: &str, keep_double: impl Fn(char) -> bool) -> String {
     let mapped: String =
         text.nfkc().flat_map(char::to_lowercase).filter(|c| !is_invisible(*c)).map(lookalike).collect();
     // Collapse "b.a.d" / "b a d" / "b-a-d": separators between single characters.
@@ -362,7 +385,7 @@ pub fn fold(text: &str) -> String {
     if !run.is_empty() {
         words.push(run);
     }
-    words.iter().map(|w| squeeze(w)).collect::<Vec<_>>().join(" ")
+    words.iter().map(|w| squeeze_with(w, &keep_double)).collect::<Vec<_>>().join(" ")
 }
 
 /// Whole-word match for single words, substring match inside words for longer terms so
@@ -375,25 +398,45 @@ fn contains_term(folded: &str, needle: &str) -> bool {
     folded.split(' ').any(|w| w == needle)
 }
 
-fn squeeze(word: &str) -> String {
+fn squeeze_with(word: &str, keep_double: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(word.len());
     let mut last = None;
+    let mut run = 0usize;
     for c in word.chars() {
-        if Some(c) != last {
+        run = if Some(c) == last { run + 1 } else { 1 };
+        last = Some(c);
+        let max = if keep_double(c) { 2 } else { 1 };
+        if run <= max {
             out.push(c);
         }
-        last = Some(c);
     }
     out
 }
 
-fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{00ad}' | '\u{034f}' | '\u{180e}')
-        || ('\u{0300}'..='\u{036f}').contains(&c) // combining marks (zalgo)
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+    ) || ('\u{0300}'..='\u{036f}').contains(&c) // combining marks (zalgo)
         || ('\u{e0000}'..='\u{e007f}').contains(&c) // tag characters
+        || ('\u{e0100}'..='\u{e01ef}').contains(&c) // variation selectors supplement
 }
 
-fn lookalike(c: char) -> char {
+/// Applies Unicode NFKC normalization and strips invisible, BiDi, format, and non-whitespace
+/// control characters before text enters moderation or TTS checks.
+pub(crate) fn normalize_invisible_nfkc(text: &str) -> String {
+    text.nfkc().filter(|c| !is_invisible(*c) && (!c.is_control() || c.is_whitespace())).collect()
+}
+
+pub(crate) fn lookalike(c: char) -> char {
     match c {
         '0' => 'o',
         '1' | '!' | '|' => 'i',
@@ -429,11 +472,119 @@ fn has_link(text: &str) -> bool {
     !links(text).is_empty()
 }
 
+fn strip_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    }
+}
+
+/// Unambiguous TLDs safe to join after a trailing sentence-like period (`evil. com`) without
+/// flagging normal prose such as `"I won. It was great."` or `"Good game. Lol"`.
+fn is_unambiguous_spaced_tld(t: &str) -> bool {
+    matches!(
+        t,
+        "com"
+            | "net"
+            | "org"
+            | "xyz"
+            | "dev"
+            | "app"
+            | "biz"
+            | "icu"
+            | "sbs"
+            | "monster"
+            | "website"
+            | "io"
+            | "gg"
+            | "ly"
+            | "co"
+            | "uk"
+            | "ru"
+            | "de"
+            | "fr"
+            | "jp"
+            | "cn"
+            | "br"
+            | "kr"
+            | "pl"
+            | "nl"
+            | "se"
+            | "cz"
+            | "ua"
+            | "tr"
+            | "hk"
+            | "sg"
+            | "tw"
+            | "vg"
+            | "tk"
+            | "pw"
+            | "cc"
+            | "ws"
+    )
+}
+
+fn collapse_spaced_dots(s: &str) -> String {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return s.to_string();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        if let Some(prev) = out.last_mut() {
+            if let Some(after_dot) = tok.strip_prefix('.')
+                && !after_dot.starts_with('.')
+                && prev.chars().next_back().is_some_and(char::is_alphanumeric)
+            {
+                let host_part = after_dot.split(['/', '?', '#', '@']).next().unwrap_or("");
+                let tld = strip_port(host_part).trim_end_matches(|c: char| !c.is_alphanumeric());
+                if is_tld(tld) {
+                    prev.push_str(tok);
+                    continue;
+                }
+            }
+            if prev.ends_with('.')
+                && !prev.ends_with("..")
+                && prev.strip_suffix('.').and_then(|p| p.chars().next_back()).is_some_and(char::is_alphanumeric)
+            {
+                let trimmed = tok.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '/');
+                let has_path = trimmed.contains(['/', '?', '#', '@']);
+                let host_part = trimmed.split(['/', '?', '#', '@']).next().unwrap_or("");
+                let tld = strip_port(host_part).trim_end_matches(|c: char| !c.is_alphanumeric());
+                let can_merge = if has_path { is_tld(tld) } else { is_unambiguous_spaced_tld(tld) };
+                if can_merge {
+                    prev.push_str(tok);
+                    continue;
+                }
+            }
+        }
+        out.push(tok.to_string());
+    }
+    out.join(" ")
+}
+
 /// Domains of anything that looks like a link, including "example . com" and "hxxp" tricks.
 pub(crate) fn links(text: &str) -> Vec<String> {
-    let lower = text.to_lowercase().replace(" . ", ".").replace("[.]", ".").replace("(.)", ".").replace(" dot ", ".");
+    let norm = normalize_invisible_nfkc(text).to_lowercase();
+    let collapsed_ws: String = norm.split_whitespace().collect::<Vec<_>>().join(" ");
+    let pre = collapsed_ws
+        .replace("[ . ]", ".")
+        .replace("( . )", ".")
+        .replace("{ . }", ".")
+        .replace("[.]", ".")
+        .replace("(.)", ".")
+        .replace("{.}", ".")
+        .replace(" dot ", ".")
+        .replace(" . ", ".")
+        .replace(" : //", "://")
+        .replace(": //", "://")
+        .replace(" ://", "://")
+        .replace(":// ", "://")
+        .replace("www . ", "www.")
+        .replace("www. ", "www.");
+    let spaced = collapse_spaced_dots(&pre);
     let mut out = Vec::new();
-    for raw in lower.split_whitespace() {
+    for raw in spaced.split_whitespace() {
         let w = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != ':');
         let w = w
             .strip_prefix("https://")
@@ -442,6 +593,7 @@ pub(crate) fn links(text: &str) -> Vec<String> {
             .or_else(|| w.strip_prefix("hxxp://"))
             .unwrap_or(w);
         let host = w.split(['/', '?', '#']).next().unwrap_or("");
+        let host = strip_port(host).trim_end_matches('.');
         let host = host.strip_prefix("www.").unwrap_or(host);
         let parts: Vec<&str> = host.split('.').collect();
         let tld_ok = parts.last().is_some_and(|t| is_tld(t));
@@ -683,5 +835,46 @@ mod tests {
         let cfg = cfg_with("badword");
         let zalgo = "z\u{0301}\u{0302}\u{0303}".repeat(20_000);
         let _ = check(&cfg, &viewer(), &zalgo, 0);
+    }
+
+    #[test]
+    fn links_catch_invisible_chars_fullwidth_and_spaced_dots_without_prose_false_positives() {
+        for hostile in [
+            "check https:\u{200b}//evil.\u{200b}com",
+            "visit evil.\u{2066}com",
+            "go to \u{ff45}\u{ff56}\u{ff49}\u{ff4c}.\u{ff43}\u{ff4f}\u{ff4d}",
+            "visit evil .com",
+            "visit evil. com",
+            "visit evil   .   com",
+            "visit evil [.] com",
+            "visit bit. ly/scam",
+            "visit evil. live/promo",
+            "visit evil.com.",
+        ] {
+            assert!(!links(hostile).is_empty(), "must detect link in {hostile:?}");
+        }
+        for safe in [
+            "Mr. Bean is funny",
+            "I won. It was great.",
+            "Good game. Lol that was funny",
+            "Nice stream. Live now!",
+            "Watch the game. TV is on.",
+            "e.g. this",
+            "U.S.A. vs IN",
+            "version 1.2 is out... ok.",
+        ] {
+            assert!(links(safe).is_empty(), "false positive link in {safe:?}: {:?}", links(safe));
+        }
+    }
+
+    #[test]
+    fn blocked_word_catches_bidi_and_variation_selector_evasions() {
+        for lookalikes in [true, false] {
+            let mut cfg = cfg_with("scam");
+            cfg.words.lookalikes = lookalikes;
+            for hostile in ["sc\u{2066}am", "sc\u{202e}am", "sc\u{fe0f}am", "sc\u{061c}am"] {
+                assert!(blocked_word(&cfg, hostile).is_some(), "must catch {hostile:?} (lookalikes={lookalikes})");
+            }
+        }
     }
 }

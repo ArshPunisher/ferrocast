@@ -17,12 +17,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use ferrocast_engine::studio_host::{
-    AudioChange, FilterEdit, ItemEdit, MediaAct, NewSource, SceneTransition, StudioAct, StudioModeOptions, WebAct,
+    AudioChange, FilterEdit, ItemEdit, ItemTarget, MediaAct, NamedTransitionInput, NamedTransitionPatch, NewSource,
+    SceneTransition, StudioAct, StudioModeOptions, WebAct,
 };
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::extract::Body;
+use crate::extract::{Body, OptionalBody};
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -44,6 +45,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
+        .route("/studio/engine/scenes/{scene}/items/boxes", put(engine_item_boxes))
         .route("/studio/engine/scenes/{scene}/items/{id}/crop", put(engine_item_crop))
         .route("/studio/engine/scenes/{scene}/thumbnail", get(engine_scene_thumbnail))
         .route(
@@ -52,6 +54,12 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route("/studio/engine/preview/selection", put(engine_select))
         .route("/studio/engine/preview/cursor", put(engine_cursor))
+        .route("/studio/engine/preview/pause", get(engine_preview_paused).put(engine_set_preview_paused))
+        .route("/studio/engine/clipboard", get(engine_clipboard).delete(engine_clipboard_clear))
+        .route("/studio/engine/clipboard/source", post(engine_copy_source))
+        .route("/studio/engine/clipboard/filters", post(engine_copy_filters))
+        .route("/studio/engine/clipboard/paste/source", post(engine_paste_source))
+        .route("/studio/engine/clipboard/paste/filters", post(engine_paste_filters_clip))
         .route("/studio/engine/studio-mode", put(engine_studio_mode))
         .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
         .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
@@ -63,6 +71,21 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items/{id}/group", put(engine_item_group))
         .route("/studio/engine/scenes/{scene}/items/{id}/ungroup", post(engine_ungroup))
         .route("/studio/engine/scenes/{scene}/items/{id}/order", put(engine_item_order))
+        .route(
+            "/studio/engine/scenes/{scene}/items/{id}/filters",
+            get(engine_item_filters).post(engine_add_item_filter),
+        )
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/scope", put(engine_set_item_filter_scope))
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}", delete(engine_remove_item_filter))
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/edit", post(engine_edit_item_filter))
+        .route(
+            "/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/settings",
+            get(engine_item_filter_settings).put(engine_update_item_filter),
+        )
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/options", get(engine_item_filter_options))
+        .route("/studio/engine/scenes/{scene}/items/{id}/paste-filters", post(engine_paste_item_filters))
+        .route("/studio/engine/scenes/{scene}/items/{id}/picture", get(engine_item_picture))
+        .route("/studio/engine/scenes/{scene}/items/{id}/screenshot", post(engine_item_screenshot))
         .route("/studio/engine/sources/{name}/deinterlace", put(engine_deinterlace))
         .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
@@ -83,15 +106,28 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/vertical/follow", get(engine_follow).put(engine_set_follow))
         .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
+        .route("/studio/engine/keys/capture", post(engine_capture_keys))
+        .route("/studio/engine/live-alerts/silence", post(engine_silence_alert))
         .route("/studio/engine/screens", get(engine_screens))
         .route("/studio/engine/library/{kind}", get(engine_shelf_list).post(engine_shelf_new))
         .route("/studio/engine/library/{kind}/current", put(engine_shelf_switch))
         .route("/studio/engine/library/{kind}/import", post(engine_shelf_import))
+        .route("/studio/engine/library/collections/overlay/import", post(engine_overlay_import))
+        .route("/studio/engine/library/collections/overlay/undo", post(engine_overlay_undo))
         .route("/studio/engine/library/{kind}/{id}", delete(engine_shelf_remove))
         .route("/studio/engine/library/{kind}/{id}/rename", post(engine_shelf_rename))
         .route("/studio/engine/library/{kind}/{id}/export", get(engine_shelf_export))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
+        .route("/studio/engine/transitions", post(engine_add_named_transition))
+        .route(
+            "/studio/engine/transitions/{name}",
+            put(engine_update_named_transition).delete(engine_delete_named_transition),
+        )
+        .route("/studio/engine/transitions/{name}/rename", post(engine_rename_named_transition))
+        .route("/studio/engine/transitions/{name}/duplicate", post(engine_duplicate_named_transition))
+        .route("/studio/engine/transitions/{name}/default", put(engine_default_named_transition))
+        .route("/studio/engine/transition-matrix", put(engine_set_transition_matrix))
         .route("/studio/engine/top-layer", put(engine_top_layer))
         .route(
             "/studio/engine/transitions/{kind}/settings",
@@ -116,11 +152,14 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
         .route("/studio/engine/sources/{name}/status", get(engine_source_status))
         .route("/studio/engine/screens/{id}/still", get(engine_screen_still))
+        .route("/studio/engine/still", get(engine_source_still))
         .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
         .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
+        .route("/studio/engine/obs-collections/preview", post(engine_preview_obs))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
+        .route("/studio/engine/streamlabs-collections/preview", post(engine_preview_streamlabs))
         .route("/studio/engine/streamlabs-collections/import", post(engine_import_streamlabs))
         .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
         .route(
@@ -133,6 +172,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/audio-care", get(audio_care).put(set_audio_care))
         .route("/studio/engine/privacy", get(privacy).put(set_privacy))
         .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
+        .route("/studio/engine/auto-config", get(engine_auto_config))
+        .route("/studio/engine/auto-config/benchmark", post(engine_auto_config_benchmark))
+        .route("/studio/engine/auto-config/cancel", post(engine_auto_config_cancel))
+        .route("/studio/engine/auto-config/apply", post(engine_auto_config_apply))
+        .route("/studio/engine/auto-config/keep", post(engine_auto_config_keep))
+        .route("/studio/engine/auto-config/undo", post(engine_auto_config_undo))
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
         .route("/studio/engine/record/pause", post(engine_record_pause))
@@ -150,6 +195,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/ndi", post(engine_ndi_output))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
+        .route("/studio/remote-control", get(remote_control).post(set_remote_control))
+        .route("/studio/remote-control/password", post(new_remote_control_password))
         .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
         .route("/studio/engine/monitoring", get(engine_monitoring))
         // chatbot
@@ -385,8 +432,11 @@ async fn engine_status(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.studio_status().await))
 }
 
-async fn engine_start(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.studio_start().await?)))
+async fn engine_start(
+    State(app): State<AppState>,
+    OptionalBody(opts): OptionalBody<ferrocast_engine::StartOptions>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.studio_start_with(opts).await?)))
 }
 
 async fn engine_stop(State(app): State<AppState>) -> ApiResult<Json<Value>> {
@@ -430,12 +480,39 @@ async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -
 }
 
 #[derive(Deserialize)]
+struct PausedBody {
+    paused: bool,
+}
+
+/// `GET /studio/engine/preview/pause` → `{ paused }`: performance mode, whether the preview is paused.
+async fn engine_preview_paused(State(app): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let paused = app.engine.studio_preview_paused().await?;
+    Ok(Json(serde_json::json!({ "paused": paused })))
+}
+
+/// `PUT /studio/engine/preview/pause` `{ paused }` → `{ paused }`: pauses or resumes drawing the
+/// preview (performance mode). The stream and recording are never touched.
+async fn engine_set_preview_paused(
+    State(app): State<AppState>,
+    Body(b): Body<PausedBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let paused = app.engine.studio_set_preview_paused(b.paused).await?;
+    Ok(Json(serde_json::json!({ "paused": paused })))
+}
+
+#[derive(Deserialize)]
 struct StreamBody {
     on: bool,
+    /// With `on: false`: don't send what the stream delay still holds (Stop now).
+    #[serde(default)]
+    discard_delay: bool,
 }
 
 async fn engine_stream(State(app): State<AppState>, Body(b): Body<StreamBody>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.studio_stream(b.on).await?))
+    if b.on {
+        return Ok(Json(app.engine.studio_stream(true).await?));
+    }
+    Ok(Json(app.engine.studio_stream_stop(b.discard_delay).await?))
 }
 
 async fn engine_stream_stats(State(app): State<AppState>) -> ApiResult<Json<Value>> {
@@ -501,6 +578,9 @@ struct AddItemBody {
 #[derive(Deserialize)]
 struct LevelsBody {
     names: Vec<String>,
+    /// "fast": the last few blocks (about 43 ms); otherwise the 300 ms window.
+    #[serde(default)]
+    window: Option<String>,
 }
 
 /// `GET /studio/engine/scenes` → `{ scenes, current, transition }`.
@@ -644,6 +724,25 @@ async fn engine_item_box(
 }
 
 #[derive(Deserialize)]
+struct BoxesBody {
+    items: Vec<ferrocast_engine::studio_host::ItemBoxIn>,
+    #[serde(default)]
+    save: bool,
+    #[serde(default)]
+    reason: ferrocast_engine::studio_host::BoxReason,
+}
+
+/// `PUT …/items/boxes` `{ items: [{ id, x, y, w, h }], save?, reason? }`: several items moved and sized at
+/// once (aligned, spaced out, a group of picked ones moved or resized) as one step → the items.
+async fn engine_item_boxes(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<BoxesBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemBoxes { scene, items: b.items, save: b.save, reason: b.reason }).await
+}
+
+#[derive(Deserialize)]
 struct ThumbQuery {
     #[serde(default = "thumb_width")]
     w: u32,
@@ -709,6 +808,88 @@ async fn engine_set_transition_settings(
     Body(b): Body<SettingsBody>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetTransitionSettings { kind, settings: b.settings }).await
+}
+
+/// `POST /studio/engine/transitions`: adds a named transition → 201 `{ name, kind, ms, settings, default }`.
+async fn engine_add_named_transition(
+    State(app): State<AppState>,
+    Body(transition): Body<NamedTransitionInput>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::AddNamedTransition { transition }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+/// `PUT /studio/engine/transitions/{name}`: updates a named transition → `{ name, kind, ms, settings, default }`.
+async fn engine_update_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(patch): Body<NamedTransitionPatch>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::UpdateNamedTransition { name, patch }).await
+}
+
+#[derive(Deserialize)]
+struct RenameTransitionBody {
+    name: String,
+}
+
+/// `POST /studio/engine/transitions/{name}/rename` `{ name }` → updated named transition.
+async fn engine_rename_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<RenameTransitionBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::RenameNamedTransition { name, new_name: b.name }).await
+}
+
+#[derive(Deserialize, Default)]
+struct DuplicateTransitionBody {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /studio/engine/transitions/{name}/duplicate` `{ name? }` → 201 new named transition.
+async fn engine_duplicate_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    OptionalBody(b): OptionalBody<DuplicateTransitionBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::DuplicateNamedTransition { name, new_name: b.name }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+/// `PUT /studio/engine/transitions/{name}/default`: sets the default transition → 204.
+async fn engine_default_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetDefaultNamedTransition { name }).await
+}
+
+/// `DELETE /studio/engine/transitions/{name}`: deletes a named transition → 204.
+async fn engine_delete_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::DeleteNamedTransition { name }).await
+}
+
+#[derive(Deserialize)]
+struct TransitionMatrixBody {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    transition: Option<String>,
+}
+
+/// `PUT /studio/engine/transition-matrix` `{ from, to, transition }`: sets or clears a matrix rule → 204.
+async fn engine_set_transition_matrix(
+    State(app): State<AppState>,
+    Body(b): Body<TransitionMatrixBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetTransitionMatrixRule { from: b.from, to: b.to, transition: b.transition }).await
 }
 
 /// `PUT /studio/engine/studio-mode` `{ on }`.
@@ -989,6 +1170,33 @@ async fn engine_projector(
     Ok((StatusCode::CREATED, Json(app.engine.studio_projector(b).await?)))
 }
 
+/// `POST /studio/engine/keys/capture` `{ on }` → 204: a shortcut field waits for a key.
+async fn engine_capture_keys(State(app): State<AppState>, Body(b): Body<CaptureKeys>) -> ApiResult<StatusCode> {
+    app.engine.studio_capture_keys(b.on);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /studio/engine/live-alerts/silence` `{ id }` → 204: a live alert (`mic:…`) is on purpose:
+/// cleared now and not raised again for this stream. 400 for any other id.
+async fn engine_silence_alert(State(app): State<AppState>, Body(b): Body<SilenceAlert>) -> ApiResult<StatusCode> {
+    if !app.engine.live_alert_silence(&b.id) {
+        return Err(
+            ferrocast_engine::EngineError::Invalid("id: a mic alert (mic:muted:… or mic:quiet:…).".into()).into()
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureKeys {
+    on: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SilenceAlert {
+    id: String,
+}
+
 async fn engine_close_projectors(State(app): State<AppState>) -> ApiResult<StatusCode> {
     app.engine.studio_close_projectors().await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1065,6 +1273,63 @@ async fn engine_shelf_import(
     Ok((StatusCode::CREATED, Json(v)))
 }
 
+/// `POST /studio/engine/library/collections/overlay/preview` (multipart `.overlay` zip) → 200 preview.
+pub(crate) async fn engine_overlay_preview(
+    State(app): State<AppState>,
+    mut form: axum::extract::Multipart,
+) -> ApiResult<Json<Value>> {
+    use ferrocast_engine::import::overlay_parse::MAX_OVERLAY_ZIP;
+    let field = loop {
+        match form.next_field().await {
+            Ok(Some(f)) if f.name() == Some("file") => break f,
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(ApiError::invalid("Attach the .overlay file in a form field named \"file\".")),
+            Err(e) => {
+                if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    return Err(ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "too_large",
+                        format!("Theme packs can be up to {} MB.", MAX_OVERLAY_ZIP / 1024 / 1024),
+                    )
+                    .hint("Trim large videos from the theme pack and try again."));
+                }
+                return Err(ApiError::invalid(format!("The upload couldn't be read: {}", e.body_text())));
+            }
+        }
+    };
+    let filename = field.file_name().unwrap_or("pack.overlay").to_string();
+    let bytes = field.bytes().await.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!("Theme packs can be up to {} MB.", MAX_OVERLAY_ZIP / 1024 / 1024),
+            )
+            .hint("Trim large videos from the theme pack and try again.")
+        } else {
+            ApiError::invalid(format!("The upload couldn't be read: {}", e.body_text()))
+        }
+    })?;
+    let preview = app.engine.preview_overlay_pack(bytes.to_vec(), filename).await?;
+    Ok(Json(serde_json::to_value(preview).unwrap_or_default()))
+}
+
+async fn engine_overlay_import(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::import::overlay::OverlayPackImportReq>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let report = app.engine.import_overlay_pack(b).await?;
+    Ok((StatusCode::CREATED, Json(serde_json::to_value(report).unwrap_or_default())))
+}
+
+async fn engine_overlay_undo(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::import::overlay::OverlayPackUndoReq>,
+) -> ApiResult<Json<Value>> {
+    let report = app.engine.undo_overlay_pack(&b.undo_token).await?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
 async fn engine_screens(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_screens().await?))
 }
@@ -1116,7 +1381,27 @@ async fn engine_set_audio(
 }
 
 async fn engine_filters(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Filters { name }).await
+    act(&app, StudioAct::Filters { name, item: None }).await
+}
+
+async fn engine_item_filters(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Filters { name: String::new(), item: Some(ItemTarget { scene, id }) }).await
+}
+
+#[derive(Deserialize)]
+struct OwnBody {
+    own: bool,
+}
+
+async fn engine_set_item_filter_scope(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<OwnBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemFilterScope { scene, id, own: b.own }).await
 }
 
 async fn engine_add_filter(
@@ -1124,7 +1409,17 @@ async fn engine_add_filter(
     Path(name): Path<String>,
     Body(filter): Body<NewSource>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let Json(v) = act(&app, StudioAct::AddFilter { name, filter }).await?;
+    let Json(v) = act(&app, StudioAct::AddFilter { name, filter, item: None }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_add_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(filter): Body<NewSource>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) =
+        act(&app, StudioAct::AddFilter { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
 
@@ -1132,12 +1427,70 @@ async fn engine_remove_filter(
     State(app): State<AppState>,
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::RemoveFilter { name, filter }).await
+    act_done(&app, StudioAct::RemoveFilter { name, filter, item: None }).await
+}
+
+async fn engine_remove_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::RemoveFilter { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
+}
+
+/// `GET /studio/engine/clipboard` → what is copied (`{ kind, name, from, count }`); 404
+/// `clipboard_empty` when nothing is.
+async fn engine_clipboard(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_clipboard()?))
+}
+
+async fn engine_clipboard_clear(State(app): State<AppState>) -> StatusCode {
+    app.engine.studio_clipboard_clear();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct CopySourceBody {
+    scene: String,
+    id: i64,
+}
+
+async fn engine_copy_source(State(app): State<AppState>, Body(b): Body<CopySourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_copy_source(b.scene, b.id).await?))
+}
+
+#[derive(Deserialize)]
+struct ClipFiltersBody {
+    name: String,
+    #[serde(default)]
+    item: Option<ItemTarget>,
+}
+
+async fn engine_copy_filters(State(app): State<AppState>, Body(b): Body<ClipFiltersBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_copy_filters(b.name, b.item).await?))
+}
+
+#[derive(Deserialize)]
+struct PasteSourceBody {
+    scene: String,
+}
+
+async fn engine_paste_source(State(app): State<AppState>, Body(b): Body<PasteSourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_paste_source(b.scene).await?))
+}
+
+async fn engine_paste_filters_clip(
+    State(app): State<AppState>,
+    Body(b): Body<ClipFiltersBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_paste_filters(b.name, b.item).await?))
 }
 
 #[derive(Deserialize)]
 struct FromBody {
+    #[serde(default)]
     from: String,
+    #[serde(default)]
+    from_item: Option<ItemTarget>,
 }
 
 async fn engine_obs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
@@ -1149,12 +1502,20 @@ struct IdBody {
     id: String,
 }
 
+async fn engine_preview_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_preview_obs(&b.id).await?))
+}
+
 async fn engine_import_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_obs(&b.id).await?))
 }
 
 async fn engine_streamlabs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_streamlabs_collections().await?))
+}
+
+async fn engine_preview_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_preview_streamlabs(&b.id).await?))
 }
 
 async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
@@ -1191,15 +1552,37 @@ async fn engine_vst_act(
     act(&app, StudioAct::Vst { name, filter, what: b.what }).await
 }
 
-/// `GET …/sources/{name}/picture?w=256[&filters=true]` → `{ image, width, height }`: the
-/// source's own picture now, before its filters (the crop editor and filter previews draw on
-/// it), or with them (the drawer's result).
+/// `GET …/sources/{name}/picture?w=256[&filters=true][&scene=...&item=...]` → `{ image, width, height }`:
+/// the source's own picture now, before its filters (the crop editor and filter previews draw on
+/// it), or with them (the drawer's result, optionally scoped to one scene item override).
 async fn engine_source_picture(
     State(app): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<PictureQuery>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::SourcePicture { name, width: q.w, filters: q.filters }).await
+    let item = match (q.scene, q.item) {
+        (Some(scene), Some(id)) => Some(ItemTarget { scene, id }),
+        (None, None) => None,
+        _ => return Err(ApiError::invalid("scene, item: give both or neither.")),
+    };
+    act(&app, StudioAct::SourcePicture { name, width: q.w, filters: q.filters, item }).await
+}
+
+async fn engine_item_picture(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Query(q): Query<PictureQuery>,
+) -> ApiResult<Json<Value>> {
+    act(
+        &app,
+        StudioAct::SourcePicture {
+            name: String::new(),
+            width: q.w,
+            filters: q.filters,
+            item: Some(ItemTarget { scene, id }),
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1208,6 +1591,38 @@ struct PictureQuery {
     w: u32,
     #[serde(default)]
     filters: bool,
+    scene: Option<String>,
+    item: Option<i64>,
+}
+
+fn deserialize_query_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoolVisitor;
+    impl serde::de::Visitor<'_> for BoolVisitor {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a boolean query parameter (1, 0, true, false)")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<bool, E> {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Ok(true),
+                "" | "0" | "false" | "no" => Ok(false),
+                other => Err(serde::de::Error::custom(format!("invalid boolean query value: {other}"))),
+            }
+        }
+    }
+    deserializer.deserialize_any(BoolVisitor)
 }
 
 #[derive(Deserialize)]
@@ -1216,20 +1631,40 @@ struct StillQuery {
     window: bool,
     #[serde(default = "still_width")]
     w: u32,
+    #[serde(default, deserialize_with = "deserialize_query_bool")]
+    fresh: bool,
 }
 
 fn still_width() -> u32 {
-    320
+    240
 }
 
-/// `GET …/screens/{id}/still?w=320&window=false` → `{ image }`: a still of a screen or window
-/// for the cards a capture is picked from (null where it can't be taken).
+/// `GET …/screens/{id}/still?w=320&window=false&fresh=1` → `{ image }`: a still of a screen or
+/// window for the cards a capture is picked from (null where it can't be taken).
 async fn engine_screen_still(
     State(app): State<AppState>,
     Path(id): Path<u32>,
     Query(q): Query<StillQuery>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w }).await
+    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w.min(320), fresh: q.fresh }).await
+}
+
+#[derive(Deserialize)]
+struct SourceStillQuery {
+    kind: String,
+    key: String,
+    value: String,
+    #[serde(default = "still_width")]
+    w: u32,
+    #[serde(default, deserialize_with = "deserialize_query_bool")]
+    fresh: bool,
+}
+
+/// `GET …/still?kind=&key=&value=&w=240&fresh=1` → `{ image }`: a single low-res JPEG still of a
+/// window, display, camera, or capture card, aborted automatically when the HTTP client disconnects.
+async fn engine_source_still(State(app): State<AppState>, Query(q): Query<SourceStillQuery>) -> ApiResult<Json<Value>> {
+    let value = q.value.parse::<i64>().map_or_else(|_| Value::String(q.value.clone()), |n| json!(n));
+    act(&app, StudioAct::SourceStill { kind: q.kind, key: q.key, value, width: q.w.min(320), fresh: q.fresh }).await
 }
 
 /// `GET …/sources/{name}/status` → how the source is doing (a Web text's last read, whether a
@@ -1238,8 +1673,41 @@ async fn engine_source_status(State(app): State<AppState>, Path(name): Path<Stri
     act(&app, StudioAct::SourceStatus { name }).await
 }
 
-async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Screenshot { name }).await
+#[derive(Default, Deserialize)]
+struct ScreenshotTarget {
+    #[serde(default)]
+    scene: Option<String>,
+    #[serde(default)]
+    item: Option<i64>,
+}
+
+async fn engine_screenshot(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ScreenshotTarget>,
+    OptionalBody(b): OptionalBody<ScreenshotTarget>,
+) -> ApiResult<Json<Value>> {
+    let scene = match (q.scene, b.scene) {
+        (Some(qs), Some(bs)) if qs != bs => return Err(ApiError::invalid("scene: query and body do not match.")),
+        (qs, bs) => bs.or(qs),
+    };
+    let item = match (q.item, b.item) {
+        (Some(qi), Some(bi)) if qi != bi => return Err(ApiError::invalid("item: query and body do not match.")),
+        (qi, bi) => bi.or(qi),
+    };
+    let target = match (scene, item) {
+        (Some(scene), Some(id)) => Some(ItemTarget { scene, id }),
+        (None, None) => None,
+        _ => return Err(ApiError::invalid("scene, item: give both or neither.")),
+    };
+    act(&app, StudioAct::Screenshot { name, item: target }).await
+}
+
+async fn engine_item_screenshot(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Screenshot { name: String::new(), item: Some(ItemTarget { scene, id }) }).await
 }
 
 async fn engine_web(
@@ -1255,7 +1723,24 @@ async fn engine_paste_filters(
     Path(name): Path<String>,
     Body(b): Body<FromBody>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::PasteFilters { name, from: b.from }).await
+    act_done(&app, StudioAct::PasteFilters { name, from: b.from, item: None, from_item: b.from_item }).await
+}
+
+async fn engine_paste_item_filters(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<FromBody>,
+) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::PasteFilters {
+            name: String::new(),
+            from: b.from,
+            item: Some(ItemTarget { scene, id }),
+            from_item: b.from_item,
+        },
+    )
+    .await
 }
 
 async fn engine_edit_filter(
@@ -1263,21 +1748,47 @@ async fn engine_edit_filter(
     Path((name, filter)): Path<(String, String)>,
     Body(b): Body<DoBody<FilterEdit>>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::EditFilter { name, filter, edit: b.what }).await
+    act_done(&app, StudioAct::EditFilter { name, filter, edit: b.what, item: None }).await
+}
+
+async fn engine_edit_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+    Body(b): Body<DoBody<FilterEdit>>,
+) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::EditFilter { name: String::new(), filter, edit: b.what, item: Some(ItemTarget { scene, id }) },
+    )
+    .await
 }
 
 async fn engine_filter_settings(
     State(app): State<AppState>,
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::FilterSettings { name, filter }).await
+    act(&app, StudioAct::FilterSettings { name, filter, item: None }).await
+}
+
+async fn engine_item_filter_settings(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FilterSettings { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
 }
 
 async fn engine_filter_options(
     State(app): State<AppState>,
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::FilterOptions { name, filter }).await
+    act(&app, StudioAct::FilterOptions { name, filter, item: None }).await
+}
+
+async fn engine_item_filter_options(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FilterOptions { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
 }
 
 async fn engine_update_filter(
@@ -1285,7 +1796,24 @@ async fn engine_update_filter(
     Path((name, filter)): Path<(String, String)>,
     Body(b): Body<SettingsBody>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::UpdateFilter { name, filter, settings: b.settings }).await
+    act_done(&app, StudioAct::UpdateFilter { name, filter, settings: b.settings, item: None }).await
+}
+
+async fn engine_update_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+    Body(b): Body<SettingsBody>,
+) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::UpdateFilter {
+            name: String::new(),
+            filter,
+            settings: b.settings,
+            item: Some(ItemTarget { scene, id }),
+        },
+    )
+    .await
 }
 
 /// A global sound device (every scene) on channel 1 to 6.
@@ -1316,6 +1844,36 @@ async fn engine_set_settings(
 
 async fn engine_stats(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_stats().await?))
+}
+
+async fn engine_auto_config(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_status())))
+}
+
+async fn engine_auto_config_benchmark(
+    State(app): State<AppState>,
+    OptionalBody(b): OptionalBody<ferrocast_engine::studio::encoder_bench::BenchmarkReq>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_benchmark(b).await?)))
+}
+
+async fn engine_auto_config_cancel(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_cancel().await)))
+}
+
+async fn engine_auto_config_apply(
+    State(app): State<AppState>,
+    OptionalBody(b): OptionalBody<ferrocast_engine::studio::encoder_bench::ApplyReq>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_apply(b).await?)))
+}
+
+async fn engine_auto_config_keep(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_keep()?)))
+}
+
+async fn engine_auto_config_undo(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_undo().await?)))
 }
 
 #[derive(Deserialize)]
@@ -1507,6 +2065,30 @@ async fn engine_remux(State(app): State<AppState>, Body(b): Body<RemuxBody>) -> 
     Ok(Json(app.engine.studio_remux(b.file).await?))
 }
 
+/// `GET /studio/remote-control` → the obs-websocket server's settings and state.
+async fn remote_control(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.obsws_view().await)))
+}
+
+/// `POST /studio/remote-control` `{ enabled?, port?, lan? }` → the same, with `password` (once)
+/// when switching it on made one.
+async fn set_remote_control(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::obsws::ObsWsPatch>,
+) -> ApiResult<Json<Value>> {
+    let (view, password) = app.engine.obsws_set(b).await?;
+    let mut out = json!(view);
+    if let Some(p) = password {
+        out["password"] = json!(p);
+    }
+    Ok(Json(out))
+}
+
+/// `POST /studio/remote-control/password` → `{ password }`: a new one; the old one stops working.
+async fn new_remote_control_password(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "password": app.engine.obsws_regenerate().await? })))
+}
+
 #[derive(Deserialize)]
 struct EncoderSettingsBody {
     #[serde(default)]
@@ -1552,7 +2134,12 @@ async fn set_privacy(State(app): State<AppState>, Body(privacy): Body<Value>) ->
 
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
 async fn engine_levels(State(app): State<AppState>, Body(b): Body<LevelsBody>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Levels { names: b.names }).await
+    let fast = match b.window.as_deref() {
+        None | Some("slow") => false,
+        Some("fast") => true,
+        Some(_) => return Err(ferrocast_engine::EngineError::Invalid("window: \"fast\" or \"slow\".".into()).into()),
+    };
+    Ok(Json(app.engine.studio_levels(b.names, fast).await?))
 }
 
 async fn show_config(State(app): State<AppState>) -> Json<Value> {
@@ -1596,10 +2183,15 @@ async fn preflight_fix(State(app): State<AppState>, Body(b): Body<FixBody>) -> A
 struct StartBody {
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    stream: Option<bool>,
 }
 
 async fn start_show(State(app): State<AppState>, Body(b): Body<StartBody>) -> ApiResult<Response> {
-    let run = app.engine.start_show(b.force).await?;
+    let run = app
+        .engine
+        .start_show_with(ferrocast_engine::studio::show::ShowStartOpts { force: b.force, stream: b.stream })
+        .await?;
     Ok((StatusCode::CREATED, Json(json!({ "show": run }))).into_response())
 }
 
@@ -1615,8 +2207,21 @@ async fn live_scene(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "show": app.engine.go_live_scene().await? })))
 }
 
-async fn end_show(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({ "show": app.engine.end_show().await? })))
+#[derive(Deserialize, Default)]
+struct EndBody {
+    /// Stop the stream at once, without the show's `stop_delay_s` wait.
+    #[serde(default)]
+    now: bool,
+}
+
+/// The body is optional (older callers send none): without `now` the show ends as before.
+async fn end_show(State(app): State<AppState>, body: axum::body::Bytes) -> ApiResult<Json<Value>> {
+    let b: EndBody = if body.iter().all(u8::is_ascii_whitespace) {
+        EndBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("A field is wrong: {e}")))?
+    };
+    Ok(Json(json!({ "show": app.engine.end_show_with(b.now).await? })))
 }
 
 // ------------------------------------------------------------------ OBS

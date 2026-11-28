@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{Engine, EngineError, now};
 
-const INVITES: &str = "guest-invites";
+pub(crate) const INVITES: &str = "guest-invites";
 /// One change to the list at a time (two made at once both kept).
 static CHANGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Links kept at most (the relay holds at most 20 per install).

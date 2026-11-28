@@ -54,7 +54,7 @@ impl Engine {
             e.source_id = Some(format!("{id}#{}", tip_status_key(*status)));
         }
 
-        if e.origin != Origin::Test {
+        if e.origin != Origin::Test && !matches!(e.kind, EventKind::ViewerCount { .. } | EventKind::NativePoll { .. }) {
             let first = self.inner.dedupe.lock().unwrap_or_else(|p| p.into_inner()).first_time(&e, at);
             if !first {
                 tracing::debug!(platform = %e.platform, source = ?e.source_id, "duplicate dropped");
@@ -83,24 +83,19 @@ impl Engine {
                     let message = if after == "sign_in_needed" {
                         format!("{name} needs you to sign in again.")
                     } else {
-                        format!("{name} needs more permissions to keep everything working.")
+                        format!("{name} needs more permissions.")
                     };
                     self.send_live(LiveFrame::new(
                         "notice",
-                        &Notice {
-                            key: Some(format!("account:{}", platform_key(e.platform))),
-                            level: NoticeLevel::Warn,
-                            message,
-                            action: Some(crate::frames::NoticeAction {
-                                label: "Reconnect".into(),
-                                href: "#/settings/accounts".into(),
-                            }),
-                        },
+                        &Notice::new(NoticeLevel::Warn, message)
+                            .key(format!("account:{}", platform_key(e.platform)))
+                            .action("Reconnect", "#/settings/accounts"),
                     ));
                 }
                 return;
             }
             EventKind::ViewerCount { count } => {
+                tracing::debug!(platform = %e.platform, count = *count, "viewer count");
                 let viewers = {
                     let mut st = self.state_mut();
                     st.viewers.insert(e.platform, *count);
@@ -112,8 +107,13 @@ impl Engine {
                         .collect::<std::collections::HashMap<_, _>>()
                 };
                 self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
+                self.send_live(LiveFrame::new("event", &e));
                 self.history_saw(&e, None);
                 self.discord_saw(&e);
+                return;
+            }
+            EventKind::NativePoll { poll_id, counts, ended } => {
+                self.on_native_poll_event(e.platform, poll_id, counts, *ended).await;
                 return;
             }
             _ => {}
@@ -168,6 +168,8 @@ impl Engine {
             },
             EventKind::MessageDeleted { message_id } => {
                 self.hide_message(e.platform, message_id);
+                // Purge matching active/queued/recent chat TTS immediately before async DB/queue awaits.
+                self.purge_chat_tts_message(e.platform, message_id, None);
                 let id = message_id.clone();
                 let p = e.platform;
                 let deleted_event = self
@@ -181,14 +183,16 @@ impl Engine {
                     .await
                     .ok()
                     .flatten();
-                // A queued alert for this message must not read it aloud either.
-                if let Some(ev) = deleted_event {
+                // A queued alert or chat TTS line for this message must not read it aloud either.
+                if let Some(ev) = &deleted_event {
+                    let ev_id = ev.clone();
                     self.queue_op(move |q, _| {
-                        q.strip_tts(&ev);
+                        q.strip_tts(&ev_id);
                         vec![]
                     })
                     .await;
                     self.push_tts_pending().await;
+                    self.purge_chat_tts_message(e.platform, message_id, Some(ev));
                 }
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
@@ -200,7 +204,10 @@ impl Engine {
             EventKind::UserMessagesCleared { target } | EventKind::Ban { target, .. } => {
                 if let Some(uid) = &target.id {
                     self.hide_user(e.platform, uid);
+                    self.purge_chat_tts_user(e.platform, uid);
+                    self.cleanup_pending_tts_for_user(e.platform, uid).await;
                 }
+                self.clear_highlight_if_user(e.platform, target);
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
                     e.seq,
@@ -215,12 +222,27 @@ impl Engine {
                 if e.origin == Origin::Live {
                     self.discord_go_live(e.platform, title.clone());
                 }
-                let mut st = self.state_mut();
-                let anyone_live = st.live.values().any(|l| *l);
-                st.live.insert(e.platform, true);
+                let anyone_live = {
+                    let mut st = self.state_mut();
+                    let was_live = st.live.values().any(|l| *l);
+                    st.live.insert(e.platform, true);
+                    if !was_live {
+                        st.viewers.clear();
+                        st.session = crate::state::Session {
+                            started_at: Some(at),
+                            credits: ferrocast_core::credits::Credits::new(Some(at)),
+                            ..Default::default()
+                        };
+                    }
+                    was_live
+                };
+                self.bump_live_epoch(e.platform);
+                self.wake_viewer_poller();
                 if !anyone_live {
-                    st.session = crate::state::Session { started_at: Some(at), ..Default::default() };
-                    drop(st);
+                    self.clear_chat_highlight();
+                    self.push_credits();
+                    self.labels_reset_session().await;
+                    self.push_all_overlay_labels().await;
                     // A new stream: chat overlays empty out and the dashboard loads this
                     // stream's chat again, so the last stream's messages don't show.
                     self.send_overlay(crate::frames::OverlayFrame::new(
@@ -231,19 +253,46 @@ impl Engine {
                     ));
                     self.send_live(crate::frames::LiveFrame::new("resync", &json!({ "missed": 0 })));
                 }
+                if e.origin == Origin::Live {
+                    self.health_stream_started(at, e.platform).await;
+                }
             }
             EventKind::StreamOffline => {
                 if e.platform == Platform::Youtube && e.origin == Origin::Live {
                     let since = self.state().session.started_at.map_or(at.0 - 43_200_000, |m| m.0);
                     self.youtube_chapters_later(since);
                 }
-                let mut st = self.state_mut();
-                st.live.insert(e.platform, false);
-                // An ended stream's last count must not keep adding to the peak.
-                st.viewers.remove(&e.platform);
+                let (any_live, viewers) = {
+                    let mut st = self.state_mut();
+                    st.live.insert(e.platform, false);
+                    // An ended stream's last count must not keep adding to the peak.
+                    let removed = st.viewers.remove(&e.platform).is_some();
+                    let viewers = removed.then(|| crate::viewers::overlay_clear_payload(&st.viewers, e.platform));
+                    (st.live.values().any(|l| *l), viewers)
+                };
+                self.bump_live_epoch(e.platform);
+                if let Some(viewers) = viewers {
+                    self.send_overlay(OverlayFrame::new(
+                        Audience::All,
+                        self.next_seq(),
+                        "state",
+                        &json!({ "viewers": viewers }),
+                    ));
+                }
+                self.wake_viewer_poller();
+                if !any_live && e.origin == Origin::Live {
+                    if self.golive_stream_running() {
+                        // The stream is still on air (no platform gets it any more): the session
+                        // record stays open until the stream itself ends.
+                        self.health_end_deferred();
+                    } else {
+                        self.health_stream_ended(at).await;
+                    }
+                }
             }
             EventKind::Reversal { original_source_id, reason } => {
                 self.reverse(e.platform, original_source_id, *reason).await;
+                self.labels_observe_event(&e).await;
             }
             _ => {}
         }
@@ -255,6 +304,9 @@ impl Engine {
 
         if e.kind.is_alertable() || matches!(e.kind, EventKind::Tip { .. }) {
             self.support_event(&e).await;
+        }
+        if show_in_overlays && matches!(e.kind, EventKind::ChatMessage { .. }) {
+            self.maybe_enqueue_chat_tts(&e).await;
         }
 
         // "When X, do Y" (hidden chat never sets a rule off).
@@ -306,8 +358,8 @@ impl Engine {
         let touched = self.db(move |s| repo::viewers::touch_chat(s, &a)).await.ok().flatten();
         let person = touched.map(|t| t.viewer_id);
         *chatter = self.chatter_mark(e, touched);
-        if e.origin == Origin::Live {
-            self.state_mut().session.record(e);
+        if e.origin == Origin::Live && self.state_mut().session.record(e) {
+            self.push_credits();
         }
         let message_id = e.source_id.clone().unwrap_or_default();
 
@@ -402,7 +454,9 @@ impl Engine {
 
         // Only live chat from this channel gets answers: replayed history and Shared Chat
         // messages from a partner channel never make the bot speak (R-11).
-        if bot_on && e.origin == Origin::Live && e.channel.is_none() {
+        // Facebook has no bot: a Page comment gets no command answer, auto-reply or welcome (the
+        // notes promise it, and a reply there would be a public comment as the Page).
+        if bot_on && e.origin == Origin::Live && e.channel.is_none() && Platform::CHAT.contains(&e.platform) {
             if content.text.trim_start().starts_with('!') {
                 if self.answer_studio_command(e).await || self.answer_points_command(e).await {
                     return Moderated::Shown;
@@ -459,9 +513,12 @@ impl Engine {
     async fn support_event(&self, e: &Event) {
         let mut reasons = Vec::new();
         if e.origin == Origin::Live {
-            self.state_mut().session.record(e);
+            if self.state_mut().session.record(e) {
+                self.push_credits();
+            }
             self.count_goals(e).await;
             self.loyalty_bonus(e).await;
+            self.labels_observe_event(e).await;
         }
 
         let (rules, test_alerts, tts_decision, paused_tts) = {
@@ -501,7 +558,7 @@ impl Engine {
                 alert.tts_text = None;
             }
             let priority = if e.origin == Origin::Test { 0 } else { variation.priority };
-            self.enqueue_alert(alert, priority).await;
+            self.enqueue_alert(alert, priority, rule.interrupt).await;
             alerted = true;
         } else {
             reasons.push(format!(
@@ -587,15 +644,23 @@ impl Engine {
         // A refund of something that never alerted (a sale, not a tip) says nothing.
         let Some(original) = original else { return };
         // This stream's totals give the money back too, if it was this stream's.
-        if let EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } = &original.kind {
-            let mut st = self.state_mut();
-            let this_stream = st.session.started_at.is_none_or(|start| original.occurred_at >= start);
-            let first_time = st.session.reversed.insert(source_id.to_string());
-            if this_stream
-                && first_time
-                && let Some(m) = st.session.tips.iter_mut().find(|m| m.currency == money.currency)
-            {
-                m.minor = m.minor.saturating_sub(money.minor).max(0);
+        if let EventKind::Tip { money, actor, .. } | EventKind::PaidMessage { money, actor, .. } = &original.kind {
+            let credits_changed = {
+                let mut st = self.state_mut();
+                let this_stream = st.session.started_at.is_none_or(|start| original.occurred_at >= start);
+                let first_time = st.session.reversed.insert(source_id.to_string());
+                if this_stream && first_time {
+                    if let Some(m) = st.session.tips.iter_mut().find(|m| m.currency == money.currency) {
+                        m.minor = m.minor.saturating_sub(money.minor).max(0);
+                    }
+                    // Only a live payment was ever credited (backfills are not).
+                    original.origin == Origin::Live && st.session.credits.reverse_tip(original.platform, actor, money)
+                } else {
+                    false
+                }
+            };
+            if credits_changed {
+                self.push_credits();
             }
         }
         let what = match reason {
@@ -603,15 +668,10 @@ impl Engine {
             ferrocast_core::event::ReversalReason::Refund => "A refund",
             ferrocast_core::event::ReversalReason::Cancelled => "A cancelled payment",
         };
-        let message = if goals_changed {
-            format!("{what} took a tip back; goals were updated.")
-        } else {
-            format!("{what} took a tip back.")
-        };
-        self.send_live(LiveFrame::new(
-            "notice",
-            &Notice { key: None, level: NoticeLevel::Warn, message, action: None },
-        ));
+        let notice = Notice::new(NoticeLevel::Warn, format!("{what} took a tip back")).key("tip-reversal");
+        // A burst of reversals is one line, not a stack.
+        let notice = if goals_changed { notice.detail("Your goals were updated.") } else { notice };
+        self.send_live(LiveFrame::new("notice", &notice));
     }
 
     pub(crate) fn broadcast_goals(&self, seq: u64) {
@@ -651,6 +711,7 @@ fn platform_label(p: Platform) -> &'static str {
         Platform::Twitch => "Twitch",
         Platform::Youtube => "YouTube",
         Platform::Kick => "Kick",
+        Platform::Facebook => "Facebook",
         Platform::Tips => "Tips",
         Platform::Ferrocast => "Ferrocast",
     }

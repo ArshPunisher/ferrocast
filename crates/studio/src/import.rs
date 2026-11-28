@@ -32,6 +32,9 @@ pub struct ImportReport {
     pub web_pages: usize,
     /// Kinds of source this computer's OBS doesn't have (they stay, empty, as in OBS).
     pub missing: Vec<String>,
+    /// Browser sources whose page address was left out because it isn't an `http(s)` page or a
+    /// plain local file (`javascript:`, `data:`, another `file://`, a `..` path).
+    pub blocked_pages: Vec<String>,
 }
 
 /// Where OBS keeps its scene collections for this user, if OBS has been run.
@@ -78,7 +81,13 @@ pub fn list(dir: &Path) -> Vec<ObsCollection> {
             if !valid_id(&id) {
                 return None;
             }
-            let doc: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let bytes =
+                crate::import_preview::read_plain_file(&path, crate::import_preview::MAX_COLLECTION_BYTES).ok()?;
+            let doc: Value = serde_json::from_slice(&bytes).ok()?;
+            let obj = doc.as_object()?;
+            if !obj.get("sources").is_none_or(Value::is_array) {
+                return None;
+            }
             let (scenes, sources) = counts(&doc);
             let name = doc.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
             Some(ObsCollection { id, name, scenes, sources })
@@ -94,15 +103,27 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
         return Err(StudioError::Failed("That isn't one of OBS's scene collections.".into()));
     }
     let path = dir.join(format!("{id}.json"));
-    let bytes = std::fs::read(&path)
-        .map_err(|_| StudioError::Failed(format!("OBS's scene collection \"{id}\" isn't there any more.")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| StudioError::Failed(format!("OBS's scene collection \"{id}\" didn't read ({e}).")))
+    let bytes =
+        crate::import_preview::read_plain_file(&path, crate::import_preview::MAX_COLLECTION_BYTES).map_err(|e| {
+            StudioError::Failed(match e {
+                crate::import_preview::ReadFail::TooBig => {
+                    format!("OBS's scene collection \"{id}\" is too large to import.")
+                }
+                crate::import_preview::ReadFail::Missing => {
+                    format!("OBS's scene collection \"{id}\" isn't there any more.")
+                }
+            })
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        StudioError::Failed(format!(
+            "OBS's scene collection \"{id}\" is damaged and can't be read. Open it in OBS to check it, or start fresh."
+        ))
+    })
 }
 
 /// A file path as a `file://` address (spaces and the few characters that would end or
 /// change one are escaped).
-fn file_url(path: &str) -> String {
+pub(crate) fn file_url(path: &str) -> String {
     let mut out = String::from("file://");
     for c in path.replace('\\', "/").chars() {
         match c {
@@ -120,12 +141,34 @@ fn file_url(path: &str) -> String {
     out
 }
 
+/// Whether an imported page address may be loaded: `http(s)` pages, or the plain local file the
+/// source said it was (an absolute path without `..`). A shared collection can hold anything
+/// else (`javascript:`, `data:`, `file:///etc/…`, another app's local address).
+pub(crate) fn page_url_ok(url: &str, from_local_file: bool) -> bool {
+    let u = url.trim();
+    if u.is_empty() {
+        return true;
+    }
+    let lower = u.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let host = lower.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+        return !host.is_empty();
+    }
+    if from_local_file && lower.starts_with("file://") {
+        let path = &u["file://".len()..];
+        let decoded = path.replace("%2e", ".").replace("%2E", ".");
+        return !decoded.split(['/', '\\']).any(|seg| seg == "..");
+    }
+    false
+}
+
 /// Changes the collection for the Studio: Browser sources into `web_kind` when given, and
 /// notes kinds not in `known` (when given). Returns what's in it.
 pub fn convert(doc: &mut Value, web_kind: Option<&str>, known: Option<&BTreeSet<String>>) -> ImportReport {
     let name = doc.get("name").and_then(Value::as_str).unwrap_or("OBS").to_string();
     let mut web_pages = 0;
     let mut missing = BTreeSet::new();
+    let mut blocked_pages: Vec<String> = Vec::new();
     if let Some(list) = doc.get_mut("sources").and_then(Value::as_array_mut) {
         for s in list.iter_mut() {
             let id = s.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -143,8 +186,15 @@ pub fn convert(doc: &mut Value, web_kind: Option<&str>, known: Option<&BTreeSet<
                 } else {
                     set.get("url").and_then(Value::as_str).unwrap_or_default().to_string()
                 };
+                // A page this computer shouldn't be told to open stays empty, and is said.
+                let url = if page_url_ok(&url, local && !file.is_empty()) {
+                    url
+                } else {
+                    blocked_pages.push(s.get("name").and_then(Value::as_str).unwrap_or("Browser source").to_string());
+                    String::new()
+                };
                 let mut out = json!({ "url": url });
-                for k in ["width", "height", "css"] {
+                for k in ["width", "height", "css", "reroute_audio"] {
                     if let Some(v) = set.get(k) {
                         out[k] = v.clone();
                     }
@@ -169,11 +219,45 @@ pub fn convert(doc: &mut Value, web_kind: Option<&str>, known: Option<&BTreeSet<
         }
     }
     let (scenes, sources) = counts(doc);
-    ImportReport { name, scenes, sources, web_pages, missing: missing.into_iter().collect() }
+    ImportReport { name, scenes, sources, web_pages, missing: missing.into_iter().collect(), blocked_pages }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_web_pages_and_plain_local_files_may_be_loaded() {
+        for ok in ["", "https://example.com/a?b=1", "HTTP://x.test", "file:///Users/me/overlay.html"] {
+            assert!(page_url_ok(ok, ok.starts_with("file")), "{ok}");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,<script>1</script>",
+            "file:///etc/passwd",
+            "ftp://x.test/a",
+            "http://",
+            "//evil.test/x",
+        ] {
+            assert!(!page_url_ok(bad, false), "{bad}");
+        }
+        assert!(!page_url_ok("file:///Users/me/../../etc/passwd", true), "a .. path");
+        assert!(!page_url_ok("file:///Users/me/%2e%2e/secret", true), "an encoded .. path");
+    }
+
+    #[test]
+    fn a_browser_source_with_a_dangerous_address_comes_in_empty_and_is_reported() {
+        let mut doc = json!({ "name": "C", "sources": [
+            { "id": "browser_source", "name": "Alerts", "settings": { "url": "javascript:alert(1)" } },
+            { "id": "browser_source", "name": "Chat", "settings": { "url": "https://chat.test/o" } },
+            { "id": "browser_source", "name": "Files", "settings": { "is_local_file": true, "local_file": "/Users/me/../../etc/passwd" } },
+        ] });
+        let r = convert(&mut doc, Some("ferrocast_web"), None);
+        assert_eq!(r.web_pages, 3);
+        assert_eq!(r.blocked_pages, vec!["Alerts".to_string(), "Files".to_string()]);
+        assert_eq!(doc["sources"][0]["settings"]["url"], "");
+        assert_eq!(doc["sources"][1]["settings"]["url"], "https://chat.test/o");
+        assert_eq!(doc["sources"][2]["settings"]["url"], "");
+    }
+
     use super::*;
 
     fn doc() -> Value {
@@ -206,7 +290,7 @@ mod tests {
         assert_eq!(alerts["versioned_id"], "ferrocast_web");
         assert_eq!(
             alerts["settings"],
-            json!({ "url": "http://127.0.0.1:47820/o/abc", "width": 1280, "height": 720, "css": "body{}", "fps": 60 })
+            json!({ "url": "http://127.0.0.1:47820/o/abc", "width": 1280, "height": 720, "css": "body{}", "fps": 60, "reroute_audio": true })
         );
         assert_eq!(d["sources"][3]["settings"]["url"], "file:///Users/me/My%20Overlay/index.html");
     }

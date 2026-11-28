@@ -1,16 +1,20 @@
 //! `/api/v1` routes (API.md §4).
 
+pub(crate) mod api_keys;
 mod app;
 mod autoreplies;
 mod bot;
+mod clips;
 mod cloud_backups;
 mod cloud_bot;
 mod cloud_sync;
 mod core;
 mod designs;
+mod diagnostics;
 mod discord;
 mod giveaways;
 mod golive;
+mod highlight;
 mod history;
 mod import;
 mod loyalty;
@@ -24,7 +28,9 @@ mod polls;
 mod pro;
 mod recap;
 pub(crate) mod remote_scope;
+mod schedule;
 mod smart;
+mod store;
 mod studio;
 mod tip_pro;
 mod tts;
@@ -42,11 +48,17 @@ pub(crate) fn api() -> Router<AppState> {
     Router::new()
         // status and pairing
         .route("/status", get(core::status))
+        .route("/openapi.json", get(crate::spec::openapi_json))
+        .route("/asyncapi.json", get(crate::spec::asyncapi_json))
         .route("/session/pair", post(core::pair))
         .route("/session/pair-code", post(core::pair_code))
+        .route("/api-keys", get(api_keys::list).post(api_keys::create))
+        .route("/api-keys/{id}", delete(api_keys::revoke))
         .route("/accounts", get(core::accounts))
         .route("/accounts/{platform}/connect", post(core::connect))
         .route("/accounts/{platform}", delete(core::disconnect))
+        .route("/links", get(core::links).put(core::save_links))
+        .route("/labels", get(core::labels))
         // overlays
         .route("/overlays", get(core::overlays).post(core::create_overlay))
         .route("/overlays/{id}", get(core::overlay).put(core::update_overlay).delete(core::delete_overlay))
@@ -69,6 +81,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/queue/pause", post(core::queue_pause))
         .route("/queue/resume", post(core::queue_resume))
         .route("/queue/skip", post(core::queue_skip))
+        .route("/queue/mute", post(core::queue_mute))
+        .route("/queue/unmute", post(core::queue_unmute))
         .route("/queue/clear", post(core::queue_clear))
         .route("/queue/{alert_id}/remove", post(core::queue_remove))
         .route("/events", get(core::events))
@@ -107,6 +121,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/loyalty/viewers/{platform}/{user_id}/adjust", post(loyalty::adjust))
         // polls
         .route("/polls", post(polls::start))
+        .route("/polls/capabilities", get(polls::capabilities))
         .route("/polls/current", get(polls::current).delete(polls::clear))
         .route("/polls/current/end", post(polls::end))
         // giveaways
@@ -148,9 +163,19 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/music", get(studio::music).put(studio::save_music))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
+        .route("/diagnostics/preview", get(diagnostics::preview))
+        .route("/diagnostics/report", post(diagnostics::write_report))
+        .route("/diagnostics/report.zip", post(diagnostics::download_zip))
+        .route(
+            "/diagnostics/pending-report",
+            get(diagnostics::pending_report).delete(diagnostics::discard_pending_report),
+        )
+        .route("/diagnostics/pending-report/send", post(diagnostics::send_pending_report))
         .route("/themes", get(app::themes))
         .route("/stats/session", get(app::session_stats))
         .route("/recap", get(recap::recap))
+        .route("/credits", get(recap::credits))
+        .route("/chat/highlight", get(highlight::current).post(highlight::pin).delete(highlight::clear))
         .route("/recap/summary", get(smart::recap_saved).post(smart::recap))
         .route("/insights/supporters", get(smart::supporters))
         .route("/updates", get(app::updates))
@@ -215,8 +240,12 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/backups/{id}/restore", post(cloud_backups::restore))
         // Studio: counters, quotes, modules, stream info, show, OBS helpers, moments
         .merge(studio::routes())
+        // Clips and highlights: browse, trim, compile, caption, send to YouTube
+        .merge(clips::routes())
         // Go live everywhere: destinations, OBS setup, the upload check
         .merge(golive::routes())
+        // Stream scheduler: plans, scheduled broadcasts, reminders (routes/schedule.rs)
+        .merge(schedule::routes())
         // auto-replies (bot answers to chat that mentions something)
         .merge(autoreplies::routes())
         // Pro dashboard from anywhere: devices, pairing links (see crate::remote)
@@ -225,6 +254,8 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(plugins::routes())
         // "When X, do Y" rules (routes/automations.rs)
         .merge(automations::routes())
+        // Community Theme Store (R37, routes/store.rs; PC only)
+        .merge(store::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.
@@ -242,6 +273,11 @@ pub(crate) fn uploads() -> Router<AppState> {
             Router::new()
                 .route("/designs/import", post(designs::import))
                 .layer(axum::extract::DefaultBodyLimit::max(designs::MAX_DESIGN_BODY)),
+        )
+        .merge(
+            Router::new()
+                .route("/studio/engine/library/collections/overlay/preview", post(studio::engine_overlay_preview))
+                .layer(axum::extract::DefaultBodyLimit::max(ferrocast_engine::import::overlay_parse::MAX_OVERLAY_BODY)),
         )
         .merge(
             Router::new()
@@ -264,7 +300,8 @@ pub(crate) fn platform(s: &str) -> Result<Platform, ApiError> {
         "twitch" => Ok(Platform::Twitch),
         "youtube" => Ok(Platform::Youtube),
         "kick" => Ok(Platform::Kick),
-        _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube or kick."))),
+        "facebook" => Ok(Platform::Facebook),
+        _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube, kick or facebook."))),
     }
 }
 

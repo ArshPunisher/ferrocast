@@ -23,6 +23,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_designs.sql"),
     include_str!("../migrations/0010_studio.sql"),
     include_str!("../migrations/0011_autoreplies.sql"),
+    include_str!("../migrations/0012_labels_index.sql"),
+    include_str!("../migrations/0013_api_keys.sql"),
+    include_str!("../migrations/0014_store_catalog.sql"),
 ];
 
 /// Schema version this build understands.
@@ -85,6 +88,26 @@ impl Store {
         let conn = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         backup::snapshot(&conn, &self.dir, label)
     }
+
+    /// Flushes and truncates the SQLite WAL cleanly during shutdown so pending frames don't linger
+    /// across restarts. Bounds busy waiting to 1 s so a stalled reader cannot block quit.
+    pub fn checkpoint(&self) -> Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(1));
+        let res = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        });
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        match res {
+            Ok((busy, log_frames, checkpointed)) => {
+                if busy != 0 {
+                    tracing::warn!(busy, log_frames, checkpointed, "SQLite WAL checkpoint finished busy");
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// `check` runs SQLite's integrity check; only the first connection needs it, and on a
@@ -130,6 +153,16 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let v: i64 = s.read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+        let has_idx: i64 = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='events_origin_hidden_kind_at'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(has_idx, 1);
         drop(s);
         Store::open(dir.path()).unwrap();
         assert!(!dir.path().join("backups").exists(), "no backup when nothing migrated");
@@ -157,6 +190,16 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let v: i64 = s.read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+        let has_idx: i64 = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='events_origin_hidden_kind_at'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(has_idx, 1);
         assert!(dir.path().join("backups").exists(), "a backup is taken before migrating");
         let o = crate::repo::overlays::get(&s, "o1").unwrap();
         assert_eq!((o.name.as_str(), o.design), ("Main", None), "existing overlays keep working");
@@ -192,5 +235,29 @@ mod tests {
         assert!(r.is_err());
         let n: i64 = s.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM counters", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn checkpoint_truncates_wal_cleanly() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let s = Store::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        s.write(|tx| {
+            tx.execute("INSERT INTO counters(name, value) VALUES ('wal_check', 42)", [])?;
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        s.checkpoint().unwrap_or_else(|e| panic!("{e}"));
+        let wal = dir.path().join("ferrocast.db-wal");
+        if wal.exists() {
+            assert_eq!(std::fs::metadata(&wal).unwrap_or_else(|e| panic!("{e}")).len(), 0);
+        }
+        drop(s);
+
+        let reopened = Store::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let value: i64 = reopened
+            .read(|c| Ok(c.query_row("SELECT value FROM counters WHERE name = 'wal_check'", [], |r| r.get(0))?))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value, 42);
     }
 }

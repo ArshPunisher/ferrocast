@@ -450,13 +450,13 @@ async fn stream_to(
                 let Some(setup) = &low.video else { continue };
                 let (Ok(Some(pt)), true) = (pt_of(setup), connected) else { continue };
                 let Some((key, cts, es)) = annex_b(setup, &data, false) else { continue };
+                if low.waiting_for_key && !key {
+                    continue;
+                }
                 // WebRTC can't carry B-frames: that layer stops, the stream goes on.
                 if cts != 0 {
                     tracing::info!("WHIP: the lower layer has B-frames; the stream alone goes");
                     low_rx = None;
-                    continue;
-                }
-                if low.waiting_for_key && !key {
                     continue;
                 }
                 low.waiting_for_key = false;
@@ -490,13 +490,13 @@ async fn stream_to(
                         let Some(setup) = &video else { continue };
                         let (Some(pt), true) = (pt_of(setup)?, connected) else { continue };
                         let Some((key, cts, es)) = annex_b(setup, &data, false) else { continue };
+                        if waiting_for_key && !key {
+                            continue;
+                        }
                         if cts != 0 {
                             return Err(DirectError::Refused(
                                 "WebRTC can't carry B-frames: turn them off in the Studio's video settings to send by WHIP.".into(),
                             ));
-                        }
-                        if waiting_for_key && !key {
-                            continue;
                         }
                         waiting_for_key = false;
                         let b = *base.get_or_insert(ts);
@@ -781,5 +781,76 @@ mod tests {
                 || got.video.load(Ordering::Relaxed) == 0,
             "{state:?}"
         );
+    }
+
+    /// Joining during a live reshape from a B-frame encoder to a no-B-frames encoder: flushed
+    /// pre-keyframe P/B packets (`cts != 0`, `!key`) before the first no-B-frames keyframe must be
+    /// skipped by `waiting_for_key`, not abort the WebRTC stream.
+    #[tokio::test]
+    async fn pre_keyframe_bframe_flush_does_not_abort_while_waiting_for_key() {
+        let Some(no_bf_tags) = crate::ts::tests::sample_tags_with(0) else { return };
+        let Some(bf_tags) = crate::ts::tests::sample_tags_with(2) else { return };
+        let got = Arc::new(Got::default());
+        let Some(port) = endpoint(got.clone()).await else { return };
+        let hub = Hub::new();
+        hub.start();
+        let (stop_tx, stop) = watch::channel(false);
+        let (health, mut h) = watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        });
+        let d = Direct {
+            id: "w".into(),
+            kind: Kind::Whip,
+            url: format!("http://127.0.0.1:{port}/whip"),
+            key: "tok".into(),
+            retry: Retry::default(),
+            layer: None,
+        };
+        let sender = tokio::spawn(run(d, hub.clone(), health, stop));
+        for (kind, ms, body) in &no_bf_tags {
+            let header = (*kind == 9 && crate::flv::video_is_header(body)) || (*kind == 8 && body.get(1) == Some(&0));
+            if header {
+                match kind {
+                    9 => hub.video(*ms, body.clone().into()),
+                    8 => hub.audio(*ms, body.clone().into()),
+                    _ => {}
+                }
+            }
+        }
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            h.wait_for(|h| h.state == PushState::Live || matches!(h.state, PushState::Reconnecting { .. })),
+        )
+        .await;
+        // Inject an old-encoder flushed inter frame with nonzero CTS before sending the clean no-BF stream.
+        if let Some((_, ms, body)) = bf_tags.iter().find(|(k, _, b)| {
+            *k == 9 && !crate::flv::video_is_header(b) && !crate::flv::video_is_keyframe(b) && b[2..5] != [0, 0, 0]
+        }) {
+            hub.video(*ms, body.clone().into());
+        }
+        for (kind, ms, body) in no_bf_tags {
+            let header = (kind == 9 && crate::flv::video_is_header(&body)) || (kind == 8 && body.get(1) == Some(&0));
+            if !header {
+                match kind {
+                    9 => hub.video(ms, body.into()),
+                    8 => hub.audio(ms, body.into()),
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let state = h.borrow().state.clone();
+        hub.end();
+        let _ = stop_tx.send(true);
+        let _ = sender.await;
+        assert_eq!(state, PushState::Live, "unexpected state: {state:?}");
+        assert!(got.video.load(Ordering::Relaxed) >= 50, "got {}", got.video.load(Ordering::Relaxed));
     }
 }

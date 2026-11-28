@@ -47,21 +47,23 @@ pub struct Source {
     pub local: bool,
 }
 
+#[cfg(any(test, feature = "test-catalog"))]
 static SOURCE: Mutex<Option<Source>> = Mutex::new(None);
 static KEPT: Mutex<Option<(Instant, Vec<Entry>)>> = Mutex::new(None);
 
-/// The tests' catalog in place of the real one.
+/// The tests' catalog in place of the real one (not in a release build).
+#[cfg(any(test, feature = "test-catalog"))]
 pub fn set_source(s: Source) {
     *SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
     *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn source() -> Source {
-    SOURCE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Source {
-        url: CATALOG_URL.into(),
-        key: CATALOG_KEY.into(),
-        local: false,
-    })
+    #[cfg(any(test, feature = "test-catalog"))]
+    if let Some(s) = SOURCE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return s;
+    }
+    Source { url: CATALOG_URL.into(), key: CATALOG_KEY.into(), local: false }
 }
 
 /// A plugin in the catalog.
@@ -87,9 +89,19 @@ fn refused(status: u16, code: &'static str, message: impl Into<String>, hint: &s
     EngineError::Refused { status, code, message: message.into(), hint: hint.into(), retry_after: None }
 }
 
+/// What a verified signature's trusted comment says (it is signed too): when it was signed and
+/// which file name it was signed under. The file name keeps one catalog's signature from
+/// passing as another's, even with the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedFor {
+    pub timestamp: i64,
+    pub file: String,
+}
+
 /// Checks `list` against its minisign signature (`sig`, base64 as `cargo tauri signer sign`
-/// writes it) and the key (base64 too).
-pub fn verify(list: &[u8], sig: &str, key: &str) -> Result<(), String> {
+/// writes it) and the key (base64 too), and reads the signed trusted comment
+/// (`timestamp:<epoch>\tfile:<name>`). The comment is required.
+pub fn verify_signed(list: &[u8], sig: &str, key: &str) -> Result<SignedFor, String> {
     let b64 = |s: &str| {
         base64::engine::general_purpose::STANDARD.decode(s.trim()).ok().and_then(|b| String::from_utf8(b).ok())
     };
@@ -97,7 +109,33 @@ pub fn verify(list: &[u8], sig: &str, key: &str) -> Result<(), String> {
     let key = minisign_verify::PublicKey::decode(&key).map_err(|e| format!("the catalog key: {e}"))?;
     let sig = b64(sig).ok_or("the catalog's signature isn't readable")?;
     let sig = minisign_verify::Signature::decode(&sig).map_err(|e| format!("the catalog's signature: {e}"))?;
-    key.verify(list, &sig, false).map_err(|_| "the catalog's signature doesn't match".to_string())
+    key.verify(list, &sig, false).map_err(|_| "the catalog's signature doesn't match".to_string())?;
+    let mut timestamp = None;
+    let mut file = None;
+    for part in sig.trusted_comment().split('\t') {
+        if let Some(t) = part.strip_prefix("timestamp:") {
+            timestamp = t.trim().parse::<i64>().ok();
+        } else if let Some(f) = part.strip_prefix("file:") {
+            file = Some(f.trim().to_string());
+        }
+    }
+    match (timestamp, file) {
+        (Some(timestamp), Some(file)) => Ok(SignedFor { timestamp, file }),
+        _ => Err("the catalog's signature has no readable timestamp and file name".into()),
+    }
+}
+
+/// The file name the plugin catalog is signed under.
+pub const PLUGIN_CATALOG_FILE: &str = "catalog.json";
+
+/// Checks the plugin catalog: its signature, and that it was signed as the plugin catalog (a
+/// Store catalog's signature, made with the same key, is refused here).
+pub fn verify(list: &[u8], sig: &str, key: &str) -> Result<(), String> {
+    let s = verify_signed(list, sig, key)?;
+    if s.file != PLUGIN_CATALOG_FILE {
+        return Err("the signature is for another catalog".into());
+    }
+    Ok(())
 }
 
 /// The address of an entry's file: an https one on GitHub, or a plain path beside the catalog
@@ -122,9 +160,23 @@ pub fn file_url(entry: &str, src: &Source) -> Option<reqwest::Url> {
 
 fn allowed(u: &reqwest::Url, src: &Source) -> bool {
     let host = u.host_str().unwrap_or_default();
+    if !u.username().is_empty() || u.password().is_some() {
+        return false;
+    }
+    let same_local_port = || {
+        // No readable catalog address: no local redirects at all.
+        let Ok(base) = reqwest::Url::parse(&src.url) else {
+            return false;
+        };
+        base.host_str() == Some(host) && base.port_or_known_default() == u.port_or_known_default()
+    };
     match u.scheme() {
-        "https" => HOSTS.contains(&host) || (src.local && host == "127.0.0.1"),
-        "http" => src.local && host == "127.0.0.1",
+        "https" => {
+            HOSTS.contains(&host)
+                || host == "ferrocast.clearcraftlabs.com"
+                || (src.local && host == "127.0.0.1" && same_local_port())
+        }
+        "http" => src.local && host == "127.0.0.1" && same_local_port(),
         _ => false,
     }
 }
@@ -158,21 +210,95 @@ pub fn entries(list: &[u8], src: &Source) -> Result<Vec<Entry>, String> {
     Ok(out)
 }
 
-/// Whether `new` is a later version than `old` (numbers dot by dot; anything else: differs).
+/// Whether `new` is a later version than `old`, by semver order: the numbers dot by dot, a
+/// release after its own prerelease, prerelease parts compared one by one (numbers as numbers,
+/// words after numbers). Build metadata (`+x`) doesn't order. A version that can't be read is
+/// never "newer": a garbled or replayed one is not offered as an update.
 pub fn newer(new: &str, old: &str) -> bool {
-    let nums = |v: &str| v.split(['.', '-', '+']).map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
-    match (nums(new), nums(old)) {
-        (Some(a), Some(b)) => a > b,
-        _ => new != old,
+    use std::cmp::Ordering;
+    let (Some((a, ap)), Some((b, bp))) = (parse_version(new), parse_version(old)) else { return false };
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        match cmp_digits(a.get(i).map_or("0", String::as_str), b.get(i).map_or("0", String::as_str)) {
+            Ordering::Equal => {}
+            o => return o == Ordering::Greater,
+        }
     }
+    match (ap.is_empty(), bp.is_empty()) {
+        (true, true) => false,
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => {
+            for (x, y) in ap.iter().zip(bp.iter()) {
+                let o = match (is_digits(x), is_digits(y)) {
+                    (true, true) => cmp_digits(x, y),
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => x.cmp(y),
+                };
+                if o != Ordering::Equal {
+                    return o == Ordering::Greater;
+                }
+            }
+            ap.len() > bp.len()
+        }
+    }
+}
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Two decimal numbers of any length: by length once leading zeros are gone, then digit by digit.
+fn cmp_digits(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// A version as `newer` reads it: its numbers, and its prerelease identifiers (build metadata is
+/// checked and left out). One grammar for everything that takes a version: dotted numbers, then
+/// an optional `-prerelease` of dotted `[0-9A-Za-z-]` identifiers, then an optional `+build`.
+fn parse_version(v: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let (rest, build) = match v.split_once('+') {
+        Some((r, b)) => (r, Some(b)),
+        None => (v, None),
+    };
+    if let Some(b) = build
+        && (b.is_empty()
+            || !b.split('.').all(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')))
+    {
+        return None;
+    }
+    let (core, pre) = match rest.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (rest, None),
+    };
+    let nums: Vec<String> = core.split('.').map(str::to_string).collect();
+    if nums.is_empty() || !nums.iter().all(|n| is_digits(n)) {
+        return None;
+    }
+    let pre: Vec<String> = match pre {
+        Some(p) => p.split('.').map(str::to_string).collect(),
+        None => Vec::new(),
+    };
+    if pre.iter().any(|id| id.is_empty() || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')) {
+        return None;
+    }
+    Some((nums, pre))
+}
+
+/// Whether a version is one `newer` can compare (the Store admits no other).
+pub fn readable_version(v: &str) -> bool {
+    parse_version(v).is_some()
 }
 
 /// A client that follows redirects only to the allowed hosts, over https (or the tests' local
 /// server).
-fn client(src: &Source) -> Result<reqwest::Client, EngineError> {
+pub(crate) fn client(src: &Source) -> Result<reqwest::Client, EngineError> {
+    let base_url = src.url.clone();
     let local = src.local;
     let policy = reqwest::redirect::Policy::custom(move |a| {
-        let s = Source { url: String::new(), key: String::new(), local };
+        let s = Source { url: base_url.clone(), key: String::new(), local };
         if a.previous().len() >= 5 || !allowed(a.url(), &s) { a.stop() } else { a.follow() }
     });
     reqwest::Client::builder()
@@ -183,12 +309,16 @@ fn client(src: &Source) -> Result<reqwest::Client, EngineError> {
 }
 
 /// Reads at most `max` bytes from `url`; more is refused (never all read).
-async fn fetch(http: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<Vec<u8>, EngineError> {
+pub(crate) async fn fetch_capped(
+    http: &reqwest::Client,
+    url: reqwest::Url,
+    max: usize,
+) -> Result<Vec<u8>, EngineError> {
     let unreachable = |e: String| {
         refused(
             502,
             "catalog_unreachable",
-            format!("The plugin catalog didn't answer: {e}"),
+            format!("The catalog server didn't answer: {e}"),
             "Check the internet and try again.",
         )
     };
@@ -211,8 +341,16 @@ async fn fetch(http: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<
     Ok(out)
 }
 
-fn hex(b: &[u8]) -> String {
+async fn fetch(http: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<Vec<u8>, EngineError> {
+    fetch_capped(http, url, max).await
+}
+
+pub(crate) fn hex_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn hex(b: &[u8]) -> String {
+    hex_bytes(b)
 }
 
 impl Engine {
@@ -399,6 +537,50 @@ mod tests {
         let got = entries(json!({ "plugins": list }).to_string().as_bytes(), &src).unwrap_or_default();
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(newer("1.10.0", "1.9.2") && !newer("1.0", "1.0") && newer("2", "1.9") && !newer("1.0.0", "1.2"));
+    }
+
+    #[test]
+    fn an_empty_source_address_allows_no_local_redirect() {
+        let src = Source { url: String::new(), key: String::new(), local: true };
+        let u = reqwest::Url::parse("http://127.0.0.1:9999/x").unwrap();
+        assert!(!allowed(&u, &src), "an empty source let any local port through");
+    }
+
+    #[test]
+    fn a_prerelease_or_older_version_is_never_an_update() {
+        assert!(newer("1.0.0", "1.0.0-alpha.1"), "the release follows its prerelease");
+        assert!(!newer("1.0.0-alpha.1", "1.0.0"), "a prerelease is not newer than the release");
+        assert!(newer("1.0.0-beta.10", "1.0.0-beta.2"), "numbers in a prerelease compare as numbers");
+        assert!(!newer("1.0.0-beta.2", "1.0.0-beta.10"));
+        assert!(newer("1.0.0-beta", "1.0.0-alpha"), "words compare in order");
+        assert!(!newer("1.0.0-alpha.1", "1.0.0-alpha.1"));
+        assert!(!newer("garbage", "1.0.0"), "what can't be read is not offered as an update");
+        assert!(newer("1.0.1+build5", "1.0.0"));
+        assert!(!newer("1.0.0+build9", "1.0.0"), "build metadata doesn't order versions");
+    }
+
+    #[test]
+    fn numbers_of_any_length_compare_as_numbers() {
+        // Past u64: still numbers, by length and then digit by digit.
+        assert!(newer("1.0.0-100000000000000000000", "1.0.0-99999999999999999999"));
+        assert!(!newer("1.0.0-99999999999999999999", "1.0.0-100000000000000000000"));
+        assert!(!newer("1.0.0-100000000000000000000", "1.0.0-100000000000000000000"));
+        assert!(newer("1.0.0-100000000000000000001", "1.0.0-100000000000000000000"));
+        assert!(newer("1.0.100000000000000000000", "1.0.99999999999999999999"), "core parts too");
+        assert!(newer("1.0.0-alpha", "1.0.0-100000000000000000000"), "words follow numbers");
+    }
+
+    #[test]
+    fn a_version_is_readable_or_not_by_the_one_grammar() {
+        for ok in ["1", "1.0", "1.2.3", "10.20.30", "1.0.0-alpha.1", "1.0.0-0.3.7", "1.0.0+build.5", "1.0.0-rc-1+b"] {
+            assert!(readable_version(ok), "{ok}");
+        }
+        for bad in
+            ["", "2oops", "1.0.0-", "1..0", ".1", "1.0.", "v1.0", "1.0.0-a..b", "1.0.0+", "1.0.0 beta", "1.0.0-\u{e9}"]
+        {
+            assert!(!readable_version(bad), "{bad:?}");
+            assert!(!newer(bad, "0.0.1") && !newer("9.9.9", bad), "{bad:?} orders nothing");
+        }
     }
 
     /// Browse and install from a catalog served here: the list checked, the file checked, a

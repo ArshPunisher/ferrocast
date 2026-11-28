@@ -20,6 +20,7 @@ ferrocast-secrets.workspace = true
 ferrocast-twitch.workspace = true
 ferrocast-youtube.workspace = true
 ferrocast-kick.workspace = true
+ferrocast-facebook.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # Pinned as the process-wide TLS provider (see `tls::install`): two backends end up in the
@@ -37,16 +38,23 @@ getrandom = "0.4"
 fastrand = "2"
 quick-xml = "0.42"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+sysinfo = { version = "0.37", default-features = false, features = ["disk", "system"] }
 # Pro cloud backups: encrypted on this PC (X25519, optional scrypt passphrase). No default
 # features: no plugins, SSH keys, armor or async.
 age = { version = "0.12", default-features = false }
 sha2 = "0.11"
+subtle = "2"
 # The plugin catalog's signature (minisign, as `cargo tauri signer` makes it).
 minisign-verify = "0.3"
 flate2 = "1"
 base64 = "0.23"
 # Logic plugins: WebAssembly run in a sandbox with a time (fuel) and memory budget (plugins.rs).
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"] }
+
+[features]
+# Lets tests in other crates point the Store and plugin catalogs at a local fixture and key.
+# Never on in a release build: it is only named by dev-dependencies.
+test-catalog = []
 
 [dev-dependencies]
 tempfile = "3"

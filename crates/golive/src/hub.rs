@@ -3,6 +3,7 @@
 //! reconnects) mid-stream can start with them. A destination that falls behind loses its oldest
 //! packets, never slowing the publisher or the others.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
@@ -12,9 +13,19 @@ use tokio::sync::{broadcast, watch};
 
 use crate::flv;
 
-/// How many packets a destination may fall behind (video and audio together, about ten seconds
-/// at 60 fps) before it skips ahead to the next keyframe.
+/// Hard packet cap on the broadcast channel (video and audio together, about ten seconds at
+/// 60 fps). A safety ceiling: RTMP destinations bound latency much tighter (~900 ms) by
+/// dropping stale non-keyframe video before the channel ever overflows.
 pub const BACKLOG: usize = 1024;
+
+/// No packet for this long: the measured rate is 0.
+#[cfg(not(test))]
+const KBPS_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const KBPS_STALE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Sentinel in `Hub::newest_video_ts` when no main-track video frame has arrived yet.
+const NO_TS: u64 = u64::MAX;
 
 /// One packet of the stream, as the publisher sent it.
 #[derive(Debug, Clone)]
@@ -68,6 +79,15 @@ pub struct Hub {
     tx: broadcast::Sender<Frame>,
     state: Mutex<State>,
     live: watch::Sender<Live>,
+    /// Newest main-track video frame timestamp (ms), or `NO_TS` before the first frame.
+    newest_video_ts: AtomicU64,
+    /// Previous main-track keyframe timestamp (ms) before [`Self::newest_key_ts`], or `NO_TS`.
+    prev_key_ts: AtomicU64,
+    /// Newest main-track keyframe timestamp (ms), or `NO_TS` before the first keyframe.
+    newest_key_ts: AtomicU64,
+    /// Monotonic counter bumped whenever the source encoder emits a main-track coded IDR frame,
+    /// including while a stream delay holds packets before [`Self::start`].
+    encoded_idr: watch::Sender<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +98,8 @@ struct State {
     /// Bitrate window: its first packet's timestamp and the bytes since.
     window: Option<(u32, u64)>,
     last_key: Option<u32>,
+    /// When a packet last arrived (the rate is 0 once none has for a while).
+    last_packet: Option<std::time::Instant>,
 }
 
 /// What the incoming stream really is, measured from its packets (not OBS's settings), for
@@ -101,7 +123,50 @@ impl Hub {
     pub fn new() -> Arc<Self> {
         let (tx, _) = broadcast::channel(BACKLOG);
         let (live, _) = watch::channel(Live::default());
-        Arc::new(Self { tx, state: Mutex::new(State::default()), live })
+        let (encoded_idr, _) = watch::channel(0u64);
+        Arc::new(Self {
+            tx,
+            state: Mutex::new(State::default()),
+            live,
+            newest_video_ts: AtomicU64::new(NO_TS),
+            prev_key_ts: AtomicU64::new(NO_TS),
+            newest_key_ts: AtomicU64::new(NO_TS),
+            encoded_idr,
+        })
+    }
+
+    /// Notes that the upstream encoder emitted a coded main-track IDR keyframe (even before
+    /// a stream delay releases packets onto this hub).
+    pub fn note_encoded_idr(&self) {
+        self.encoded_idr.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Monotonic count of main-track coded IDR frames emitted for this hub.
+    pub fn encoded_idr_count(&self) -> u64 {
+        *self.encoded_idr.borrow()
+    }
+
+    /// Watch receiver notified whenever a coded main-track IDR is encoded for this hub.
+    pub fn encoded_idr_rx(&self) -> watch::Receiver<u64> {
+        self.encoded_idr.subscribe()
+    }
+
+    /// The newest main-track video frame's timestamp (ms) in the current stream, if any has
+    /// arrived. Codec headers and extra tracks don't move this, so destinations can measure how
+    /// far behind live video they are without locking.
+    pub fn newest_video_ts(&self) -> Option<u32> {
+        u32::try_from(self.newest_video_ts.load(Ordering::Acquire)).ok()
+    }
+
+    /// The newest main-track keyframe timestamp (ms) in the current stream, if any has arrived.
+    pub fn newest_key_ts(&self) -> Option<u32> {
+        u32::try_from(self.newest_key_ts.load(Ordering::Acquire)).ok()
+    }
+
+    /// The previous main-track keyframe timestamp (ms) before [`Self::newest_key_ts`], if at
+    /// least two main keyframes have arrived in the current stream.
+    pub fn prev_key_ts(&self) -> Option<u32> {
+        u32::try_from(self.prev_key_ts.load(Ordering::Acquire)).ok()
     }
 
     /// Which stream is on; changes when a publisher starts or stops.
@@ -112,7 +177,17 @@ impl Hub {
     /// The incoming stream's measured numbers (all empty while nothing streams).
     pub fn stats(&self) -> StreamStats {
         let st = self.lock();
-        if st.live.on { st.stats } else { StreamStats::default() }
+        if !st.live.on {
+            return StreamStats::default();
+        }
+        let mut stats = st.stats;
+        // The rate is measured when packets arrive; with none arriving it must fall to 0, not stay at
+        // the last measurement (upload protection saw a "healthy" 6000 kbps from a stream that had
+        // stopped, then paused a destination for the wrong reason).
+        if st.last_packet.is_none_or(|at| at.elapsed() >= KBPS_STALE) {
+            stats.kbps = 0;
+        }
+        stats
     }
 
     pub fn subscribe(&self) -> Subscription {
@@ -128,6 +203,9 @@ impl Hub {
         let mut st = self.lock();
         let stream = st.live.stream + 1;
         *st = State { live: Live { stream, on: true }, ..State::default() };
+        self.newest_video_ts.store(NO_TS, Ordering::Release);
+        self.prev_key_ts.store(NO_TS, Ordering::Release);
+        self.newest_key_ts.store(NO_TS, Ordering::Release);
         self.live.send_replace(st.live);
     }
 
@@ -167,8 +245,8 @@ impl Hub {
     pub fn video(&self, ts: u32, data: Bytes) {
         let mut st = self.lock();
         let extra = flv::video_extra_track(&data);
-        // Only the main track's keyframes are where a joining destination may start.
-        let key = extra.is_none() && flv::video_is_keyframe(&data);
+        // Only the main track's coded keyframes are where a joining destination may start.
+        let key = flv::video_is_coded_keyframe(&data);
         if let Some((track, header)) = extra {
             if header {
                 st.headers.extra_video.retain(|(t, _)| *t != track);
@@ -176,12 +254,22 @@ impl Hub {
             }
         } else if flv::video_is_header(&data) {
             st.stats.video_codec = flv::video_codec(&data);
-            st.headers.video = Some(data.clone());
-        } else if key {
-            if let Some(prev) = st.last_key {
-                st.stats.keyframe_interval_ms = Some(ts.wrapping_sub(prev));
+            if let Some((w, h)) = flv::avcc_sps_dimensions(&data) {
+                st.stats.width = Some(w);
+                st.stats.height = Some(h);
             }
-            st.last_key = Some(ts);
+            st.headers.video = Some(data.clone());
+        } else {
+            if key {
+                if let Some(prev) = st.last_key {
+                    st.stats.keyframe_interval_ms = Some(ts.wrapping_sub(prev));
+                    self.prev_key_ts.store(u64::from(prev), Ordering::Release);
+                }
+                st.last_key = Some(ts);
+                self.newest_key_ts.store(u64::from(ts), Ordering::Release);
+                self.note_encoded_idr();
+            }
+            self.newest_video_ts.store(u64::from(ts), Ordering::Release);
         }
         st.count(ts, data.len());
         let _ = self.tx.send(Frame::Video { ts, data, key });
@@ -210,6 +298,7 @@ impl Hub {
 impl State {
     /// Adds a packet to the bitrate window; every two seconds of stream time, the rate.
     fn count(&mut self, ts: u32, len: usize) {
+        self.last_packet = Some(std::time::Instant::now());
         let (start, bytes) = self.window.get_or_insert((ts, 0));
         *bytes += len as u64;
         let span = ts.wrapping_sub(*start);
@@ -226,6 +315,21 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_measured_rate_falls_to_zero_when_packets_stop() {
+        let hub = Hub::new();
+        hub.start();
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        for i in 0..=30u32 {
+            let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+            d.resize(75_000, 0);
+            hub.video(i * 100, Bytes::from(d));
+        }
+        assert!(hub.stats().kbps > 1_000, "measured: {}", hub.stats().kbps);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(hub.stats().kbps, 0, "nothing arrives: the rate is 0, not the last measurement");
+    }
 
     #[test]
     fn stats_measure_the_real_stream() {
@@ -254,5 +358,78 @@ mod tests {
         assert_eq!(hub.stats(), StreamStats::default());
         hub.start();
         assert_eq!(hub.stats(), StreamStats::default());
+    }
+
+    #[test]
+    fn newest_video_ts_tracks_only_main_video_frames() {
+        let hub = Hub::new();
+        assert_eq!(hub.newest_video_ts(), None);
+        hub.start();
+        assert_eq!(hub.newest_video_ts(), None);
+
+        // Headers, audio and extra video tracks don't move the main video clock.
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        hub.audio(500, Bytes::from_static(&[0xAF, 0x01, 0x21]));
+        hub.video(900, Bytes::from_static(b"\x96\x00avc1\x01\x01\x64"));
+        hub.video(950, Bytes::from_static(b"\xA6\x03avc1\x01\x00\x00\x00\x02"));
+        assert_eq!(hub.newest_video_ts(), None);
+
+        // Main keyframe and inter frame advance it, including ts=0 and u32::MAX.
+        hub.video(0, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!(hub.newest_video_ts(), Some(0));
+        hub.video(1234, Bytes::from_static(&[0x27, 0x01, 0, 0, 0]));
+        assert_eq!(hub.newest_video_ts(), Some(1234));
+        // Mid-stream codec header at ts=0 must not drag it backwards.
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        assert_eq!(hub.newest_video_ts(), Some(1234));
+        hub.video(u32::MAX, Bytes::from_static(&[0x27, 0x01, 0, 0, 0]));
+        assert_eq!(hub.newest_video_ts(), Some(u32::MAX));
+
+        // A new stream clears it.
+        hub.start();
+        assert_eq!(hub.newest_video_ts(), None);
+        assert_eq!(hub.newest_key_ts(), None);
+        assert_eq!(hub.prev_key_ts(), None);
+    }
+
+    #[test]
+    fn key_timestamps_track_last_two_main_keyframes_only() {
+        let hub = Hub::new();
+        hub.start();
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
+
+        // Headers, inter frames and extra track keyframes never count as main keyframes.
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        hub.video(50, Bytes::from_static(&[0x27, 0x01, 0, 0, 0]));
+        hub.video(100, Bytes::from_static(b"\x96\x01avc1\x01\x00\x00\x00\x01"));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
+
+        hub.video(0, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, Some(0)));
+        hub.video(1000, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (Some(0), Some(1000)));
+        hub.video(2000, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (Some(1000), Some(2000)));
+
+        hub.start();
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
+    }
+
+    #[test]
+    fn encoded_idr_counts_only_coded_keyframes_and_survives_deferred_start() {
+        let hub = Hub::new();
+        assert_eq!(hub.encoded_idr_count(), 0);
+        // Sequence headers never trigger encoded_idr (even though frame type nibble is 1).
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        assert_eq!(hub.encoded_idr_count(), 0);
+        // Pre-delay coded IDR can be signalled before `hub.start()` and survives `hub.start()`.
+        hub.note_encoded_idr();
+        assert_eq!(hub.encoded_idr_count(), 1);
+        hub.start();
+        assert_eq!(hub.encoded_idr_count(), 1);
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        assert_eq!(hub.encoded_idr_count(), 1);
+        hub.video(0, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!(hub.encoded_idr_count(), 2);
     }
 }

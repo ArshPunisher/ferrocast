@@ -160,13 +160,19 @@ impl Guest {
         let s = shared.clone();
         let to =
             (SocketAddr::from((Ipv4Addr::LOCALHOST, video_port)), SocketAddr::from((Ipv4Addr::LOCALHOST, audio_port)));
-        let thread = std::thread::Builder::new().name("ferrocast-guest".into()).spawn(move || {
+        let thread = match std::thread::Builder::new().name("ferrocast-guest".into()).spawn(move || {
             if let Err(e) = run(rtc, &socket, &out, to, &s, born) {
                 tracing::info!(error = %e, "a guest's connection ended");
             }
             s.ended.store(true, Ordering::Release);
             s.connected.store(false, Ordering::Release);
-        })?;
+        }) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = std::fs::remove_file(sdp);
+                return Err(e.into());
+            }
+        };
         Ok((answer, Guest { shared, born, sdp: sdp.to_path_buf(), thread: Some(thread) }))
     }
 
@@ -189,6 +195,12 @@ impl Guest {
     pub fn sdp(&self) -> &Path {
         &self.sdp
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_with_sdp(sdp: &Path) -> Result<Self, GuestError> {
+        write_sdp(sdp, Video::Vp8, 50000, 50002)?;
+        Ok(Self { shared: Arc::new(Shared::default()), born: Instant::now(), sdp: sdp.to_path_buf(), thread: None })
+    }
 }
 
 impl Drop for Guest {
@@ -197,6 +209,7 @@ impl Drop for Guest {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        let _ = std::fs::remove_file(&self.sdp);
     }
 }
 
@@ -555,5 +568,19 @@ mod tests {
         let (_, q) = free_pair().expect("two more");
         assert!(q != p && q != p + 1, "held ports aren't handed out twice");
         drop(held);
+    }
+
+    #[test]
+    fn guest_drop_removes_sdp_file() {
+        let dir = std::env::temp_dir().join(format!("ferrocast-guest-drop-{}", std::process::id()));
+        let sdp = dir.join("alex-1.sdp");
+        write_sdp(&sdp, Video::Vp8, 50000, 50002).unwrap();
+        assert!(sdp.is_file());
+        {
+            let _g =
+                Guest { shared: Arc::new(Shared::default()), born: Instant::now(), sdp: sdp.clone(), thread: None };
+        }
+        assert!(!sdp.exists(), "Drop must clean up temp SDP file");
+        let _ = std::fs::remove_dir(&dir);
     }
 }

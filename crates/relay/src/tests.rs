@@ -78,6 +78,20 @@ async fn fake_kick() -> String {
             if body.contains("refresh_token=revoked") {
                 return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": "invalid" })));
             }
+            if body.contains("refresh_token=kick-waf") {
+                // A WAF or a gateway in front of Kick's token endpoint (Cloudflare): not Kick's verdict.
+                return (StatusCode::FORBIDDEN, axum::Json(json!({ "error": "blocked" })));
+            }
+            if body.contains("refresh_token=kick-gateway") {
+                // A 401 that isn't Kick's own refusal (no OAuth `error`): a gateway or proxy.
+                return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "blocked by a gateway" })));
+            }
+            if body.contains("refresh_token=kick-timeout") {
+                return (StatusCode::REQUEST_TIMEOUT, axum::Json(json!({ "error": "timeout" })));
+            }
+            if body.contains("refresh_token=kick-down") {
+                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({ "error": "busy" })));
+            }
             (StatusCode::OK, axum::Json(json!({ "access_token": "kick-access", "refresh_token": "kick-refresh", "expires_in": "7200", "token_type": "Bearer", "scope": "" })))
         }))
         .route("/public/v1/users", get(|| async { axum::Json(json!({ "data": [{ "user_id": 4242, "name": "kicker", "profile_picture": "" }] })) }));
@@ -221,6 +235,30 @@ async fn refresh_goes_through_the_relay_and_strangers_are_refused() {
         .await
         .unwrap();
     assert_eq!(revoked.status(), 401);
+    let rev: Value = revoked.json().await.unwrap();
+    assert_eq!(rev["error"]["code"], "sign_in_needed", "Kick refusing the token is a sign-out");
+    // Kick being down is not a sign-out.
+    let down = http
+        .post(format!("{}/v1/kick/refresh", r.base))
+        .bearer_auth(&auth)
+        .json(&json!({ "refresh_token": "kick-down" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(down.status(), 502);
+    let down: Value = down.json().await.unwrap();
+    assert_eq!(down["error"]["code"], "kick_unreachable");
+    // A 403 or a 408 from in front of Kick isn't Kick refusing the token either.
+    for token in ["kick-waf", "kick-timeout", "kick-gateway"] {
+        let res = http
+            .post(format!("{}/v1/kick/refresh", r.base))
+            .bearer_auth(&auth)
+            .json(&json!({ "refresh_token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 502, "{token} must not sign the streamer out");
+    }
     let (id, _) = auth.split_once('.').unwrap();
     for bad in ["".to_string(), "nodot".into(), format!("{id}.wrong-secret"), "ghost.secret".into()] {
         let res = http
@@ -807,4 +845,323 @@ fn kick_sign_in_asks_for_the_stream_key_cloud_mode_never() {
         assert!(crate::KICK_SCOPES.contains(s), "{s}");
     }
     assert_eq!(crate::KICK_SCOPES.len(), crate::KICK_CLOUD_SCOPES.len() + 1);
+}
+
+// ------------------------------------------------------------------------------- Facebook sign-in
+
+/// A fake Meta: the token endpoint, `/me`, and the Pages. Every call is written down.
+async fn fake_meta() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>) {
+    use axum::http::{HeaderMap, Uri};
+    let calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> = Default::default();
+    let (c1, c2, c3) = (calls.clone(), calls.clone(), calls.clone());
+    let app = axum::Router::new()
+        .route(
+            "/oauth/access_token",
+            post(move |u: Uri, body: String| {
+                let c = c1.clone();
+                async move {
+                    c.lock().unwrap().push(("POST /oauth/access_token".into(), u.to_string(), body.clone()));
+                    if body.contains("fb_exchange_token=SHORT") {
+                        (StatusCode::OK, axum::Json(json!({ "access_token": "LONG", "token_type": "bearer" })))
+                    } else if body.contains("code=goodcode") {
+                        (StatusCode::OK, axum::Json(json!({ "access_token": "SHORT", "token_type": "bearer" })))
+                    } else {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({ "error": { "message": "bad code", "code": 100 } })),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/me",
+            get(move |u: Uri, h: HeaderMap| {
+                let c = c2.clone();
+                async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    c.lock().unwrap().push(("GET /me".into(), u.to_string(), auth.clone()));
+                    if auth == "Bearer LONG" {
+                        (StatusCode::OK, axum::Json(json!({ "id": "u1", "name": "Dev Person" })))
+                    } else {
+                        (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": { "code": 190 } })))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/me/accounts",
+            get(move |u: Uri, h: HeaderMap| {
+                let c = c3.clone();
+                async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    c.lock().unwrap().push(("GET /me/accounts".into(), u.to_string(), auth.clone()));
+                    axum::Json(json!({ "data": [
+                        { "id": "p1", "name": "My Page", "access_token": "PAGE-T",
+                          "picture": { "data": { "url": "https://x/p.png" } } },
+                        { "id": "p2", "name": "No token page" }
+                    ] }))
+                }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (base, calls)
+}
+
+async fn relay_facebook(meta: Option<&str>) -> Relay {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("relay.db")).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let cfg = Config {
+        public_url: base.clone(),
+        tip_url: None,
+        kick_client_id: None,
+        kick_client_secret: None,
+        kick_id_url: base.clone(),
+        kick_api_url: base.clone(),
+    };
+    let mut st = AppState::new(cfg, db);
+    if let Some(meta) = meta {
+        st = st.with_facebook(facebook::Config {
+            app_id: Some("APP".into()),
+            app_secret: Some("APP-SECRET".into()),
+            dialog_url: format!("{meta}/dialog/oauth"),
+            graph_url: meta.to_string(),
+        });
+    }
+    let app = router(st).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(l, app).await });
+    Relay { base, _dir: dir }
+}
+
+#[tokio::test]
+async fn facebook_sign_in_trades_the_code_on_the_relay_and_hands_the_pages_to_the_desktop() {
+    let (meta, calls) = fake_meta().await;
+    let r = relay_facebook(Some(&meta)).await;
+    let auth = install(&r).await;
+    let http = reqwest::Client::new();
+
+    // Only an install may start it.
+    let nobody = http.post(format!("{}/v1/facebook/oauth", r.base)).send().await.unwrap();
+    assert_eq!(nobody.status(), 401);
+
+    let start: Value = http
+        .post(format!("{}/v1/facebook/oauth", r.base))
+        .bearer_auth(&auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = url::Url::parse(start["url"].as_str().unwrap()).unwrap();
+    assert!(url.as_str().starts_with(&format!("{meta}/dialog/oauth")), "{url}");
+    let q = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned()).unwrap_or_default();
+    assert_eq!(q("client_id"), "APP");
+    assert_eq!(q("redirect_uri"), format!("{}/v1/facebook/callback", r.base), "Meta's one fixed address: the relay's");
+    assert!(q("scope").contains("pages_manage_posts") && q("scope").contains("publish_video"));
+    assert!(!url.as_str().contains("APP-SECRET"), "the secret is never in an address");
+    let state = q("state");
+
+    // A wrong state, a cancelled sign-in, a missing code.
+    assert_eq!(
+        http.get(format!("{}/v1/facebook/callback?code=goodcode&state=nope", r.base)).send().await.unwrap().status(),
+        400
+    );
+    assert_eq!(http.get(format!("{}/v1/facebook/callback?state={state}", r.base)).send().await.unwrap().status(), 400);
+    // (the state above was spent by the call without a code: start again)
+    let start: Value = http
+        .post(format!("{}/v1/facebook/oauth", r.base))
+        .bearer_auth(&auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = url::Url::parse(start["url"].as_str().unwrap()).unwrap();
+    let state = url.query_pairs().find(|(n, _)| n == "state").unwrap().1.into_owned();
+
+    let ok = http.get(format!("{}/v1/facebook/callback?code=goodcode&state={state}", r.base)).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    let again = http.get(format!("{}/v1/facebook/callback?code=goodcode&state={state}", r.base)).send().await.unwrap();
+    assert_eq!(again.status(), 400, "a state works once");
+
+    // The secret went to Meta in a body, never in an address; the long-lived token was asked for.
+    let seen = calls.lock().unwrap().clone();
+    assert!(seen.iter().all(|(_, uri, _)| !uri.contains("APP-SECRET")), "{seen:?}");
+    let token_calls: Vec<_> = seen.iter().filter(|(c, _, _)| c == "POST /oauth/access_token").collect();
+    assert_eq!(token_calls.len(), 2, "{seen:?}");
+    assert!(token_calls.iter().all(|(_, _, b)| b.contains("client_secret=APP-SECRET")));
+    assert!(token_calls[1].2.contains("fb_exchange_token=SHORT"));
+
+    // The desktop gets the user and the Pages that have a token, over its link.
+    let mut req = format!("{}/v1/link", r.base.replace("http", "ws")).into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {auth}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+    let TMessage::Text(t) = msg else { panic!("a text frame") };
+    let v: Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(v["kind"], "facebook_connected");
+    assert_eq!(v["payload"]["user"]["id"], "u1");
+    assert_eq!(v["payload"]["user"]["name"], "Dev Person");
+    let pages = v["payload"]["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1, "a Page without a token is no use: {pages:?}");
+    assert_eq!(pages[0]["id"], "p1");
+    assert_eq!(pages[0]["access_token"], "PAGE-T");
+    assert_eq!(pages[0]["avatar_url"], "https://x/p.png");
+}
+
+#[tokio::test]
+async fn facebook_sign_in_without_the_app_set_up_says_so_and_a_refused_code_queues_nothing() {
+    let r = relay_facebook(None).await;
+    let auth = install(&r).await;
+    let http = reqwest::Client::new();
+    let res = http.post(format!("{}/v1/facebook/oauth", r.base)).bearer_auth(&auth).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "facebook_unavailable");
+
+    let (meta, _calls) = fake_meta().await;
+    let r = relay_facebook(Some(&meta)).await;
+    let auth = install(&r).await;
+    let start: Value = http
+        .post(format!("{}/v1/facebook/oauth", r.base))
+        .bearer_auth(&auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = url::Url::parse(start["url"].as_str().unwrap()).unwrap();
+    let state = url.query_pairs().find(|(n, _)| n == "state").unwrap().1.into_owned();
+    let bad = http.get(format!("{}/v1/facebook/callback?code=badcode&state={state}", r.base)).send().await.unwrap();
+    assert_eq!(bad.status(), 502);
+    let mut req = format!("{}/v1/link", r.base.replace("http", "ws")).into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {auth}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    // Only text frames carry queued items (a ping or the like does not).
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(Ok(m)) = ws.next().await {
+            if let TMessage::Text(t) = m {
+                got.push(t.to_string());
+            }
+        }
+    })
+    .await;
+    assert!(got.is_empty(), "nothing was queued for the desktop: {got:?}");
+}
+
+/// A Meta whose Page list comes in two pieces. With `foreign`, the second piece is at another origin.
+async fn fake_meta_paged(foreign: Option<String>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::http::{HeaderMap, Uri};
+    let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let h = hits.clone();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let b2 = base.clone();
+    let app = axum::Router::new()
+        .route(
+            "/oauth/access_token",
+            post(|body: String| async move {
+                if body.contains("fb_exchange_token=SHORT") {
+                    axum::Json(json!({ "access_token": "LONG" }))
+                } else {
+                    axum::Json(json!({ "access_token": "SHORT" }))
+                }
+            }),
+        )
+        .route("/me", get(|| async { axum::Json(json!({ "id": "u1", "name": "Dev Person" })) }))
+        .route(
+            "/me/accounts",
+            get(move |u: Uri, hd: HeaderMap| {
+                let (h, base, foreign) = (h.clone(), b2.clone(), foreign.clone());
+                async move {
+                    let auth = hd.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    h.lock().unwrap().push(format!("{} {auth}", u));
+                    if u.query().is_some_and(|q| q.contains("after=PAGE2")) {
+                        axum::Json(json!({ "data": [{ "id": "p26", "name": "Page 26", "access_token": "T26" }] }))
+                    } else {
+                        let next = foreign
+                            .map(|f| format!("{f}/me/accounts?after=PAGE2"))
+                            .unwrap_or_else(|| format!("{base}/me/accounts?after=PAGE2"));
+                        axum::Json(json!({
+                            "data": [{ "id": "p1", "name": "Page 1", "access_token": "T1" }],
+                            "paging": { "next": next }
+                        }))
+                    }
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (base, hits)
+}
+
+async fn facebook_callback_status(r: &Relay, auth: &str) -> u16 {
+    let http = reqwest::Client::new();
+    let start: Value = http
+        .post(format!("{}/v1/facebook/oauth", r.base))
+        .bearer_auth(auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = url::Url::parse(start["url"].as_str().unwrap()).unwrap();
+    let state = url.query_pairs().find(|(n, _)| n == "state").unwrap().1.into_owned();
+    http.get(format!("{}/v1/facebook/callback?code=goodcode&state={state}", r.base))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+async fn queued_texts(r: &Relay, auth: &str, wait_ms: u64) -> Vec<Value> {
+    let mut req = format!("{}/v1/link", r.base.replace("http", "ws")).into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {auth}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(wait_ms), async {
+        while let Some(Ok(m)) = ws.next().await {
+            if let TMessage::Text(t) = m {
+                got.push(serde_json::from_str::<Value>(&t).unwrap());
+            }
+        }
+    })
+    .await;
+    got
+}
+
+#[tokio::test]
+async fn every_page_of_pages_is_read_and_a_next_link_to_another_origin_is_not_followed() {
+    // Two pieces on the same origin: both Pages arrive, the token goes only to Meta's origin.
+    let (meta, hits) = fake_meta_paged(None).await;
+    let r = relay_facebook(Some(&meta)).await;
+    let auth = install(&r).await;
+    assert_eq!(facebook_callback_status(&r, &auth).await, 200);
+    let got = queued_texts(&r, &auth, 800).await;
+    let ids: Vec<_> =
+        got[0]["payload"]["pages"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, ["p1", "p26"], "{got:?}");
+    assert_eq!(hits.lock().unwrap().len(), 2);
+
+    // A next link that leads somewhere else is refused: no request goes there, nothing is queued.
+    let (evil, evil_hits) = fake_meta_paged(None).await;
+    let (meta, _hits) = fake_meta_paged(Some(evil.clone())).await;
+    let r = relay_facebook(Some(&meta)).await;
+    let auth = install(&r).await;
+    assert_eq!(facebook_callback_status(&r, &auth).await, 502);
+    assert!(
+        evil_hits.lock().unwrap().is_empty(),
+        "the Page token was sent to another origin: {:?}",
+        evil_hits.lock().unwrap()
+    );
+    assert!(queued_texts(&r, &auth, 500).await.is_empty(), "nothing is handed to the desktop on a partial list");
 }

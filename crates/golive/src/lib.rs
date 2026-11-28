@@ -8,6 +8,7 @@
 //!                                      └─▶ push: Kick, custom servers
 //! ```
 
+pub mod bench;
 pub mod cut;
 pub mod cutter;
 pub mod demux;
@@ -32,11 +33,15 @@ mod whip;
 
 mod conn;
 
+pub use flv::VideoCodec;
 pub use hub::{Hub, StreamStats};
 pub use ingest::Ingest;
-pub use probe::{Need, Service, Verdict};
-pub use push::{Destination, Health, Link, PushError, PushState};
-pub use target::{Target, TargetError};
+pub use probe::{
+    BitrateCap, Canvas, CappedInfo, CustomQuality, DestinationQuality, EncodeKey, FittedEncode, MainEncode, Need,
+    PlatformLimit, RuleCode, RuleNotice, Service, Verdict, direct_limit, fit, platform_limit,
+};
+pub use push::{Destination, Health, Link, PushError, PushState, SentStreamInfo};
+pub use target::{IpFamily, Target, TargetError};
 
 #[cfg(test)]
 mod tests;

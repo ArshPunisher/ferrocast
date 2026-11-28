@@ -7,20 +7,25 @@
 mod macros;
 
 pub mod alert;
+pub mod api_keys;
 pub mod auto_quality;
 pub mod autoreply;
 pub mod chatbot;
 pub mod cloudbot;
 pub mod command;
+pub mod credits;
 pub mod dedupe;
 pub mod design;
+pub mod diagnostics;
 pub mod discord;
 pub mod event;
 pub mod filter;
 pub mod giveaway;
 pub mod goal;
 pub mod health;
+pub mod labels;
 pub mod layer;
+pub mod links;
 pub mod loyalty;
 pub mod moderation;
 pub mod moments;

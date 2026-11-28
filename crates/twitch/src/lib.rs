@@ -83,7 +83,13 @@ impl TwitchError {
             // Twitch answers a missing scope with 401 "Missing scope: …".
             401 if message.to_lowercase().contains("missing scope") => TwitchError::MissingScope(message),
             401 => TwitchError::SignInNeeded,
-            403 if message.to_lowercase().contains("scope") || message.to_lowercase().contains("permission") => {
+            403 if {
+                let lower = message.to_lowercase();
+                lower.contains("scope")
+                    || lower.contains("permission")
+                    || lower.contains("missing proper authorization")
+            } =>
+            {
                 TwitchError::MissingScope(message)
             }
             429 => {

@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrocast_connector::{Connector, ConnectorError};
+use ferrocast_connector::{Connector, ConnectorError, NativePollSpec, NativePollTally};
 use ferrocast_core::command::{Access, Command, Timer};
 use ferrocast_core::event::*;
 use ferrocast_core::goal::{Goal, GoalKind};
 use ferrocast_core::loyalty::MAX_ADJUST;
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use ferrocast_core::money::Money;
+use ferrocast_core::poll::{
+    DEFAULT_LIMITS, PlatformPollCapability, PlatformPollMode, PlatformPollState, PollCapabilityMode, PollLimits,
+};
 use ferrocast_core::queue::AckPhase;
 use serde_json::Value;
 
@@ -21,6 +24,12 @@ struct FakePlatform {
     platform: Option<Platform>,
     log: Mutex<Vec<String>>,
     fail_bans: bool,
+    poll_capability: Option<PlatformPollCapability>,
+    fail_native_poll: bool,
+    native_ended_tally: Option<Vec<u64>>,
+    native_start_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    native_end_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    fail_native_end_left: Mutex<u32>,
 }
 
 impl FakePlatform {
@@ -73,6 +82,53 @@ impl Connector for FakePlatform {
     async fn last_game(&self, login: &str) -> ferrocast_connector::Result<Option<String>> {
         self.push(format!("lookup {login}"))?;
         Ok((login == "friend").then(|| "Hades II".to_string()))
+    }
+    async fn poll_capability(&self) -> Option<PlatformPollCapability> {
+        self.poll_capability.clone()
+    }
+    async fn create_native_poll(&self, spec: &NativePollSpec) -> ferrocast_connector::Result<NativePollTally> {
+        if let Some((entered, release)) = &self.native_start_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if self.fail_native_poll {
+            let _ = self.push(format!("native_poll_fail {}", spec.question));
+            return Err(ConnectorError::Refused { platform: self.platform(), message: "poll refused".into() });
+        }
+        self.push(format!(
+            "native_poll_start {} opts={} dur={:?}",
+            spec.question,
+            spec.options.len(),
+            spec.duration_s
+        ))?;
+        Ok(NativePollTally {
+            external_id: format!("ext-{}", self.platform()).to_lowercase(),
+            counts: vec![0; spec.options.len()],
+            ended: false,
+        })
+    }
+    async fn end_native_poll(&self, external_id: &str) -> ferrocast_connector::Result<Option<NativePollTally>> {
+        if let Some((entered, release)) = &self.native_end_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        {
+            let mut left = self.fail_native_end_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                let _ = self.push(format!("native_poll_end_fail {external_id}"));
+                return Err(ConnectorError::Network {
+                    platform: self.platform(),
+                    message: "transient network error".into(),
+                });
+            }
+        }
+        self.push(format!("native_poll_end {external_id}"))?;
+        Ok(self.native_ended_tally.clone().map(|counts| NativePollTally {
+            external_id: external_id.to_string(),
+            counts,
+            ended: true,
+        }))
     }
 }
 
@@ -266,6 +322,47 @@ async fn a_platform_that_needs_signing_in_shows_one_reconnect_notice() {
     assert!(notices[0]["data"]["message"].as_str().unwrap().starts_with("Kick"));
 }
 
+/// The relay answering the link with 401 has forgotten this install. It keeps which install owns a
+/// Kick channel, so the new install the next try registers owns none: Kick's events would never
+/// come, with Kick looking connected. While Kick is signed in, the install is forgotten as before
+/// and the streamer is asked to sign in to Kick again (as the refresh path does).
+#[tokio::test]
+async fn a_relay_that_forgot_this_install_while_kick_is_signed_in_asks_for_a_new_kick_sign_in() {
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!("http://{}", rl.local_addr().unwrap());
+    let app = axum::Router::new()
+        .route("/v1/link", axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }))
+        .route(
+            "/v1/installs",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({ "install_id": "n", "install_secret": "s" }))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(rl, app).await });
+    let secrets = mem();
+    secrets.set("relay-install", "old.secret").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let apps = PlatformApps { relay_url: Some(relay), ..PlatformApps::default() };
+    let e = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+    e.register_connector(FakePlatform::new(Platform::Kick));
+    let mut live = e.subscribe_live();
+    e.ensure_relay_link();
+    let mut asked = false;
+    for _ in 0..300 {
+        while let Ok(f) = live.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["message"].as_str().is_some_and(|m| m.starts_with("Kick")) {
+                asked = true;
+            }
+        }
+        if asked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(asked, "Kick was never asked to sign in again");
+}
+
 #[tokio::test]
 async fn session_numbers_follow_tips_refunds_bits_and_viewers() {
     let (e, _d) = engine().await;
@@ -349,6 +446,73 @@ async fn commands_reply_on_the_source_platform() {
     .unwrap();
     e.ingest(chat(Platform::Kick, "k1", "Sam", "!discord")).await;
     eventually(|| kick.log().contains(&"say Join us, Sam! reply=k1".to_string())).await;
+}
+
+/// Facebook has no bot: comments never get a command answer, an auto-reply or a welcome (the
+/// notes promise it), while the other platforms do.
+#[tokio::test]
+async fn facebook_comments_never_make_the_bot_speak() {
+    let (e, _d) = engine().await;
+    let fb = FakePlatform::new(Platform::Facebook);
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(fb.clone());
+    e.register_connector(kick.clone());
+    e.save_command(Command {
+        id: "dc".into(),
+        name: "!discord".into(),
+        aliases: vec![],
+        response: "Join us, {user}!".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    let patch = serde_json::json!({ "enabled": true, "template": "Hi {user}, welcome!" });
+    e.patch_welcome(patch.as_object().unwrap()).await.unwrap();
+    e.ingest(chat(Platform::Facebook, "f1", "Asha", "!discord")).await;
+    e.ingest(chat(Platform::Facebook, "f2", "Ravi", "hello there")).await;
+    // The same command on Kick answers (so the silence above is the rule, not a broken setup).
+    e.ingest(chat(Platform::Kick, "k1", "Sam", "!discord")).await;
+    eventually(|| kick.log().contains(&"say Join us, Sam! reply=k1".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(fb.log().iter().all(|l| !l.starts_with("say")), "nothing is said on Facebook: {:?}", fb.log());
+}
+
+/// Facebook doesn't let apps ban: nothing was banned, so no ban is written down as if it was.
+#[tokio::test]
+async fn a_ban_facebook_cannot_do_is_not_recorded_as_done() {
+    let (e, _d) = engine().await;
+    let graph = Arc::new(ferrocast_facebook::Graph::new("http://127.0.0.1:9", "page", "T"));
+    e.register_connector(Arc::new(ferrocast_facebook::FacebookConnector::new(graph)));
+    let out = e.ban(Platform::Facebook, "u1", "asha", Some("Asha"), None, false).await.unwrap();
+    assert!(out.ok.is_empty());
+    assert_eq!(out.failed.len(), 1, "{out:?}");
+    assert!(e.bans().entries.is_empty(), "the ban list says someone is banned who is not");
+}
+
+/// A ban or timeout made from here takes the author's pinned message off stream at
+/// once; it must not wait for the platform to echo the event back.
+#[tokio::test]
+async fn banning_or_timing_out_the_author_unpins_their_message() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    for (n, act, who) in [("m1", "ban", "pinned"), ("m2", "timeout", "other")] {
+        e.ingest(chat(Platform::Twitch, n, who, "show me")).await;
+        let id =
+            e.db(move |s| ferrocast_store::repo::events::by_source(s, Platform::Twitch, n)).await.unwrap().unwrap();
+        e.pin_chat_highlight(&id, None).await.unwrap();
+        assert!(e.chat_highlight().is_some());
+        if act == "ban" {
+            e.ban(Platform::Twitch, "pinned-id", who, None, None, false).await.unwrap();
+        } else {
+            e.timeout(Platform::Twitch, "other-id", 60, None).await.unwrap();
+        }
+        assert!(e.chat_highlight().is_none(), "{act} must clear the pinned message");
+    }
 }
 
 #[tokio::test]
@@ -474,6 +638,9 @@ async fn panic_mode_switches_modes_and_pauses_alerts() {
         let v = serde_json::from_str::<Value>(&f.text).unwrap();
         if v["type"] == "notice" {
             assert_eq!(v["data"]["key"], "panic", "panic notices replace each other on the dashboard");
+            // One short line, what it did behind its (i).
+            assert_eq!(v["data"]["message"], "Panic mode is on");
+            assert!(v["data"]["detail"].as_str().unwrap().contains("locked down"), "{v}");
         }
         kinds.push(v["type"].as_str().unwrap_or("").to_string());
     }
@@ -1107,7 +1274,8 @@ fn poll_spec(opts: &[&str]) -> ferrocast_core::poll::PollSpec {
     ferrocast_core::poll::PollSpec {
         question: "Which map next?".into(),
         options: opts.iter().map(|s| s.to_string()).collect(),
-        duration_s: 60,
+        duration_s: Some(60),
+        chat_fallback: true,
     }
 }
 
@@ -1156,9 +1324,9 @@ async fn polls_count_one_vote_per_person_and_post_the_result_once() {
         saw_poll_frame |= f.text.contains("\"type\":\"poll\"");
     }
     assert!(saw_poll_frame, "dashboards get live results");
-    e.clear_poll().unwrap();
+    e.clear_poll().await.unwrap();
     assert!(e.poll().is_none());
-    assert!(matches!(e.clear_poll(), Err(EngineError::Missing { code: "poll_not_found", .. })));
+    assert!(matches!(e.clear_poll().await, Err(EngineError::Missing { code: "poll_not_found", .. })));
     assert!(matches!(e.end_poll().await, Err(EngineError::Missing { code: "poll_not_found", .. })));
     assert!(e.start_poll(poll_spec(&["only one"])).await.is_err());
 }
@@ -1175,6 +1343,389 @@ async fn a_poll_without_any_chat_connected_says_so() {
         }
     }
     assert!(notice.unwrap().contains("No chat is connected"));
+}
+
+fn native_twitch_cap() -> PlatformPollCapability {
+    PlatformPollCapability {
+        platform: Platform::Twitch,
+        mode: PollCapabilityMode::Native,
+        reason: None,
+        limits: PollLimits {
+            min_options: 2,
+            max_options: 5,
+            min_duration_s: 15,
+            max_duration_s: 1800,
+            supports_no_timer: true,
+            question_chars: 60,
+            option_chars: 25,
+        },
+    }
+}
+
+#[tokio::test]
+async fn poll_capabilities_reports_native_and_chat_fallback_platforms() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    let yt = Arc::new(FakePlatform {
+        platform: Some(Platform::Youtube),
+        poll_capability: Some(PlatformPollCapability {
+            platform: Platform::Youtube,
+            mode: PollCapabilityMode::ChatFallback,
+            reason: Some("not_live".into()),
+            limits: PollLimits {
+                min_options: 2,
+                max_options: 4,
+                min_duration_s: 10,
+                max_duration_s: 1800,
+                supports_no_timer: true,
+                question_chars: 100,
+                option_chars: 35,
+            },
+        }),
+        ..Default::default()
+    });
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(tw);
+    e.register_connector(yt);
+    e.register_connector(kick);
+
+    let caps = e.poll_capabilities().await;
+    assert_eq!(caps.platforms.len(), 3);
+    assert_eq!(caps.platforms[0].platform, Platform::Twitch);
+    assert_eq!(caps.platforms[0].mode, PollCapabilityMode::Native);
+    assert_eq!(caps.platforms[1].platform, Platform::Youtube);
+    assert_eq!(caps.platforms[1].mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(caps.platforms[1].reason.as_deref(), Some("not_live"));
+    assert_eq!(caps.platforms[2].platform, Platform::Kick);
+    assert_eq!(caps.platforms[2].mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(caps.platforms[2].reason.as_deref(), Some("platform_unsupported"));
+    assert_eq!(caps.platforms[2].limits, DEFAULT_LIMITS);
+}
+
+#[tokio::test]
+async fn mixed_native_and_chat_poll_isolates_vote_routing_and_merges_tallies() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(tw.clone());
+    e.register_connector(kick.clone());
+
+    let p = e.start_poll(poll_spec(&["Ascent", "Bind"])).await.unwrap();
+    assert_eq!(p.platforms.len(), 2);
+    assert_eq!(p.platforms[0].mode, PlatformPollMode::Native);
+    assert_eq!(p.platforms[0].external_id.as_deref(), Some("ext-twitch"));
+    assert_eq!(p.platforms[1].mode, PlatformPollMode::Chat);
+
+    // Kick gets the !vote announcement; Twitch runs natively and stays silent in chat.
+    eventually(|| kick.log().iter().any(|l| l.starts_with("say Poll: Which map next?"))).await;
+    assert!(tw.log().iter().any(|l| l == "native_poll_start Which map next? opts=2 dur=Some(60)"));
+    assert!(!tw.log().iter().any(|l| l.starts_with("say ")));
+
+    // Twitch !vote is ignored while Twitch runs natively; Kick !vote counts.
+    e.ingest(chat(Platform::Twitch, "tw-v1", "viewer1", "!vote 1")).await;
+    e.ingest(chat(Platform::Kick, "kk-v1", "viewer2", "!vote 2")).await;
+    assert_eq!(e.poll().unwrap().options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![0, 1]);
+
+    // Native tally updates from Twitch EventSub add onto Kick's !vote counts and aren't stored in DB.
+    let stored_before = repo::events::recent(&e.store(), None, 50, &[]).unwrap().len();
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("ev-np-1".into()),
+        Millis(0),
+        EventKind::NativePoll { poll_id: "ext-twitch".into(), counts: vec![3, 1], ended: false },
+    ))
+    .await;
+    assert_eq!(repo::events::recent(&e.store(), None, 50, &[]).unwrap().len(), stored_before);
+    let view = e.poll().unwrap();
+    assert_eq!(view.options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![3, 2]);
+    assert_eq!(view.total, 5);
+    assert_eq!(view.leaders, vec![0]);
+
+    // End terminates Twitch natively and announces result only on Kick.
+    let ended = e.end_poll().await.unwrap();
+    assert!(ended.closed);
+    eventually(|| tw.log().iter().any(|l| l == "native_poll_end ext-twitch")).await;
+    eventually(|| kick.log().iter().any(|l| l.starts_with("say Poll closed: Which map next? Winner: Ascent"))).await;
+    assert!(!tw.log().iter().any(|l| l.starts_with("say Poll closed:")));
+}
+
+#[tokio::test]
+async fn native_poll_failure_falls_back_to_chat_or_errors_when_disabled() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        fail_native_poll: true,
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let mut no_fb = poll_spec(&["Yes", "No"]);
+    no_fb.chat_fallback = false;
+    assert!(matches!(e.start_poll(no_fb).await, Err(EngineError::Invalid(_))));
+    assert!(e.poll().is_none());
+
+    let with_fb = e.start_poll(poll_spec(&["Yes", "No"])).await.unwrap();
+    assert_eq!(with_fb.platforms.len(), 1);
+    assert_eq!(with_fb.platforms[0].mode, PlatformPollMode::Chat);
+    assert_eq!(with_fb.platforms[0].state, PlatformPollState::FailedFallback);
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Poll: Which map next?"))).await;
+
+    e.ingest(chat(Platform::Twitch, "tw-fb-1", "ana", "!vote 1")).await;
+    assert_eq!(e.poll().unwrap().total, 1);
+}
+
+#[tokio::test]
+async fn native_poll_exceeding_limits_falls_back_without_truncation() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let long_q = "Long question text exceeding sixty characters cleanly for fallback";
+    let p = e
+        .start_poll(ferrocast_core::poll::PollSpec {
+            question: long_q.into(),
+            options: vec!["Alpha".into(), "Beta".into()],
+            duration_s: Some(60),
+            chat_fallback: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(p.question, long_q);
+    assert_eq!(p.platforms[0].mode, PlatformPollMode::Chat);
+    assert_eq!(p.platforms[0].state, PlatformPollState::FailedFallback);
+    assert_eq!(p.platforms[0].note.as_deref(), Some("text_too_long_for_native"));
+    eventually(|| tw.log().iter().any(|l| l.contains(long_q))).await;
+    assert!(!tw.log().iter().any(|l| l.starts_with("native_poll_start")));
+}
+
+#[tokio::test]
+async fn untimed_poll_lives_until_end_or_external_native_end_and_clear_cancels_native() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let untimed = e
+        .start_poll(ferrocast_core::poll::PollSpec {
+            question: "Wait for boss?".into(),
+            options: vec!["Stay".into(), "Reset".into()],
+            duration_s: None,
+            chat_fallback: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(untimed.ends_at, None);
+    assert!(tw.log().iter().any(|l| l == "native_poll_start Wait for boss? opts=2 dur=None"));
+
+    // Clearing an active native poll ends it on the platform cleanly.
+    e.clear_poll().await.unwrap();
+    eventually(|| tw.log().iter().any(|l| l == "native_poll_end ext-twitch")).await;
+
+    // External native poll end auto-closes a native-only poll without needing clicking End.
+    e.start_poll(ferrocast_core::poll::PollSpec {
+        question: "Round 2?".into(),
+        options: vec!["Left".into(), "Right".into()],
+        duration_s: None,
+        chat_fallback: false,
+    })
+    .await
+    .unwrap();
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("ev-np-end".into()),
+        Millis(0),
+        EventKind::NativePoll { poll_id: "ext-twitch".into(), counts: vec![2, 5], ended: true },
+    ))
+    .await;
+    eventually(|| e.poll().is_some_and(|p| p.closed && p.total == 7)).await;
+    let final_view = e.poll().unwrap();
+    assert_eq!(final_view.options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![2, 5]);
+    assert_eq!(final_view.leaders, vec![1]);
+}
+
+#[tokio::test]
+async fn native_poll_serializes_finish_vs_start_retries_failed_end_starts_clock_after_setup_and_accepts_boundary_end() {
+    use tokio::sync::Notify;
+
+    // 1. started_at is captured after native creation completes, and boundary late NativePoll updates apply.
+    let (e, _d) = engine().await;
+    let start_entered = Arc::new(Notify::new());
+    let start_release = Arc::new(Notify::new());
+    let end_entered = Arc::new(Notify::new());
+    let end_release = Arc::new(Notify::new());
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        native_ended_tally: Some(vec![9, 1]),
+        native_start_gate: Some((start_entered.clone(), start_release.clone())),
+        native_end_gate: None,
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let e_start = e.clone();
+    let p_task = tokio::spawn(async move { e_start.start_poll(poll_spec(&["A", "B"])).await });
+    start_entered.notified().await;
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let unblocked_at = now();
+    start_release.notify_one();
+    let started = p_task.await.unwrap().unwrap();
+    assert!(
+        started.started_at.0 >= unblocked_at.0,
+        "local poll clock must start after native creation (started_at={} < unblocked={})",
+        started.started_at.0,
+        unblocked_at.0
+    );
+
+    // Late final EventSub arrival right past ends_at before timer finish_poll must apply final counts.
+    {
+        let mut guard = e.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
+        guard.poll.as_mut().unwrap().ends_at = Some(Millis(now().0 - 5));
+    }
+    e.on_native_poll_event(Platform::Twitch, "ext-twitch", &[4, 6], true).await;
+    let boundary_view = e.poll().unwrap();
+    assert!(boundary_view.closed);
+    assert_eq!(boundary_view.total, 10, "boundary final tally past ends_at must not be dropped");
+
+    // 2. Limit error with chat_fallback=false names the limit reason (duration / text length).
+    {
+        let err = e
+            .start_poll(ferrocast_core::poll::PollSpec {
+                question: "Short duration?".into(),
+                options: vec!["Y".into(), "N".into()],
+                duration_s: Some(10),
+                chat_fallback: false,
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("second") || msg.contains("15") || msg.contains("duration"), "unexpected error: {err}");
+    }
+
+    // 3. Failed end_native_poll stays retryable without reopening voting or double-announcing.
+    let (e2, _d2) = engine().await;
+    let tw2 = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        native_ended_tally: Some(vec![3, 2]),
+        fail_native_end_left: Mutex::new(1),
+        ..Default::default()
+    });
+    let kick2 = FakePlatform::new(Platform::Kick);
+    e2.register_connector(tw2.clone());
+    e2.register_connector(kick2.clone());
+    let mut mixed_spec = poll_spec(&["X", "Y"]);
+    mixed_spec.chat_fallback = true;
+    e2.start_poll(mixed_spec).await.unwrap();
+    let after_fail = e2.end_poll().await.unwrap();
+    assert!(after_fail.closed, "poll closes locally even if native end failed");
+    eventually(|| kick2.log().iter().any(|l| l.starts_with("say Poll closed:"))).await;
+    // Retry end_poll succeeds remotely and announces result on Kick only once.
+    let retried = e2.end_poll().await.unwrap();
+    assert!(retried.closed);
+    assert!(tw2.log().iter().any(|l| l == "native_poll_end ext-twitch"));
+    assert_eq!(kick2.log().iter().filter(|l| l.starts_with("say Poll closed:")).count(), 1);
+    assert!(matches!(e2.end_poll().await, Err(EngineError::Conflict(_))));
+
+    // 4. finish_poll serializes against concurrent start_poll so Poll A's result is never lost.
+    let (e3, _d3) = engine().await;
+    let tw3 = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        native_ended_tally: Some(vec![9, 1]),
+        native_end_gate: Some((end_entered.clone(), end_release.clone())),
+        ..Default::default()
+    });
+    e3.register_connector(tw3.clone());
+    e3.start_poll(poll_spec(&["Alpha", "Beta"])).await.unwrap();
+    let e3_end = e3.clone();
+    let end_task = tokio::spawn(async move { e3_end.end_poll().await });
+    end_entered.notified().await;
+
+    let e3_start = e3.clone();
+    let start_b = tokio::spawn(async move { e3_start.start_poll(poll_spec(&["One", "Two"])).await });
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !tw3.log().iter().any(|l| l.contains("native_poll_start One")),
+        "new poll start must wait until previous poll finishes ending"
+    );
+    end_release.notify_one();
+    let ended_a = end_task.await.unwrap().expect("Poll A end_poll must succeed with final tallies");
+    assert_eq!(ended_a.total, 10);
+    assert!(start_b.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn moderation_ban_surfaces_pending_tts_cleanup_failure_and_blocks_approval_until_cleaned() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw);
+    let mut tts = e.state().tts.clone();
+    tts.enabled = true;
+    tts.voice = Some("missing-local-voice-falls-back-fast".into());
+    tts.chat.enabled = true;
+    tts.chat.mode = ferrocast_core::tts::ChatTtsMode::Everyone;
+    tts.hold_for_approval = true;
+    e.save_tts(tts).await.unwrap();
+
+    e.ingest(chat(Platform::Twitch, "bad-1", "troll", "spam line")).await;
+    let pending = e.tts_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let pid = pending[0]["id"].as_str().unwrap().to_string();
+
+    // Force SQLite DELETE on tts_pending to fail while platform ban succeeds.
+    e.db(|s| {
+        s.write(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER test_fail_tts_del BEFORE DELETE ON tts_pending BEGIN
+                    SELECT RAISE(ABORT, 'simulated cleanup error');
+                 END;",
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let mut live_rx = e.subscribe_live();
+    let out = e.ban(Platform::Twitch, "troll-id", "troll", Some("troll"), None, false).await.unwrap();
+    assert_eq!(out.ok, vec![Platform::Twitch]);
+
+    // Failure notice must be surfaced instead of silently dropped as 0, and approval must be refused.
+    let mut saw_notice = false;
+    while let Ok(f) = live_rx.try_recv() {
+        if f.text.contains("\"type\":\"notice\"") && f.text.to_ascii_lowercase().contains("pending") {
+            saw_notice = true;
+        }
+    }
+    assert!(saw_notice, "must surface failed pending-TTS cleanup notice");
+    assert!(
+        e.decide_tts(&pid, true).await.is_err(),
+        "banned user's pending row must not be approvable while cleanup failed"
+    );
+
+    // Once DB recovers, retry drops the row cleanly.
+    e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER test_fail_tts_del;")?))).await.unwrap();
+    assert!(e.decide_tts(&pid, true).await.is_err());
+    assert!(e.tts_pending().await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------- giveaways
@@ -1753,7 +2304,8 @@ async fn a_browser_that_didnt_open_reaches_the_dashboard() {
     assert_eq!(notices[0]["key"], crate::BROWSER_NOTICE);
     assert_eq!(notices[0]["level"], "warn");
     let message = notices[0]["message"].as_str().unwrap();
-    assert!(message.contains("couldn't open your browser") && message.contains("Try again"), "{message}");
+    assert_eq!(message, "Ferrocast couldn't open your browser");
+    assert!(notices[0]["detail"].as_str().unwrap().contains("Try again"), "{:?}", notices[0]);
 }
 
 #[tokio::test]
@@ -1786,4 +2338,994 @@ async fn a_new_stream_starts_with_empty_chat() {
     }
     assert!(!again, "one stream, one clear");
     assert_eq!(e.stream_started_at(), Some(start));
+}
+
+#[tokio::test]
+async fn a_failed_background_save_gives_one_notice_and_a_later_success_replaces_it() {
+    let (e, d) = engine().await;
+    e.watch_saves();
+    let mut live = e.subscribe_live();
+    // The folder's place is taken by a file, so the save fails at once (not a passing lock).
+    let blocker = d.path().join("savetest");
+    std::fs::write(&blocker, b"x").unwrap();
+    let file = blocker.join("collections").join("main.json");
+    for _ in 0..3 {
+        ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    }
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["key"].as_str().is_some_and(|k| k.starts_with("save:")) {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+    let failed = notices(&mut live);
+    assert_eq!(failed.len(), 1, "one notice per failing file, not per attempt: {failed:?}");
+    assert_eq!(failed[0]["level"], "warn");
+    // The parent being a file: NotADirectory/NotFound-class, not a lock.
+    assert!(failed[0]["message"].as_str().unwrap().starts_with("Couldn't save your scenes"));
+    assert!(failed[0]["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    let text = failed[0].to_string();
+    let tmp = d.path().to_string_lossy().to_string();
+    assert!(!text.contains(&tmp) && !text.contains("savetest"), "no path in the notice: {text}");
+    assert_eq!(failed[0]["key"], "save:collections/main.json");
+    // Fixed: the same key says it's saving again, replacing the warning on the dashboard.
+    std::fs::remove_file(&blocker).unwrap();
+    ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());
+    assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    let back = notices(&mut live);
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert_eq!(back[0]["key"], failed[0]["key"]);
+    assert_eq!(back[0]["level"], "info");
+}
+
+#[tokio::test]
+async fn overlay_labels_track_session_monthly_alltime_latest_and_hype_train() {
+    use ferrocast_core::money::{PlatformValue, ValueUnit};
+    use ferrocast_core::overlay::{Preset, Widget, WidgetKind};
+    use serde_json::json;
+
+    let (e, _d) = engine().await;
+    let now_ms = crate::now().0;
+
+    let view = e.create_overlay("LabelsTest", Preset::Blank).await.unwrap();
+    let mut ov = e.overlay(&view.id).await.unwrap();
+    ov.widgets = vec![
+        Widget::new(
+            "lf",
+            WidgetKind::Label,
+            (10, 10, 300, 50),
+            json!({ "source": "latest_follower", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "sf",
+            WidgetKind::Label,
+            (10, 70, 300, 50),
+            json!({ "source": "session_follows", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "mf",
+            WidgetKind::Label,
+            (10, 130, 300, 50),
+            json!({ "source": "monthly_follows", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "af",
+            WidgetKind::Label,
+            (10, 190, 300, 50),
+            json!({ "source": "alltime_follows", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "sb",
+            WidgetKind::Label,
+            (10, 250, 300, 50),
+            json!({ "source": "session_bits", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "st",
+            WidgetKind::Label,
+            (10, 310, 300, 50),
+            json!({ "source": "session_tips", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "sr",
+            WidgetKind::Label,
+            (10, 370, 300, 50),
+            json!({ "source": "session_raids", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "ts",
+            WidgetKind::Label,
+            (10, 430, 300, 50),
+            json!({ "source": "top_supporter_session", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "lr",
+            WidgetKind::Label,
+            (10, 490, 300, 50),
+            json!({ "source": "latest_raid", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "ht",
+            WidgetKind::Label,
+            (10, 550, 460, 50),
+            json!({
+                "source": "hype_train",
+                "template": "Hype Lv.{level} ({count}) {timer}",
+                "theme": "molten",
+                "train_window_s": 60,
+                "train_step_s": 15,
+                "train_max_s": 180,
+                "train_threshold": 2
+            }),
+        ),
+    ];
+    e.update_overlay(ov.clone()).await.unwrap();
+    let mut rx = e.subscribe_overlays();
+
+    let fan = |n: &str| {
+        let mut a = Actor::named(Platform::Twitch, n);
+        a.id = Some(format!("id-{n}"));
+        a
+    };
+
+    // Go live on stream 1 and ingest an event far in the past (prev year) + events now
+    let old_ts = 1_577_836_800_000_i64; // 2020-01-01
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("old-follow".into()),
+        Millis(old_ts),
+        EventKind::Follow { actor: fan("PastFan") },
+    ))
+    .await;
+
+    // Stream 1 starts now
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("s1-on".into()),
+        Millis(now_ms - 5_000),
+        EventKind::StreamOnline { title: None },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("f1".into()),
+        Millis(now_ms - 4_000),
+        EventKind::Follow { actor: fan("Alice") },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("b1".into()),
+        Millis(now_ms - 3_000),
+        EventKind::PlatformGift {
+            actor: fan("BitsKing"),
+            value: PlatformValue { unit: ValueUnit::Bits, amount: 1200 },
+            message: None,
+        },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("r1".into()),
+        Millis(now_ms - 2_000),
+        EventKind::Raid { from: fan("RaiderBob"), viewers: 25 },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Tips,
+        Some("t1".into()),
+        Millis(now_ms - 1_000),
+        EventKind::Tip {
+            actor: fan("Whale"),
+            money: Money::new(50_000, "INR"),
+            message: None,
+            provider: TipProvider::Razorpay,
+            payment_ref: "t1".into(),
+            status: PaymentStatus::Captured,
+        },
+    ))
+    .await;
+
+    // Test alert must not alter label counts or hype train
+    e.test("tip", None).await.unwrap();
+
+    // Verify at least one overlay WS label state push arrived cleanly
+    let mut got_push = false;
+    while let Ok(f) = rx.try_recv() {
+        let v: Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "state" && v["data"]["labels"]["ht"].is_string() {
+            got_push = true;
+        }
+    }
+    assert!(got_push, "label update frame should be pushed over WS");
+
+    let snap = e.overlay_snapshot(&ov).await.unwrap();
+    let labels = &snap["state"]["labels"];
+    assert_eq!(labels["lf"], "Alice");
+    assert_eq!(labels["sf"], "1");
+    assert_eq!(labels["mf"], "1");
+    assert_eq!(labels["af"], "2", "includes the 2020 follower in all-time");
+    assert_eq!(labels["sb"], "1,200");
+    assert_eq!(labels["st"], "₹500");
+    assert_eq!(labels["sr"], "1");
+    assert_eq!(labels["lr"], "RaiderBob (25)");
+    assert!(labels["ts"].as_str().unwrap().starts_with("BitsKing"));
+    let train = &snap["state"]["label_trains"]["ht"];
+    assert_eq!(train["active"], true);
+    assert_eq!(train["events"], 4);
+
+    // Go offline then start Stream 2 -> session resets to 0 while monthly/all-time stay!
+    e.ingest(Event::live(Platform::Twitch, Some("s1-off".into()), Millis(now_ms - 500), EventKind::StreamOffline))
+        .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("s2-on".into()),
+        Millis(now_ms),
+        EventKind::StreamOnline { title: None },
+    ))
+    .await;
+    let snap2 = e.overlay_snapshot(&ov).await.unwrap();
+    assert_eq!(snap2["state"]["labels"]["sf"], "0");
+    assert_eq!(snap2["state"]["labels"]["st"], "0");
+    assert_eq!(snap2["state"]["labels"]["mf"], "1");
+    assert_eq!(snap2["state"]["labels"]["af"], "2");
+}
+
+#[tokio::test]
+async fn mute_and_pause_show_in_the_queue_and_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
+        assert!(!e.queue().await.muted);
+        let v = e.queue_set_muted(true).await;
+        assert!(v.muted && !v.paused);
+        e.queue_pause().await;
+    }
+    let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
+    let q = e.queue().await;
+    assert!(q.muted && q.paused);
+    assert!(!e.queue_set_muted(false).await.muted);
+}
+
+#[tokio::test]
+async fn a_muted_alert_reaches_the_overlay_without_sound() {
+    let (e, _d) = engine().await;
+    e.queue_set_muted(true).await;
+    e.test("follow", None).await.unwrap();
+    let mut shown = None;
+    for _ in 0..300 {
+        shown = e.queue().await.playing;
+        if shown.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let a = shown.expect("the alert started").alert;
+    assert!(a.sound.is_none() && a.tts_text.is_none() && a.tts_audio.is_none());
+}
+
+async fn playing_id(e: &Engine) -> Option<String> {
+    e.queue().await.playing.map(|p| p.alert.alert_id)
+}
+
+#[tokio::test]
+async fn an_interrupting_rule_replaces_the_playing_alert_and_others_queue() {
+    let (e, _d) = engine().await;
+    let mut rule = e.rules().into_iter().find(|r| r.kinds.iter().any(|k| k == "follow")).unwrap();
+    rule.interrupt = true;
+    e.save_rule(rule).await.unwrap();
+    e.test("follow", None).await.unwrap();
+    let mut first = None;
+    for _ in 0..300 {
+        first = playing_id(&e).await;
+        if first.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let first = first.expect("first alert started");
+    e.test("follow", None).await.unwrap();
+    for _ in 0..300 {
+        if playing_id(&e).await.is_some_and(|id| id != first) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_ne!(playing_id(&e).await.as_deref(), Some(first.as_str()), "the new follow ended the old one");
+    assert!(e.queue().await.waiting.is_empty());
+    // A raid has no interrupting rule: it waits behind the playing follow.
+    e.test("raid", None).await.unwrap();
+    for _ in 0..300 {
+        if !e.queue().await.waiting.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(e.queue().await.waiting.len(), 1);
+}
+
+#[tokio::test]
+async fn a_rule_without_interrupt_queues_behind_the_playing_alert() {
+    let (e, _d) = engine().await;
+    e.test("follow", None).await.unwrap();
+    e.test("follow", None).await.unwrap();
+    for _ in 0..300 {
+        let q = e.queue().await;
+        if q.playing.is_some() && q.waiting.len() == 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the second follow never queued");
+}
+
+#[tokio::test]
+async fn account_urls_capture_youtube_custom_url_and_lazy_refresh_updates_overlays() {
+    use ferrocast_youtube::{Endpoints as YtEndpoints, Tokens as YtTokens};
+    let (e, _d) = engine().await;
+
+    // Seed an existing YouTube install whose login still holds a display title (no @handle)
+    // and expired OAuth tokens, backed by a fake YouTube OAuth + API server.
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "access_token": "yt-fresh",
+                    "refresh_token": "yt-r",
+                    "expires_in": 3600
+                }))
+            }),
+        )
+        .route(
+            "/api/channels",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "items": [{
+                        "id": "UC_EXIST_1",
+                        "snippet": {
+                            "title": "Nova Legacy Title",
+                            "customUrl": "@NovaActualHandle"
+                        }
+                    }]
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let apps = PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "cid".into(), client_secret: "sec".into() }),
+        youtube_endpoints: YtEndpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: String::new(),
+        },
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(ferrocast_secrets::MemorySecrets::default());
+    let eng = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+
+    // Save legacy YouTube account row + expired tokens before creating an overlay listener.
+    eng.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_EXIST_1".into(),
+                login: "Nova Legacy Title".into(),
+                display_name: "Nova Legacy Title".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 100,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let mut rx = eng.subscribe_overlays();
+    let api = eng
+        .youtube_api(YtTokens { access_token: "yt-old".into(), refresh_token: "yt-r".into(), expires_at: 1 })
+        .unwrap();
+
+    // Trigger a token refresh via api.access(); lazy handle discovery runs in background.
+    assert_eq!(api.access().await.unwrap(), "yt-fresh");
+    eventually(|| {
+        eng.state()
+            .connectors
+            .get("youtube")
+            .and_then(|c| c.account.as_ref())
+            .is_some_and(|a| a.login == "@NovaActualHandle")
+    })
+    .await;
+
+    let yt = eng.state().connectors["youtube"].account.as_ref().unwrap().clone();
+    assert_eq!(yt.login, "@NovaActualHandle");
+    assert_eq!(yt.url.as_deref(), Some("youtube.com/@NovaActualHandle"));
+
+    // Overlay stream received live `state` frame with updated YouTube link.
+    let f = next_overlay_frame(&mut rx, "state").await;
+    assert_eq!(f["data"]["links"]["youtube"], "youtube.com/@NovaActualHandle");
+
+    // Disconnecting clears the link explicitly (not merely omitting the key) and notifies live overlays.
+    eng.disconnect_account(Platform::Youtube).await.unwrap();
+    let f2 = next_overlay_frame(&mut rx, "state").await;
+    assert_eq!(f2.pointer("/data/links/youtube"), Some(&Value::Null));
+    drop(e);
+}
+
+#[tokio::test]
+async fn disconnect_removes_account_row_before_emitting_status_frame() {
+    #[derive(Debug)]
+    struct InspectOnDeleteSecrets {
+        inner: ferrocast_secrets::MemorySecrets,
+        live_rx: Mutex<Option<tokio::sync::broadcast::Receiver<LiveFrame>>>,
+        saw_status_before_delete: Mutex<bool>,
+    }
+    impl ferrocast_secrets::Secrets for InspectOnDeleteSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>, ferrocast_secrets::SecretError> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            if let Some(rx) = self.live_rx.lock().unwrap().as_mut() {
+                while let Ok(frame) = rx.try_recv() {
+                    let v: Value = serde_json::from_str(&frame.text).unwrap_or(Value::Null);
+                    if v["type"] == "status" {
+                        *self.saw_status_before_delete.lock().unwrap() = true;
+                    }
+                }
+            }
+            self.inner.delete(key)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(InspectOnDeleteSecrets {
+        inner: ferrocast_secrets::MemorySecrets::default(),
+        live_rx: Mutex::new(None),
+        saw_status_before_delete: Mutex::new(false),
+    });
+    let eng = Engine::start_with_secrets(dir.path(), secrets.clone()).await.unwrap();
+    eng.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "twitch".into(),
+                user_id: "tw1".into(),
+                login: "novaplays".into(),
+                display_name: "NovaPlays".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 1,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let mut post_rx = eng.subscribe_live();
+    *secrets.live_rx.lock().unwrap() = Some(eng.subscribe_live());
+
+    eng.disconnect_account(Platform::Twitch).await.unwrap();
+
+    assert!(
+        !*secrets.saw_status_before_delete.lock().unwrap(),
+        "status live frame must not fire before secrets + DB account deletion"
+    );
+    let mut saw_status = false;
+    while let Ok(frame) = post_rx.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "status" {
+            assert!(v.pointer("/data/connectors/twitch/account").is_some_and(Value::is_null));
+            saw_status = true;
+        }
+    }
+    assert!(saw_status);
+}
+
+#[tokio::test]
+async fn youtube_handle_refresh_does_not_resurrect_disconnected_or_switched_account() {
+    use ferrocast_youtube::{Endpoints as YtEndpoints, Tokens as YtTokens};
+    let req_started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let req_started_srv = req_started.clone();
+    let release_srv = release.clone();
+
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "access_token": "yt-fresh",
+                    "refresh_token": "yt-r",
+                    "expires_in": 3600
+                }))
+            }),
+        )
+        .route(
+            "/api/channels",
+            axum::routing::get(move || {
+                let req_started = req_started_srv.clone();
+                let release = release_srv.clone();
+                async move {
+                    req_started.notify_one();
+                    release.notified().await;
+                    axum::Json(serde_json::json!({
+                        "items": [{
+                            "id": "UC_OLD_1",
+                            "snippet": {
+                                "title": "Old Channel",
+                                "customUrl": "@OldHandle"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let apps = PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "cid".into(), client_secret: "sec".into() }),
+        youtube_endpoints: YtEndpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: String::new(),
+        },
+        ..Default::default()
+    };
+
+    // Case A: disconnect happens while `api.me()` is in flight -> no zombie resurrection.
+    let dir = tempfile::tempdir().unwrap();
+    let eng = Engine::start_with(dir.path(), mem(), apps.clone()).await.unwrap();
+    eng.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_OLD_1".into(),
+                login: "Old Title".into(),
+                display_name: "Old Title".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 100,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let api = eng
+        .youtube_api(YtTokens {
+            access_token: "yt-valid".into(),
+            refresh_token: "yt-r".into(),
+            expires_at: crate::now().0 + 3_600_000,
+        })
+        .unwrap();
+    let task = {
+        let eng = eng.clone();
+        let api = api.clone();
+        tokio::spawn(async move {
+            eng.refresh_youtube_handle_if_missing(&api).await;
+        })
+    };
+    req_started.notified().await;
+    eng.disconnect_account(Platform::Youtube).await.unwrap();
+    release.notify_one();
+    task.await.unwrap();
+    assert!(
+        !eng.db(ferrocast_store::repo::settings::accounts).await.unwrap().into_iter().any(|a| a.platform == "youtube")
+    );
+    assert!(eng.state().connectors.get("youtube").and_then(|c| c.account.as_ref()).is_none());
+    assert!(eng.resolved_links().await.unwrap().youtube.is_none());
+
+    // Case B: switching to UC_NEW_2 while `api.me()` for UC_OLD_1 is in flight -> new account wins.
+    let dir2 = tempfile::tempdir().unwrap();
+    let eng2 = Engine::start_with(dir2.path(), mem(), apps).await.unwrap();
+    eng2.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_OLD_1".into(),
+                login: "Old Title".into(),
+                display_name: "Old Title".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 100,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let api2 = eng2
+        .youtube_api(YtTokens {
+            access_token: "yt-valid".into(),
+            refresh_token: "yt-r".into(),
+            expires_at: crate::now().0 + 3_600_000,
+        })
+        .unwrap();
+    let task2 = {
+        let eng2 = eng2.clone();
+        let api2 = api2.clone();
+        tokio::spawn(async move {
+            eng2.refresh_youtube_handle_if_missing(&api2).await;
+        })
+    };
+    req_started.notified().await;
+    eng2.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_NEW_2".into(),
+                login: "@NewChannel".into(),
+                display_name: "New Channel".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 200,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    release.notify_one();
+    task2.await.unwrap();
+    let yt_after = eng2
+        .db(ferrocast_store::repo::settings::accounts)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.platform == "youtube")
+        .unwrap();
+    assert_eq!(yt_after.user_id, "UC_NEW_2");
+    assert_eq!(yt_after.login, "@NewChannel");
+}
+
+#[tokio::test]
+async fn resume_account_backfills_youtube_handle_on_startup_without_waiting_for_token_expiry() {
+    use ferrocast_secrets::Secrets;
+    use ferrocast_youtube::{Endpoints as YtEndpoints, Tokens as YtTokens};
+    let app = axum::Router::new().route(
+        "/api/channels",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "items": [{
+                    "id": "UC_EXIST_1",
+                    "snippet": {
+                        "title": "Nova Legacy Title",
+                        "customUrl": "@NovaActualHandle"
+                    }
+                }]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(ferrocast_secrets::MemorySecrets::default());
+    {
+        let seed = Engine::start_with_secrets(dir.path(), secrets.clone()).await.unwrap();
+        seed.db(|s| {
+            ferrocast_store::repo::settings::save_account(
+                s,
+                &ferrocast_store::repo::settings::Account {
+                    platform: "youtube".into(),
+                    user_id: "UC_EXIST_1".into(),
+                    login: "Nova Legacy Title".into(),
+                    display_name: "Nova Legacy Title".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 100,
+                },
+            )
+        })
+        .await
+        .unwrap();
+        let tok_json = serde_json::to_string(&YtTokens {
+            access_token: "yt-still-valid".into(),
+            refresh_token: "yt-r".into(),
+            expires_at: crate::now().0 + 3_600_000,
+        })
+        .unwrap();
+        secrets.set(crate::accounts::YOUTUBE_TOKENS, &tok_json).unwrap();
+    }
+
+    let apps = PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "cid".into(), client_secret: "sec".into() }),
+        youtube_endpoints: YtEndpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: String::new(),
+        },
+        ..Default::default()
+    };
+    let eng = Engine::start_with(dir.path(), secrets, apps).await.unwrap();
+    eventually(|| {
+        eng.state()
+            .connectors
+            .get("youtube")
+            .and_then(|c| c.account.as_ref())
+            .is_some_and(|a| a.url.as_deref() == Some("youtube.com/@NovaActualHandle"))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reload_pushes_restored_links_to_open_overlays_and_dashboards() {
+    let (eng, _d) = engine().await;
+    let mut ov_rx = eng.subscribe_overlays();
+    let mut live_rx = eng.subscribe_live();
+
+    eng.db(|s| {
+        ferrocast_store::repo::settings::set(
+            s,
+            "creator_links",
+            &serde_json::json!({ "discord": "https://discord.gg/restored/" }),
+        )
+    })
+    .await
+    .unwrap();
+
+    eng.reload().await.unwrap();
+
+    let ov_frame = next_overlay_frame(&mut ov_rx, "state").await;
+    assert_eq!(ov_frame["data"]["links"]["discord"], "discord.gg/restored");
+    let live_frame = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(f) = live_rx.recv().await {
+                let v: Value = serde_json::from_str(&f.text).unwrap();
+                if v["type"] == "links" {
+                    return v;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(live_frame["data"]["resolved"]["discord"], "discord.gg/restored");
+}
+
+#[tokio::test]
+async fn patch_links_refuses_to_overwrite_stored_links_after_failed_read() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::instrument::WithSubscriber;
+    use tracing::{Event, Level, Metadata, Subscriber, span};
+
+    #[derive(Default)]
+    struct LogCapture {
+        errors: Mutex<Vec<String>>,
+    }
+
+    impl LogCapture {
+        fn record_event(&self, event: &Event<'_>) {
+            struct MsgVisitor(String);
+            impl Visit for MsgVisitor {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            if *event.metadata().level() <= Level::ERROR {
+                let mut v = MsgVisitor(String::new());
+                event.record(&mut v);
+                self.errors.lock().unwrap().push(v.0);
+            }
+        }
+    }
+
+    struct CaptureSub(Arc<LogCapture>);
+    impl Subscriber for CaptureSub {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= Level::ERROR
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            self.0.record_event(event);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    let (eng, _d) = engine().await;
+    let corrupt_json = r#"{"twitch":"twitch.tv/keepme","discord":123}"#;
+    eng.db(move |s| {
+        s.write(|tx| {
+            tx.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES ('creator_links', ?1, 1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [corrupt_json],
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let logs = Arc::new(LogCapture::default());
+    let dispatch = tracing::Dispatch::new(CaptureSub(logs.clone()));
+    let patch = serde_json::json!({ "x": "novaplays" }).as_object().unwrap().clone();
+    let err = eng.patch_links(&patch).with_subscriber(dispatch).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("my links") && msg.to_lowercase().contains("read"),
+        "expected clear error explaining failed read prevented overwrite, got: {msg}"
+    );
+
+    // Stored JSON row must remain completely intact (never overwritten with partial patch).
+    let stored_after: String = eng
+        .db(|s| {
+            s.read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = 'creator_links'", [], |r| r.get(0))?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored_after, corrupt_json);
+
+    // Error was logged with context (`creator_links` and patched field key, without leaking values).
+    let recorded = logs.errors.lock().unwrap().join("\n");
+    assert!(recorded.contains("creator_links"), "expected creator_links context in error log: {recorded}");
+    assert!(recorded.contains("patch_keys"), "expected patch_keys context in error log: {recorded}");
+
+    // Best-effort display paths still fall back to empty links instead of failing.
+    assert_eq!(eng.links().await.unwrap().links, ferrocast_core::links::CreatorLinks::default());
+    assert!(eng.resolved_links().await.unwrap().socials.is_empty());
+
+    // SQL read errors also fail instead of falling back to empty links.
+    let (sql_eng, _d2) = engine().await;
+    sql_eng.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TABLE settings;")?))).await.unwrap();
+    let sql_err = sql_eng.patch_links(&patch).await.unwrap_err();
+    assert!(
+        sql_err.to_string().to_lowercase().contains("my links"),
+        "expected clear error on SQL read failure, got: {sql_err}"
+    );
+}
+
+#[tokio::test]
+async fn viewer_count_forwards_to_live_socket_bypasses_dedupe_and_offline_clears_overlays() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    let mut overlays = e.subscribe_overlays();
+
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::StreamOnline { title: None })).await;
+    e.ingest(Event::live(Platform::Youtube, None, Millis(1_000_000), EventKind::StreamOnline { title: None })).await;
+
+    // Two live ViewerCount updates for the same platform at the same millisecond must both
+    // forward to the dashboard live socket instead of being swallowed by dedupe or early-returned.
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::ViewerCount { count: 100 })).await;
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::ViewerCount { count: 120 })).await;
+    e.ingest(Event::live(Platform::Youtube, None, Millis(1_000_000), EventKind::ViewerCount { count: 50 })).await;
+
+    let mut viewer_events = Vec::new();
+    while let Ok(frame) = live.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "event" && v["data"]["kind"]["type"] == "viewer_count" {
+            viewer_events.push((
+                v["data"]["platform"].as_str().unwrap_or("").to_string(),
+                v["data"]["kind"]["count"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    assert_eq!(
+        viewer_events,
+        vec![("twitch".into(), 100), ("twitch".into(), 120), ("youtube".into(), 50)],
+        "every live viewer_count update must reach the dashboard live socket"
+    );
+
+    // Drain earlier overlay frames before StreamOffline.
+    while overlays.try_recv().is_ok() {}
+
+    e.ingest(Event::live(Platform::Youtube, None, Millis(1_001_000), EventKind::StreamOffline)).await;
+
+    let mut offline_viewers: Option<Value> = None;
+    while let Ok(frame) = overlays.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "state" && v["data"].get("viewers").is_some() {
+            offline_viewers = Some(v["data"]["viewers"].clone());
+        }
+    }
+    let viewers = offline_viewers.expect("StreamOffline must emit updated viewers state to overlays");
+    assert_eq!(viewers["twitch"], 120);
+    assert!(viewers["youtube"].is_null(), "offline platform must clear in overlays: {viewers:?}");
+}
+
+#[tokio::test]
+async fn studio_stream_start_wakes_youtube() {
+    let (e, _d) = engine().await;
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let woken = wake.notified();
+    *e.inner.youtube_wake.lock().unwrap() = Some(wake.clone());
+    e.on_stream_started();
+    tokio::time::timeout(Duration::from_secs(1), woken).await.expect("Studio on_stream_started must wake YouTube");
+}
+
+#[tokio::test]
+async fn stream_offline_viewer_clear_uses_fresh_seq_and_viewer_counts_skip_recent_events() {
+    let (e, _d) = engine().await;
+    let before = e.current_seq();
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::StreamOnline { title: None })).await;
+    e.ingest(first_time(chat(Platform::Twitch, "msg-1", "alice", "hello"))).await;
+    let (after_chat, gap_initial) = e.events_since(before);
+    assert!(!gap_initial);
+    let chat_seq = after_chat
+        .iter()
+        .filter_map(|f| serde_json::from_str::<Value>(&f.text).ok())
+        .filter_map(|v| v["data"]["seq"].as_u64())
+        .max()
+        .unwrap();
+
+    // ViewerCount must still reach live subscribers, without polluting or evicting recent_events.
+    let mut live_rx = e.subscribe_live();
+    for count in 1..=510u64 {
+        e.ingest(Event::live(
+            Platform::Twitch,
+            None,
+            Millis(1_000_000 + count as i64),
+            EventKind::ViewerCount { count },
+        ))
+        .await;
+    }
+    let mut saw_510 = false;
+    while let Ok(frame) = live_rx.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "event" && v["data"]["kind"]["count"] == 510 {
+            saw_510 = true;
+        }
+    }
+    assert!(saw_510, "live websocket subscribers must still receive ViewerCount updates");
+    let (since_chat, gap_after) = e.events_since(chat_seq);
+    assert!(!gap_after, "ViewerCount updates must not evict chat events from recent_events");
+    assert!(
+        !since_chat.iter().any(|f| {
+            serde_json::from_str::<Value>(&f.text).ok().is_some_and(|v| v["data"]["kind"]["type"] == "viewer_count")
+        }),
+        "ViewerCount must not be pushed into recent_events replay buffer"
+    );
+
+    // StreamOffline's overlay clear frame must get a fresh seq strictly above the offline event's seq.
+    let mut overlays = e.subscribe_overlays();
+    while overlays.try_recv().is_ok() {}
+    while live_rx.try_recv().is_ok() {}
+    e.ingest(Event::live(Platform::Twitch, None, Millis(2_000_000), EventKind::StreamOffline)).await;
+
+    let offline_event_seq = {
+        let mut found = None;
+        while let Ok(f) = live_rx.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "event" && v["data"]["kind"]["type"] == "stream_offline" {
+                found = v["data"]["seq"].as_u64();
+            }
+        }
+        found.expect("expected StreamOffline live frame")
+    };
+    let mut clear_seq = None;
+    while let Ok(frame) = overlays.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "state" && v["data"].get("viewers").is_some() {
+            clear_seq = v.get("seq").and_then(|s| s.as_u64());
+        }
+    }
+    assert!(
+        clear_seq.expect("expected viewer-clear overlay frame") > offline_event_seq,
+        "viewer-clear overlay frame must mint a fresh seq above the offline event seq"
+    );
 }

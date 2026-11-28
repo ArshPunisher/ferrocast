@@ -20,61 +20,65 @@ pub struct Face {
 /// The faces in an RGBA picture `w`×`h` (rows top first), biggest first. Empty when there are
 /// none, or the picture can't be read.
 pub fn faces(rgba: &[u8], w: u32, h: u32) -> Vec<Face> {
-    let Some(handler) = handler(rgba, w, h) else { return Vec::new() };
-    // SAFETY: a plain new request with no completion handler.
-    let request = unsafe { VNDetectFaceRectanglesRequest::new() };
-    let as_request: &VNRequest = &request;
-    let list = NSArray::from_slice(&[as_request]);
-    if handler.performRequests_error(&list).is_err() {
-        return Vec::new();
-    }
-    // SAFETY: results of a request that has run, read on the same thread.
-    let Some(found) = (unsafe { request.results() }) else { return Vec::new() };
-    let mut out: Vec<Face> = found
-        .iter()
-        .map(|o| {
-            // SAFETY: a getter on a live observation.
-            let b = unsafe { o.boundingBox() };
-            // Vision's origin is the bottom left.
-            Face { x: b.origin.x, y: 1.0 - b.origin.y - b.size.height, w: b.size.width, h: b.size.height }
-        })
-        .filter(|f| f.w > 0.0 && f.h > 0.0)
-        .collect();
-    out.sort_by(|a, b| (b.w * b.h).total_cmp(&(a.w * a.h)));
-    out
+    objc2::rc::autoreleasepool(|_| {
+        let Some(handler) = handler(rgba, w, h) else { return Vec::new() };
+        // SAFETY: a plain new request with no completion handler.
+        let request = unsafe { VNDetectFaceRectanglesRequest::new() };
+        let as_request: &VNRequest = &request;
+        let list = NSArray::from_slice(&[as_request]);
+        if handler.performRequests_error(&list).is_err() {
+            return Vec::new();
+        }
+        // SAFETY: results of a request that has run, read on the same thread.
+        let Some(found) = (unsafe { request.results() }) else { return Vec::new() };
+        let mut out: Vec<Face> = found
+            .iter()
+            .map(|o| {
+                // SAFETY: a getter on a live observation.
+                let b = unsafe { o.boundingBox() };
+                // Vision's origin is the bottom left.
+                Face { x: b.origin.x, y: 1.0 - b.origin.y - b.size.height, w: b.size.width, h: b.size.height }
+            })
+            .filter(|f| f.w > 0.0 && f.h > 0.0)
+            .collect();
+        out.sort_by(|a, b| (b.w * b.h).total_cmp(&(a.w * a.h)));
+        out
+    })
 }
 
 /// Where the eye goes in an RGBA picture (Vision's attention-based saliency): the box round
 /// what stands out, biggest first. Empty for a picture with nothing standing out.
 pub fn busy(rgba: &[u8], w: u32, h: u32) -> Vec<Face> {
-    let Some(handler) = handler(rgba, w, h) else { return Vec::new() };
-    // SAFETY: a plain new request with no completion handler.
-    let request = unsafe { VNGenerateAttentionBasedSaliencyImageRequest::new() };
-    let as_request: &VNRequest = &request;
-    if handler.performRequests_error(&NSArray::from_slice(&[as_request])).is_err() {
-        return Vec::new();
-    }
-    // SAFETY: results of a request that has run, read on the same thread.
-    let Some(found) = (unsafe { request.results() }) else { return Vec::new() };
-    let mut out = Vec::new();
-    for o in found.iter() {
-        // SAFETY: a getter on a live observation.
-        let Some(objects) = (unsafe { o.salientObjects() }) else { continue };
-        for r in objects.iter() {
+    objc2::rc::autoreleasepool(|_| {
+        let Some(handler) = handler(rgba, w, h) else { return Vec::new() };
+        // SAFETY: a plain new request with no completion handler.
+        let request = unsafe { VNGenerateAttentionBasedSaliencyImageRequest::new() };
+        let as_request: &VNRequest = &request;
+        if handler.performRequests_error(&NSArray::from_slice(&[as_request])).is_err() {
+            return Vec::new();
+        }
+        // SAFETY: results of a request that has run, read on the same thread.
+        let Some(found) = (unsafe { request.results() }) else { return Vec::new() };
+        let mut out = Vec::new();
+        for o in found.iter() {
             // SAFETY: a getter on a live observation.
-            let b = unsafe { r.boundingBox() };
-            if b.size.width > 0.0 && b.size.height > 0.0 {
-                out.push(Face {
-                    x: b.origin.x,
-                    y: 1.0 - b.origin.y - b.size.height,
-                    w: b.size.width,
-                    h: b.size.height,
-                });
+            let Some(objects) = (unsafe { o.salientObjects() }) else { continue };
+            for r in objects.iter() {
+                // SAFETY: a getter on a live observation.
+                let b = unsafe { r.boundingBox() };
+                if b.size.width > 0.0 && b.size.height > 0.0 {
+                    out.push(Face {
+                        x: b.origin.x,
+                        y: 1.0 - b.origin.y - b.size.height,
+                        w: b.size.width,
+                        h: b.size.height,
+                    });
+                }
             }
         }
-    }
-    out.sort_by(|a, b| (b.w * b.h).total_cmp(&(a.w * a.h)));
-    out
+        out.sort_by(|a, b| (b.w * b.h).total_cmp(&(a.w * a.h)));
+        out
+    })
 }
 
 /// A Vision handler for an RGBA picture `w`×`h` (rows top first), or None when it can't be

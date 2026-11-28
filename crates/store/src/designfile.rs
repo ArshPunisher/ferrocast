@@ -102,6 +102,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ImportReport {
     pub designs: Vec<Design>,
+    /// The ids among `designs` that replaced an installed design in place (same id kept).
+    pub updated: Vec<String>,
     pub media_files: usize,
     pub notes: Vec<String>,
 }
@@ -157,8 +159,9 @@ pub fn export(
             remap.insert(id, checked.sha256);
         }
     }
-    let ids: BTreeMap<String, String> =
-        designs.iter().enumerate().map(|(i, d)| (d.id.clone(), format!("d{}", i + 1))).collect();
+    // Each design keeps its own id in the file: it is what a later version of a Store package is
+    // matched on, so it can't depend on which other designs the file happens to carry.
+    let ids: BTreeMap<String, String> = designs.iter().map(|d| (d.id.clone(), d.id.clone())).collect();
     for d in &mut designs {
         d.remap_media(&remap);
         d.id = ids.get(&d.id).cloned().unwrap_or_else(|| d.id.clone());
@@ -260,6 +263,14 @@ fn read_json<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Result
 
 /// Reads and checks a design file, then adds its designs (and media) as the streamer's own.
 pub fn import(store: &Store, path: &Path) -> Result<ImportReport> {
+    import_into(store, path, &[])
+}
+
+/// Like `import`, but a design in the file that matches one of `existing` replaces it in place
+/// (same id, same creation time), so everything that points at it keeps pointing at it. A
+/// design matches by its id inside the file, or (installs from before that was kept) by kind and
+/// name. The rest are added as new designs.
+pub fn import_into(store: &Store, path: &Path, existing: &[Design]) -> Result<ImportReport> {
     let size = std::fs::metadata(path)?.len();
     if size > MAX_FILE {
         return Err(too_big_file().into());
@@ -347,7 +358,7 @@ pub fn import(store: &Store, path: &Path) -> Result<ImportReport> {
     // Unpack and check every media file before anything is saved.
     let staging = store.dir().join("tmp").join(format!("design-{}", new_id()));
     std::fs::create_dir_all(&staging)?;
-    let result = stage_and_save(store, &mut zip, &staging, &manifest, designs, &media_names);
+    let result = stage_and_save(store, &mut zip, &staging, &manifest, designs, &media_names, existing);
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -363,6 +374,7 @@ fn stage_and_save<R: Read + Seek>(
     manifest: &Manifest,
     designs: Vec<Design>,
     media_names: &[(String, String)],
+    existing: &[Design],
 ) -> Result<ImportReport> {
     let mut staged: Vec<(String, std::path::PathBuf)> = Vec::new();
     for (name, sha) in media_names {
@@ -425,11 +437,39 @@ fn stage_and_save<R: Read + Seek>(
     }
     let now = now_ms();
     let from = Some(manifest.name.chars().take(120).collect::<String>());
-    let new_ids: BTreeMap<String, String> = designs.iter().map(|d| (d.id.clone(), new_id())).collect();
+    // Which installed design each design in the file replaces (each is replaced once).
+    let mut taken: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut replaces: BTreeMap<String, String> = BTreeMap::new();
+    // By the package's own id first, for every design in the file: a name never decides while an id can.
+    for d in &designs {
+        if let Some(e) = existing
+            .iter()
+            .find(|e| !taken.contains(e.id.as_str()) && e.origin.source.as_deref() == Some(d.id.as_str()))
+        {
+            taken.insert(e.id.as_str());
+            replaces.insert(d.id.clone(), e.id.clone());
+        }
+    }
+    // Then the installs from before packages carried an id (no source yet): by kind and name, once;
+    // the package id is recorded below so a later rename can't lose them.
+    for d in &designs {
+        if replaces.contains_key(&d.id) {
+            continue;
+        }
+        if let Some(e) = existing.iter().find(|e| {
+            !taken.contains(e.id.as_str()) && e.origin.source.is_none() && e.kind() == d.kind() && e.name == d.name
+        }) {
+            taken.insert(e.id.as_str());
+            replaces.insert(d.id.clone(), e.id.clone());
+        }
+    }
+    let new_ids: BTreeMap<String, String> =
+        designs.iter().map(|d| (d.id.clone(), replaces.get(&d.id).cloned().unwrap_or_else(new_id))).collect();
     let mut out = Vec::new();
     for d in designs {
         let id = new_ids.get(&d.id).cloned().unwrap_or_else(new_id);
-        let mut mine = d.into_user(id, Origin { kind: OriginKind::Import, from: from.clone() }, now);
+        let source = Some(d.id.clone());
+        let mut mine = d.into_user(id, Origin { kind: OriginKind::Import, from: from.clone(), source }, now);
         mine.remap_media(&remap);
         if let DesignContent::Theme(t) = &mut mine.content
             && let Some(a) = &t.alert_design
@@ -445,13 +485,21 @@ fn stage_and_save<R: Read + Seek>(
         }
         out.push(mine);
     }
+    let mut updated = Vec::new();
     for d in &out {
-        repo::designs::insert(store, d)?;
+        if existing.iter().any(|e| e.id == d.id) {
+            repo::designs::update_import(store, d)?;
+            updated.push(d.id.clone());
+        } else {
+            repo::designs::insert(store, d)?;
+        }
     }
     if manifest.files.is_empty() && media_files == 0 {
         notes.push("No pictures or sounds came with it: it uses the art built into Ferrocast.".into());
     }
-    Ok(ImportReport { designs: out, media_files, notes })
+    // What was saved, as saved (an update keeps the first import's creation time and origin).
+    let out: Vec<Design> = out.into_iter().map(|d| repo::designs::get(store, &d.id).unwrap_or(d)).collect();
+    Ok(ImportReport { designs: out, updated, media_files, notes })
 }
 
 #[cfg(test)]
@@ -541,6 +589,121 @@ mod tests {
         let a = r.designs.iter().find(|d| d.kind() == ferrocast_core::design::DesignKind::Alert).unwrap();
         let DesignContent::Theme(tc) = &t.content else { unreachable!() };
         assert_eq!(tc.alert_design.as_deref(), Some(a.id.as_str()), "the link points at the imported copy");
+    }
+
+    /// A package of `designs` as a version of a Store item would carry them.
+    fn package(dir: &Path, name: &str, designs: &[Design]) -> std::path::PathBuf {
+        let out = dir.join(name);
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        entries.push(("manifest.json".into(), manifest(1)));
+        for (i, d) in designs.iter().enumerate() {
+            entries.push((format!("designs/{}.json", i + 1), serde_json::to_vec(d).unwrap()));
+        }
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+        let f = zip_of(&refs);
+        std::fs::copy(f.path(), &out).unwrap();
+        out
+    }
+
+    fn alert_named(id: &str, name: &str) -> Design {
+        let mut d = fixture();
+        d.id = id.into();
+        d.name = name.into();
+        d
+    }
+
+    /// CodeRabbit: the id a design has in a package is its own stable id (not its place in the
+    /// file), so the same design keeps one identity across versions that carry other designs.
+    #[test]
+    fn an_export_keeps_each_design_s_own_id_so_versions_can_be_matched() {
+        let (dir, s) = store();
+        let alert = with_picture(&s);
+        let mut theme: Design =
+            serde_json::from_str(include_str!("../../core/fixtures/designs/scene-design.json")).unwrap();
+        let DesignContent::Scene(scene) = theme.content.clone() else { unreachable!() };
+        theme.id = new_id();
+        theme.content = DesignContent::Theme(ferrocast_core::design::ThemeContent {
+            scenes: vec![scene],
+            alert_design: Some(alert.id.clone()),
+        });
+        repo::designs::insert(&s, &theme).unwrap();
+        let ids_in = |out: &Path| -> Vec<String> {
+            let mut zip = zip::ZipArchive::new(std::fs::File::open(out).unwrap()).unwrap();
+            let mut ids = Vec::new();
+            for n in ["designs/1.json", "designs/2.json"] {
+                if let Ok(mut f) = zip.by_name(n) {
+                    let mut b = Vec::new();
+                    f.read_to_end(&mut b).unwrap();
+                    ids.push(serde_json::from_slice::<Design>(&b).unwrap().id);
+                }
+            }
+            ids
+        };
+        let v1 = dir.path().join("v1.ferrodesign");
+        export(&s, &theme, Some(&alert), &v1, "0.1.0").unwrap();
+        let v2 = dir.path().join("v2.ferrodesign");
+        export(&s, &alert, None, &v2, "0.1.0").unwrap();
+        assert_eq!(ids_in(&v1), vec![theme.id.clone(), alert.id.clone()]);
+        assert_eq!(ids_in(&v2), vec![alert.id.clone()], "the alert is the same design in both versions");
+        // Installed from v1, then updated from v2: only the alert is replaced.
+        let (_d2, s2) = store();
+        let first = import(&s2, &v1).unwrap();
+        let alert_installed =
+            first.designs.iter().find(|d| d.kind() == ferrocast_core::design::DesignKind::Alert).unwrap();
+        let again = import_into(&s2, &v2, &first.designs).unwrap();
+        assert_eq!(again.updated, vec![alert_installed.id.clone()]);
+        assert_eq!(repo::designs::list(&s2).unwrap().len(), 2, "nothing was added or lost");
+    }
+
+    /// CodeRabbit: an install from before packages carried identities is matched once by kind and
+    /// name, and then remembers its package id, so a later rename can't make it a new design.
+    #[test]
+    fn a_legacy_install_is_matched_by_name_once_then_remembers_its_package_id() {
+        let (dir, s) = store();
+        let mut legacy = alert_named("01legacy", "Neon");
+        legacy = legacy.into_user("01legacy".into(), Origin { kind: OriginKind::Import, from: None, source: None }, 1);
+        repo::designs::insert(&s, &legacy).unwrap();
+        let v2 = package(dir.path(), "v2.ferrodesign", &[alert_named("pk-neon", "Neon")]);
+        let r = import_into(&s, &v2, std::slice::from_ref(&legacy)).unwrap();
+        assert_eq!(r.updated, vec!["01legacy".to_string()]);
+        let saved = repo::designs::get(&s, "01legacy").unwrap();
+        assert_eq!(saved.origin.source.as_deref(), Some("pk-neon"), "the package id is kept");
+        // The next version renames it: still the same design, by identity.
+        let v3 = package(dir.path(), "v3.ferrodesign", &[alert_named("pk-neon", "Neon Nights")]);
+        let r3 = import_into(&s, &v3, &[saved]).unwrap();
+        assert_eq!(r3.updated, vec!["01legacy".to_string()]);
+        assert_eq!(repo::designs::list(&s).unwrap().len(), 1);
+        // The ordinary save can't rewrite where a design came from.
+        let mut forged = repo::designs::get(&s, "01legacy").unwrap();
+        forged.origin.source = Some("forged".into());
+        let after = repo::designs::update(&s, &forged).unwrap();
+        assert_eq!(after.origin.source.as_deref(), Some("pk-neon"));
+    }
+
+    /// A name never decides alone when the package says which design it is.
+    #[test]
+    fn a_name_match_never_beats_a_package_id() {
+        let (dir, s) = store();
+        let mut a = alert_named("01a", "Neon").into_user(
+            "01a".into(),
+            Origin { kind: OriginKind::Import, from: None, source: Some("pk-a".into()) },
+            1,
+        );
+        let mut b = alert_named("01b", "Pulse").into_user(
+            "01b".into(),
+            Origin { kind: OriginKind::Import, from: None, source: None },
+            1,
+        );
+        a.name = "Neon".into();
+        b.name = "Pulse".into();
+        repo::designs::insert(&s, &a).unwrap();
+        repo::designs::insert(&s, &b).unwrap();
+        // The new version: "pk-a" is now called Pulse; and a new design is called Neon.
+        let v = package(dir.path(), "v.ferrodesign", &[alert_named("pk-new", "Neon"), alert_named("pk-a", "Pulse")]);
+        let r = import_into(&s, &v, &[a.clone(), b.clone()]).unwrap();
+        // pk-a replaced design 01a (identity), the legacy "Pulse"/"Neon" names did not steal it.
+        assert!(r.updated.contains(&"01a".to_string()));
+        assert_eq!(repo::designs::get(&s, "01a").unwrap().name, "Pulse");
     }
 
     fn zip_of(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {

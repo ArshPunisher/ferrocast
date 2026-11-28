@@ -6,17 +6,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{CloseHandle, HWND, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
-    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
 use windows::Win32::System::Com::{BLOB, COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows::core::{Interface, implement};
@@ -50,14 +52,24 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
     }
 }
 
-/// An audio client hearing process `pid` and its children.
-fn client_for(pid: u32) -> Result<IAudioClient, String> {
+#[derive(Clone, Copy)]
+enum LoopbackTarget {
+    IncludeTree(u32),
+    ExcludeTree(u32),
+}
+
+/// An audio client hearing (or excluding) `target` and its child processes.
+fn client_for(target: LoopbackTarget) -> Result<IAudioClient, String> {
+    let (pid, mode) = match target {
+        LoopbackTarget::IncludeTree(pid) => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
+        LoopbackTarget::ExcludeTree(pid) => (pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
+    };
     let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                 TargetProcessId: pid,
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                ProcessLoopbackMode: mode,
             },
         },
     };
@@ -103,15 +115,35 @@ fn client_for(pid: u32) -> Result<IAudioClient, String> {
 }
 
 /// Hears process `pid` until `stop`, handing 48 kHz stereo pieces to `keep`. `ready` is told
-/// once whether it started.
-pub fn run(pid: u32, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>, mut keep: impl FnMut(&[f32])) {
+/// once whether it started. It also returns when the app quits or Windows lets go of its sound
+/// (a read fails): its caller says so, and the watchdog starts it again (before 20 Nov it went on
+/// forever, silent, after the app was closed and opened again).
+pub fn run(pid: u32, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>, keep: impl FnMut(&[f32])) {
+    run_target(LoopbackTarget::IncludeTree(pid), stop, ready, keep);
+}
+
+/// Hears everything the computer plays except this process (and its children), until `stop`.
+/// Used for Desktop Audio on Windows 10 version 2004+ so Ferrocast's own monitoring playback
+/// never feeds back or leaks onto the stream.
+pub fn run_excluding_self(stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>, keep: impl FnMut(&[f32])) {
+    // SAFETY: GetCurrentProcessId reads the current process identifier with no preconditions.
+    let pid = unsafe { GetCurrentProcessId() };
+    run_target(LoopbackTarget::ExcludeTree(pid), stop, ready, keep);
+}
+
+fn run_target(
+    target: LoopbackTarget,
+    stop: Arc<AtomicBool>,
+    ready: mpsc::Sender<Result<(), String>>,
+    mut keep: impl FnMut(&[f32]),
+) {
     // SAFETY: COM for this thread (its own; undone below).
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     let started = (|| -> Result<(IAudioClient, IAudioCaptureClient), String> {
-        if pid == 0 {
+        if matches!(target, LoopbackTarget::IncludeTree(0)) {
             return Err("that window is closed".into());
         }
-        let client = client_for(pid)?;
+        let client = client_for(target)?;
         let format = WAVEFORMATEX {
             wFormatTag: FLOAT,
             nChannels: 2,
@@ -154,19 +186,32 @@ pub fn run(pid: u32, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), Strin
         }
     };
     let mut silence = Vec::new();
-    while !stop.load(Ordering::Acquire) {
+    // SAFETY: a handle to wait on the app's end (None if it can't be had: then only a failed
+    // read ends this); closed below.
+    let app = match target {
+        // SAFETY: a handle to wait on the app's end, closed below.
+        LoopbackTarget::IncludeTree(pid) => unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.ok(),
+        LoopbackTarget::ExcludeTree(_) => None,
+    };
+    let mut ticks = 0u32;
+    'hear: while !stop.load(Ordering::Acquire) {
         // Windows hands sound over every 10 ms or so; nothing comes while the app is quiet.
-        std::thread::sleep(Duration::from_millis(5));
+        crate::sleep_precise(Duration::from_millis(5));
+        ticks = ticks.wrapping_add(1);
+        // SAFETY: a live process handle of ours; a zero wait only looks.
+        if ticks.is_multiple_of(40) && app.is_some_and(|h| unsafe { WaitForSingleObject(h, 0) } == WAIT_OBJECT_0) {
+            break;
+        }
         loop {
             // SAFETY: a started capture client, read on the thread that made it.
-            let Ok(n) = (unsafe { capture.GetNextPacketSize() }) else { break };
+            let Ok(n) = (unsafe { capture.GetNextPacketSize() }) else { break 'hear };
             if n == 0 {
                 break;
             }
             let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
             // SAFETY: out pointers of ours; the buffer is read and given back before the next one.
             if unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }.is_err() {
-                break;
+                break 'hear;
             }
             let samples = frames as usize * 2;
             if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
@@ -180,6 +225,12 @@ pub fn run(pid: u32, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), Strin
             unsafe {
                 let _ = capture.ReleaseBuffer(frames);
             }
+        }
+    }
+    if let Some(h) = app {
+        // SAFETY: the handle opened above, closed once.
+        unsafe {
+            let _ = CloseHandle(h);
         }
     }
     // SAFETY: stops the client started above.

@@ -97,6 +97,20 @@ pub async fn tts(State(app): State<AppState>) -> Json<Value> {
     Json(tts_view(&app.engine.tts_policy(), &app.engine.settings().currency))
 }
 
+/// Partial update to Chat TTS settings; unspecified fields keep their saved value.
+#[derive(Deserialize)]
+pub struct ChatTtsPatch {
+    enabled: Option<bool>,
+    mode: Option<ferrocast_core::tts::ChatTtsMode>,
+    command: Option<String>,
+    cooldown_s: Option<u32>,
+    global_cooldown_s: Option<u32>,
+    queue_limit: Option<usize>,
+    max_chars: Option<usize>,
+    skip_links: Option<bool>,
+    skip_emote_spam: Option<bool>,
+}
+
 /// Every field is optional: what isn't sent keeps its saved value.
 #[derive(Deserialize)]
 pub struct TtsBody {
@@ -111,6 +125,7 @@ pub struct TtsBody {
     max_chars: Option<usize>,
     hold_for_approval: Option<bool>,
     read_names: Option<bool>,
+    chat: Option<ChatTtsPatch>,
 }
 
 fn currency_ok(c: &str) -> bool {
@@ -145,6 +160,36 @@ pub async fn save_tts(State(app): State<AppState>, Body(b): Body<TtsBody>) -> Ap
         Some(v) => Some(v.trim().to_string()).filter(|v| !v.is_empty()),
         None => current.voice.clone(),
     };
+    let mut chat = current.chat;
+    if let Some(patch) = b.chat {
+        if let Some(v) = patch.enabled {
+            chat.enabled = v;
+        }
+        if let Some(v) = patch.mode {
+            chat.mode = v;
+        }
+        if let Some(v) = patch.command {
+            chat.command = v.trim().to_string();
+        }
+        if let Some(v) = patch.cooldown_s {
+            chat.cooldown_s = v;
+        }
+        if let Some(v) = patch.global_cooldown_s {
+            chat.global_cooldown_s = v;
+        }
+        if let Some(v) = patch.queue_limit {
+            chat.queue_limit = v;
+        }
+        if let Some(v) = patch.max_chars {
+            chat.max_chars = v;
+        }
+        if let Some(v) = patch.skip_links {
+            chat.skip_links = v;
+        }
+        if let Some(v) = patch.skip_emote_spam {
+            chat.skip_emote_spam = v;
+        }
+    }
     let p = TtsPolicy {
         enabled: b.enabled.unwrap_or(current.enabled),
         voice,
@@ -153,6 +198,7 @@ pub async fn save_tts(State(app): State<AppState>, Body(b): Body<TtsBody>) -> Ap
         max_chars: b.max_chars.unwrap_or(current.max_chars),
         read_names: b.read_names.unwrap_or(current.read_names),
         hold_for_approval: b.hold_for_approval.unwrap_or(current.hold_for_approval),
+        chat,
     };
     Ok(Json(tts_view(&app.engine.save_tts(p).await?, &main)))
 }

@@ -13,6 +13,7 @@ fn platform_key(p: Platform) -> &'static str {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
         Platform::Kick => "kick",
+        Platform::Facebook => "facebook",
         Platform::Tips => "tips",
         Platform::Ferrocast => "ferrocast",
     }
@@ -113,6 +114,35 @@ pub fn get(store: &Store, id: &str) -> Result<Option<Event>> {
         store.read(|c| Ok(c.query_row("SELECT seq FROM events WHERE id = ?1", [id], |r| r.get(0)).optional()?))?;
     let Some(seq) = seq else { return Ok(None) };
     Ok(recent(store, Some(seq + 1), 1, &[])?.into_iter().next().map(|(_, e)| e))
+}
+
+/// Fetches a non-hidden chat message by its Ferrocast event id (for pinning in Chat Highlight).
+pub fn get_visible_chat(store: &Store, id: &str) -> Result<Option<Event>> {
+    store.read(|c| {
+        let mut st = c.prepare(
+            "SELECT seq, id, platform, source_id, origin, occurred_at, received_at, data FROM events
+             WHERE id = ?1 AND kind = 'chat_message' AND hidden = 0 LIMIT 1",
+        )?;
+        st.query_row([id], |r| {
+            let seq: i64 = r.get(0)?;
+            let platform: String = r.get(2)?;
+            let origin: String = r.get(4)?;
+            Ok(Event {
+                id: r.get(1)?,
+                seq: u64::try_from(seq).unwrap_or(0),
+                platform: super::from_json(2, format!("\"{platform}\""))?,
+                channel: None,
+                source_id: r.get(3)?,
+                occurred_at: ferrocast_core::event::Millis(r.get(5)?),
+                received_at: ferrocast_core::event::Millis(r.get(6)?),
+                origin: super::from_json(4, format!("\"{origin}\""))?,
+                kind: super::from_json(7, r.get(7)?)?,
+                raw: None,
+            })
+        })
+        .optional()
+        .map_err(Into::into)
+    })
 }
 
 /// Marks a message hidden (filtered, deleted by a mod, from a banned account) so it never
@@ -255,6 +285,14 @@ pub fn pending_tts(store: &Store) -> Result<Vec<PendingTts>> {
     })
 }
 
+/// Reads a pending TTS item without removing it.
+pub fn get_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
+    store.read(|c| {
+        Ok(c.query_row(&format!("SELECT {PENDING_COLS} FROM tts_pending WHERE id = ?1"), [id], pending_row)
+            .optional()?)
+    })
+}
+
 /// Removes and returns a pending item (approve or reject both take it off the list).
 pub fn take_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
     store.write(|tx| {
@@ -269,6 +307,37 @@ pub fn take_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
 /// Drops pending TTS for an event (a mod deleted the message).
 pub fn drop_pending_tts_for_event(store: &Store, event_id: &str) -> Result<usize> {
     store.write(|tx| Ok(tx.execute("DELETE FROM tts_pending WHERE event_id = ?1", [event_id])?))
+}
+
+/// Counts pending TTS items belonging to live chat messages (`kind = 'chat_message'`).
+pub fn pending_chat_tts_count(store: &Store) -> Result<usize> {
+    store.read(|c| {
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM tts_pending t
+             JOIN events e ON e.id = t.event_id
+             WHERE e.kind = 'chat_message'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    })
+}
+
+/// Drops pending chat TTS items authored by `actor_id` on `platform` (user banned or cleared).
+pub fn drop_pending_tts_for_user(store: &Store, platform: Platform, actor_id: &str) -> Result<usize> {
+    if actor_id.is_empty() {
+        return Ok(0);
+    }
+    store.write(|tx| {
+        Ok(tx.execute(
+            "DELETE FROM tts_pending
+             WHERE event_id IN (
+                 SELECT id FROM events
+                 WHERE platform = ?1 AND actor_id = ?2 AND kind = 'chat_message'
+             )",
+            params![platform_key(platform), actor_id],
+        )?)
+    })
 }
 
 /// Deletes chat older than `days` (alerts and tips are kept for history and taxes).
@@ -413,5 +482,70 @@ mod tests {
         assert_eq!(take_pending_tts(&s, "t1").unwrap(), None);
         assert_eq!(drop_pending_tts_for_event(&s, "e1").unwrap(), 1);
         assert!(pending_tts(&s).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_tts_pending_count_and_user_purge_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+
+        let make_chat = |id: &str, platform: Platform, uid: &str, text: &str| {
+            let mut e = Event::live(
+                platform,
+                Some(format!("src-{id}")),
+                Millis(10),
+                EventKind::ChatMessage {
+                    actor: Actor { id: Some(uid.into()), ..Actor::named(platform, uid) },
+                    content: Content::plain(text),
+                    reply_to: None,
+                    is_action: false,
+                },
+            );
+            e.id = id.into();
+            e
+        };
+        let mut tip = Event::live(
+            Platform::Twitch,
+            Some("tip-src".into()),
+            Millis(10),
+            EventKind::Tip {
+                actor: Actor { id: Some("u1".into()), ..Actor::named(Platform::Twitch, "u1") },
+                money: ferrocast_core::money::Money::new(500, "USD"),
+                message: Some("nice".into()),
+                provider: ferrocast_core::event::TipProvider::Stripe,
+                payment_ref: "pay-1".into(),
+                status: ferrocast_core::event::PaymentStatus::Captured,
+            },
+        );
+        tip.id = "e-tip".into();
+
+        for ev in [
+            make_chat("e-c1", Platform::Twitch, "u1", "hello"),
+            make_chat("e-c2", Platform::Twitch, "u2", "hey"),
+            make_chat("e-c3", Platform::Kick, "u1", "kick hi"),
+            tip,
+        ] {
+            insert(&s, &ev).unwrap();
+        }
+        let pending = |id: &str, event_id: &str, text: &str| PendingTts {
+            id: id.into(),
+            event_id: event_id.into(),
+            text: text.into(),
+            created_at: 1,
+            platform: Some("twitch".into()),
+            name: None,
+            amount: None,
+        };
+        add_pending_tts(&s, &pending("p1", "e-c1", "hello")).unwrap();
+        add_pending_tts(&s, &pending("p2", "e-c2", "hey")).unwrap();
+        add_pending_tts(&s, &pending("p3", "e-c3", "kick hi")).unwrap();
+        add_pending_tts(&s, &pending("p4", "e-tip", "nice")).unwrap();
+
+        assert_eq!(pending_chat_tts_count(&s).unwrap(), 3);
+        assert_eq!(drop_pending_tts_for_user(&s, Platform::Twitch, "u1").unwrap(), 1);
+        assert_eq!(pending_chat_tts_count(&s).unwrap(), 2);
+        let remaining_ids: Vec<_> = pending_tts(&s).unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(remaining_ids, ["p2", "p3", "p4"]);
+        assert_eq!(drop_pending_tts_for_user(&s, Platform::Twitch, "").unwrap(), 0);
     }
 }

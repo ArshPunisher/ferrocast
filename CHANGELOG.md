@@ -5,6 +5,186 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.8.1
+
+A smoother Studio when you resize, clearer frame stats, and an optional way to send us a crash
+report.
+
+- **Resizing the window**: both pictures, the main one and the vertical one, stay in their
+  places while you drag the window or a panel divider, and settle at once when you let go. No
+  more black strip, no picture drawn over the other one, and the vertical picture no longer
+  disappears. Fullscreen, a second monitor and projector windows resize cleanly too.
+- **Frame rate in Stats**: the last minute comes first, so an old hiccup no longer keeps it red.
+  It says why frames were missed (window resize, drawing fell behind, encoder overloaded or upload
+  too slow), shows a small graph of the last minute, and turns red only while it is still
+  happening.
+- **Crash reports, only if you say yes**: if Ferrocast closes unexpectedly, the next start asks
+  whether to send a report. "See what's sent" shows the exact text first. Stream keys,
+  passwords, tokens and emails are stripped before it's sent, and memory dumps are never sent. Settings > Privacy has Ask, Always or Never.
+- **Go live**: the "places · Mbps · encodes" line at the bottom of the Go live list is gone. The
+  totals are in Your platforms.
+- **Fixes**: the vertical picture now shows in Go live's phone preview.
+
+## 3.8.0
+
+Pick the quality for each platform, see who is watching, run real polls, let chat talk, and a
+steadier Studio that stays smooth when you resize it.
+
+- **Quality per platform**: tap a platform's quality in Go live (or the gear) to open one
+  "Your platforms" window: your platforms on the left, that platform's quality on the right.
+  Choose "Match main stream" or set your own resolution, frame rate and bitrate. With Match main
+  you see your main stream next to what the platform really gets, for example Kick gets 1080p60
+  at 8 Mbps because it closes anything bigger, and Twitch gets 6 Mbps with a one-tap "Use 1080p60"
+  tip. Only values the platform accepts and your computer can encode are offered. Platforms that
+  want the same quality share one encode, and you can change it while live: only that platform
+  switches, your main stream and recording keep going.
+- **Go live list**: every platform row is two steady lines, its quality or a short coloured status
+  (live, reconnecting, error, switching), and tapping a problem shows the reason and one fix.
+- **Your bitrate, explained**: next to the bitrate setting you now see what each platform really
+  gets (for example "Twitch 6 Mbps (max)").
+- **Watching now and Peak**: viewer counts from Twitch, YouTube and Kick, live on Home while you
+  stream. Peak never goes down during a stream.
+- **Real polls**: polls run as native Twitch and YouTube polls where your account allows it, and
+  as "!vote" in chat everywhere else. New "No timer" option: the poll ends when you press End.
+- **Read chat aloud**: Settings > Text-to-speech can read chat messages: everyone, subs and mods,
+  or only "!tts" messages. Links, emote spam, slurs and your blocked words are skipped, it waits
+  between messages, and Panic mode or deleting a message stops it at once.
+- **Mic**: Clean up my mic never raises the room noise while you are silent, and has an Auto boost
+  switch. The "mic is very quiet" warning only appears while you are actually speaking quietly,
+  and you can dismiss it for the rest of the stream. Remove a sound straight from the Audio list's
+  "..." menu (undo brings it back).
+- **Steadier Studio**: every menu, tooltip and dialog opens fully visible, never hidden behind
+  the preview. Resizing the window is smooth (the preview holds a still picture while you drag),
+  the sidebar folds instantly, and below 900 px the Studio switches to a compact layout.
+- **macOS**: after an update or a restart, Ferrocast opens again in your pinned Dock icon instead
+  of a second one.
+- **Sources**: Camera and Capture card are now one "Video device" entry (both list the same
+  devices), and you can add the same camera or capture card more than once in a scene: each copy
+  shows the same feed with its own size and crop, and the device is still opened only once.
+- **Scene collections and profiles**: switching a scene collection no longer leaves the preview stuck on the old one with 0 FPS; the preview, Studio Mode, vertical picture and projectors follow the new collection at once. Switching profiles keeps your settings safe (a damaged profile falls back to its backup instead of resetting), and quick clicks or switches can no longer save one collection over another.
+- **Fixes**: Selected buttons that sit side by side (stage toolbar, mixer) no longer merge into one block. A thin line of the preview no longer shows across dialogs on the Mac, an unplugged sound device's meter drops to silence instead of freezing, Advanced audio's Push to talk, Push to mute and This is a mic switches no longer overlap the next sound, the Ready check chip can be closed, toasts stay readable over dialogs, Escape returns you to where you were, no dialog opens on top of another, and many long names, narrow docks and phone layouts no longer cut off buttons or text. Kick closing the stream now says why (over 1080p) instead of blaming multistreaming,
+  chat's pin button no longer overlaps messages, clearer missed-frame and falling-behind details
+  in Stats and the log, and graphics card errors after a restart are gone.
+- **API**: new `GET /api/v1/golive/quality-options` and `PUT /api/v1/golive/destinations/{id}/quality`,
+  `GET /api/v1/polls/capabilities`, chat settings in `/api/v1/tts`, and new fields on Go live
+  destinations (effective quality, shared encode, capped reason). Twitch asks for the
+  `channel:manage:polls` permission the next time you reconnect it.
+
+## 3.7.0
+
+Your own names and links in every overlay, a calmer layout editor, picking only the parts of a theme
+you want, and scenes you can drag into order.
+
+- **My links**: one place in Settings > Accounts for your channel links (filled in from your
+  connected Twitch, YouTube and Kick accounts, including your YouTube @handle) plus Discord,
+  Instagram, X, TikTok, your website and a "next stream" line. Every theme and overlay reads from
+  it and updates live, also in OBS. Text you typed yourself is never changed, and a platform you
+  have not connected is left out instead of showing "yourname".
+- **Real names in previews**: overlay and theme previews show your latest follower, sub and tip
+  instead of made-up names (samples only until you have real ones).
+- **Layout editor**: one scroll area, the canvas fills the window, the save bar sits right under
+  the editor, and the canvas no longer jumps or flickers when you change an option. Backspace or
+  Delete removes the selected layer (undo brings it back) instead of leaving the page. Saving
+  keeps your undo history.
+- **Use part of a theme**: tick the screens you want (all ticked by default, Select all/none),
+  see which ones you already added, use just one screen, or add one part of a theme (chat, goal,
+  event list) to an overlay you already have. Studio setup only covers what you ticked.
+- **Scenes in order**: drag scenes in the Studio's Scenes list, or move them with Alt+Up/Down.
+  Dragging never puts a scene on air. In Studio Mode the buttons under the list act on the scene
+  you picked, as in OBS. Scenes on the Vertical canvas can be reordered too.
+- **Fixes**: adding a theme screen twice gives the copy its own name ("2"), a scene dropped back
+  in place no longer adds an empty undo step, and a few more small fixes in these screens.
+- **API**: accounts include their login and channel link; new `GET/PUT /api/v1/links` (fields you
+  leave out are kept) and `GET /api/v1/labels`; overlays receive your links in their live state.
+
+## 3.6.1
+
+Fixes for the problems found with 3.6.0: the setup mic meter, iPhone cameras, flip and crop in
+Studio, and the bitrate numbers.
+
+- **Setup mic meter**: the level meter in first setup moves again, even before anything is on air.
+- **iPhone and other cameras**: a camera that drops out for a moment keeps being retried and comes
+  back on its own, also when it is unplugged and plugged in again. A capture card with no signal
+  still stops after a few tries so it is not hammered. Two identical USB cameras on Windows now
+  open the right one each.
+- **"No buffer space available (os error 55)"**: Ferrocast waits and tries again to open its local
+  server, and a start that fails no longer makes the next launch offer Safe Mode.
+- **Planned streams**: a tab of its own in Studio.
+- **Flip and turn**: a flipped or turned source stays where it was on the canvas, also inside a
+  group.
+- **Source screenshot**: includes the source's filters, crop, flip and turn.
+- **Alt+drag crop**: shows a crop cursor, dragging an edge crops instead of moving the source, and
+  the visible picture stays put while you crop. A quick crop followed by a nudge no longer loses
+  the crop, and undo steps match what you did.
+- **Bitrate**: the Go live screen now explains why a stream can send 6.2 Mbps per place: one
+  shared encode, Twitch's 6,000 kbps limit, and the total upload for all places. A Twitch that is
+  not connected no longer caps your YouTube stream.
+- **Updates**: Ferrocast waits for a recording or replay buffer to stop before it installs an
+  update, and shuts down cleanly on Windows when it does.
+- **A tidier Studio**: a 100% zoom button that works on every click, bordered tiles for Start show
+  and Your platforms, a clearer alert editor (buttons, Rule switch, narrow dock), themed Accounts
+  tiles, a tidier Advanced settings page and one tile for Clean up my mic.
+- **API**: the screenshot route can take a single source, and the API documents describe it.
+
+## 3.6.0
+
+A Community Store, clips, more places to go live, a fuller Studio and a redesigned dashboard.
+
+- **Community Store**: browse and install themes, alerts, widgets, overlays and plugins made by
+  other creators, with one-click undo. Every package is checked on your PC before it is used,
+  and a ferrocast:// link opens the Store at the right package.
+- **Clips**: trim a moment, add captions, join several into one video and upload it to YouTube
+  as a clip or a Short. Uploads show their progress and can resume.
+- **More places to go live**: X, Instagram and Facebook (Facebook sign-in goes through the
+  Ferrocast relay), add or remove a destination while you're live, and turning every
+  destination off keeps your stream running.
+- **Schedule a stream**: plan a YouTube or Facebook broadcast for later. Ferrocast reminds you
+  and never starts it for you.
+- **A better first setup**: a test that finds the encoder settings your computer can keep up
+  with, with a way back to your old settings, and an import preview of an OBS or Streamlabs
+  setup the first time you open Ferrocast.
+- **Alerts and widgets**: a new alert editor, three new widgets (End Credits, Emote Wall and
+  Chat Highlight), alerts that can interrupt each other or pick a random look by weight, and a
+  switch to mute the alert queue. Custom alerts run in a closed frame and cannot run scripts.
+- **Overlay packs**: import Streamlabs and OWN3D .overlay packs, with their fonts.
+- **Studio**: named transitions with a from/to matrix, snapping to other sources and to the
+  centre, moving several items as one undo step, showing an item on the stream, in the
+  recording or both, performance mode that pauses the preview, push-to-show and push-to-hide
+  hotkeys, and copy and paste of sources and filters between collections.
+- **Overflow stripes**: Ferrocast draws stripes over what a source runs past the canvas, and
+  the app has ten themes.
+- **For developers**: local API keys with their own scopes, OpenAPI and AsyncAPI documents, more
+  obs-websocket requests and events, and Node and Python examples.
+- **Help**: a "Report a problem" file with your private details removed, and a hardware report.
+- **A new look**: Overlays are a full-width card grid, Designs have a filter rail and a dense
+  gallery, the Store has a category rail, and the alert editor is a full-screen three-pane
+  view. Nothing scrolls sideways at any window width.
+
+## 3.5.0
+
+Smoother video, a stream that warns you before viewers notice, and many OBS features.
+
+- **Smoother video**: frames go straight to the encoder with no copy, and sound is encoded on
+  its own thread, so a busy computer no longer makes the picture stutter. In our tests late
+  frames fell from about 230 to 8 per 6 minutes, and recordings hold 60 fps.
+- **Warnings while you're live**: Ferrocast tells you when you're talking but your mic is
+  muted (with Unmute and "Muted on purpose"), when your voice is very quiet (with +6 dB), when a
+  mic gives no sound, and when viewers see a black screen. The same checks run before you go
+  live. A capture card's sound is never mistaken for your mic.
+- **Cleaner sound**: "Remove background noise" now uses RNNoise, light and with almost no
+  delay; "Strong noise removal" removes more. No more clicks when you turn noise removal on or
+  off, and a loud mic no longer distorts it.
+- **Vertical**: a camera in the vertical picture can have its own filters, and new shortcuts
+  show or hide the vertical picture and take a vertical screenshot.
+- **From OBS**: push-to-talk and push-to-mute, Video Delay, obs-websocket for Stream Deck and
+  Touch Portal (off until you turn it on, with a password), a Mac menu bar, more shortcuts
+  (several keys per action), projector options, preview lock and zoom with safe-area guides,
+  text size, row spacing and colour-blind meter colours.
+- **Safer quitting**: quitting while live or recording always asks first, also from the Dock.
+- **Fixes**: "A show is already running" can't get stuck, a stream can't stay on Be right back
+  after the computer sleeps, a stream delay no longer makes platforms reconnect, and YouTube
+  uses the right stream key.
+
 ## 3.4.0
 
 Stream and record 4K60 at once, steadier sound, and a Windows app that never freezes.

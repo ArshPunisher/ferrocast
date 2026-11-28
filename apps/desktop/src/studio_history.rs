@@ -10,16 +10,29 @@
 
 use std::time::{Duration, Instant};
 
-use ferrocast_engine::studio_host::{ItemEdit as Edit, StudioAct};
+use ferrocast_engine::studio_host::{BoxReason, ItemEdit as Edit, StudioAct};
 use ferrocast_studio::stage::Stage as Collection;
 use serde_json::Value;
 
 /// Steps kept each way.
 const KEEP: usize = 100;
+/// What the steps may hold in all (before and after of each): a big collection's hundred steps
+/// were hundreds of MB of JSON. The oldest go first.
+const MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Edit Transform changes this close together are one step.
 const MERGE: Duration = Duration::from_secs(3);
 /// Arrow-key nudges this close together are one step.
 const NUDGES: Duration = Duration::from_secs(1);
+/// How long a drag that never saved (a lost pointer, a closed page) can keep a step open: after
+/// this a move of the same sources is a step of its own, not folded into hours-old work.
+const OPEN_MAX: Duration = Duration::from_secs(30);
+
+impl Step {
+    /// Still being added to by a drag that hasn't saved.
+    fn live(&self) -> bool {
+        self.open && self.at.elapsed() < OPEN_MAX
+    }
+}
 
 #[derive(Debug)]
 struct Step {
@@ -32,6 +45,19 @@ struct Step {
     at: Instant,
     /// A drag still going: its moves join this step until the one that saves.
     open: bool,
+    /// About what `before` and `after` take in memory.
+    bytes: usize,
+}
+
+/// About how much memory a JSON value takes.
+fn approx_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 8,
+        Value::Number(_) => 16,
+        Value::String(s) => 24 + s.len(),
+        Value::Array(a) => 24 + a.iter().map(approx_bytes).sum::<usize>(),
+        Value::Object(o) => 48 + o.iter().map(|(k, v)| 24 + k.len() + approx_bytes(v)).sum::<usize>(),
+    }
 }
 
 /// What `before` noted, for `after` to finish once the act ran.
@@ -83,6 +109,7 @@ fn verb(e: &Edit) -> &'static str {
         | Edit::ScaleBilinear
         | Edit::ScaleLanczos
         | Edit::ScaleArea => "Change scaling of",
+        Edit::StreamAndRecording | Edit::StreamOnly | Edit::RecordingOnly => "Set stream or recording for",
     }
 }
 
@@ -115,16 +142,46 @@ impl History {
             StudioAct::SetItemBox { scene, id, save, .. } => {
                 let key = ("box", scene.clone(), *id);
                 // A drag's moves, or nudges with the arrow keys in a row, are one step.
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
+                if self
+                    .undo
+                    .last()
+                    .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
                 {
-                    return Some(joined(*save));
+                    // An unsaved move joining a step already closed reopens it: the drag goes on.
+                    return Some(Before { open: !*save, ..joined(*save) });
                 }
                 Some(fresh(format!("Move {}", item_name(c, scene, *id)?), Some(key), !*save))
+            }
+            StudioAct::SetItemBoxes { scene, items, save, reason } => {
+                // The same ids in any order are the same drag.
+                let mut ids: Vec<i64> = items.iter().map(|b| b.id).collect();
+                ids.sort_unstable();
+                // The whole sorted list is the key: two sets that happen to hash alike are two drags.
+                // Align and Space out are one click each: their own step, named for what they do,
+                // never joined to a drag before them or an arrow key after them.
+                let key = ("boxes", format!("{scene}\u{1}{ids:?}\u{1}{reason:?}"), 0);
+                let one_shot = *reason != BoxReason::Move;
+                if !one_shot
+                    && self
+                        .undo
+                        .last()
+                        .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
+                {
+                    return Some(Before { open: !*save, ..joined(*save) });
+                }
+                let n = ids.len();
+                let label = match (reason, ids.as_slice()) {
+                    (BoxReason::Align, _) => format!("Align {n} sources"),
+                    (BoxReason::Distribute, _) => format!("Space out {n} sources"),
+                    (BoxReason::Move, [one]) => format!("Move {}", item_name(c, scene, *one)?),
+                    (BoxReason::Move, _) => format!("Move {n} sources"),
+                };
+                Some(fresh(label, Some(key), !*save))
             }
             StudioAct::SetItemCrop { scene, id, save, .. } => {
                 let key = ("crop", scene.clone(), *id);
                 // A drag's crops are one step.
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.open) {
+                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.live()) {
                     return Some(joined(*save));
                 }
                 Some(fresh(format!("Crop {}", item_name(c, scene, *id)?), Some(key), !*save))
@@ -154,6 +211,18 @@ impl History {
                 Some(fresh(format!("Ungroup {}", item_name(c, scene, *id)?), None, false))
             }
             StudioAct::PasteCopy { name, .. } => Some(fresh(format!("Paste a copy of {name}"), None, false)),
+            StudioAct::PasteSource { clip, .. } => {
+                let name = clip.pointer("/sources/0/name").and_then(|n| n.as_str()).unwrap_or("source");
+                Some(fresh(format!("Paste {name}"), None, false))
+            }
+            StudioAct::PasteFilterClip { name, item, clip } => {
+                let from = clip.get("from").and_then(|n| n.as_str()).unwrap_or("a source");
+                let to = match item {
+                    Some(it) => item_name(c, &it.scene, it.id).unwrap_or_else(|| it.scene.clone()),
+                    None => name.clone(),
+                };
+                Some(fresh(format!("Paste filters from {from} to {to}"), None, false))
+            }
             StudioAct::AddExisting { name, .. } => Some(fresh(format!("Add {name}"), None, false)),
             StudioAct::SetItemTransition { scene, id, show, .. } => {
                 let what = if *show { "Show" } else { "Hide" };
@@ -173,6 +242,27 @@ impl History {
             StudioAct::SetSceneTransition { scene, .. } => {
                 Some(fresh(format!("Change transition of {scene}"), None, false))
             }
+            StudioAct::AddNamedTransition { transition } => {
+                Some(fresh(format!("Add transition {}", transition.name), None, false))
+            }
+            StudioAct::UpdateNamedTransition { name, .. } => {
+                let key = ("named_transition", name.clone(), 0);
+                if self.joins(&key) {
+                    return Some(joined(false));
+                }
+                Some(fresh(format!("Change transition {name}"), Some(key), false))
+            }
+            StudioAct::RenameNamedTransition { name, new_name } if name != new_name => {
+                Some(fresh(format!("Rename transition {name}"), None, false))
+            }
+            StudioAct::DuplicateNamedTransition { name, .. } => {
+                Some(fresh(format!("Duplicate transition {name}"), None, false))
+            }
+            StudioAct::DeleteNamedTransition { name } => Some(fresh(format!("Remove transition {name}"), None, false)),
+            StudioAct::SetDefaultNamedTransition { name } => {
+                Some(fresh(format!("Set default transition {name}"), None, false))
+            }
+            StudioAct::SetTransitionMatrixRule { .. } => Some(fresh("Change transition matrix".into(), None, false)),
             StudioAct::Update { name, .. } => {
                 let key = ("settings", name.clone(), 0);
                 if self.joins(&key) {
@@ -201,14 +291,37 @@ impl History {
                 };
                 Some(fresh(label, slide.then_some(key), false))
             }
+            StudioAct::SetChannel { channel, device } => match device {
+                Some(dev) => Some(fresh(format!("Set {}", dev.name), None, false)),
+                None => {
+                    let name = c.channels().into_iter().find(|a| a.channel == Some(*channel))?.name;
+                    Some(fresh(format!("Remove {name}"), None, false))
+                }
+            },
             StudioAct::AddFilter { filter, .. } => Some(fresh(format!("Add filter {}", filter.name), None, false)),
             StudioAct::RemoveFilter { filter, .. } => Some(fresh(format!("Remove filter {filter}"), None, false)),
             StudioAct::EditFilter { filter, .. } => Some(fresh(format!("Change filter {filter}"), None, false)),
-            StudioAct::PasteFilters { name, from } => {
-                Some(fresh(format!("Paste filters from {from} to {name}"), None, false))
+            StudioAct::SetItemFilterScope { scene, id, own } => {
+                let who = item_name(c, scene, *id)?;
+                let verb = if *own { "Use own filters for" } else { "Use shared filters for" };
+                Some(fresh(format!("{verb} {who}"), None, false))
             }
-            StudioAct::UpdateFilter { name, filter, .. } => {
-                let key = ("filter", format!("{name}\n{filter}"), 0);
+            StudioAct::PasteFilters { name, from, item, from_item } => {
+                let src = match from_item {
+                    Some(f) => item_name(c, &f.scene, f.id).unwrap_or_else(|| f.scene.clone()),
+                    None => from.clone(),
+                };
+                let to = match item {
+                    Some(it) => item_name(c, &it.scene, it.id).unwrap_or_else(|| it.scene.clone()),
+                    None => name.clone(),
+                };
+                Some(fresh(format!("Paste filters from {src} to {to}"), None, false))
+            }
+            StudioAct::UpdateFilter { name, filter, item, .. } => {
+                let key = match item {
+                    Some(it) => ("filter", format!("{}\n{filter}", it.scene), it.id),
+                    None => ("filter", format!("{name}\n{filter}"), 0),
+                };
                 if self.joins(&key) {
                     return Some(joined(false));
                 }
@@ -230,29 +343,58 @@ impl History {
         }
         let now = c.snapshot();
         if b.join {
-            if let Some(top) = self.undo.last_mut() {
+            let pop_noop = self.undo.last_mut().is_some_and(|top| {
+                // Dragging or sliding back to the exact origin before the step settles is a no-op
+                // and must not remain on the undo stack (keep mid-drag open steps until release).
+                let will_be_open = !b.closes && (b.open || top.open);
+                if !will_be_open && top.before == now {
+                    return true;
+                }
                 top.at = Instant::now();
                 top.after = now;
+                // The step's size follows its collection (a drag that added to it grows it).
+                top.bytes = approx_bytes(&top.before) + approx_bytes(&top.after);
                 if b.closes {
                     top.open = false;
+                } else if b.open {
+                    top.open = true;
                 }
+                false
+            });
+            if pop_noop {
+                self.undo.pop();
             }
             self.redo.clear();
+            self.trim();
             return;
         }
         if now == b.doc {
             return;
         }
         self.redo.clear();
-        self.undo.push(Step {
+        let bytes = approx_bytes(&b.doc) + approx_bytes(&now);
+        self.push_step(Step {
             label: b.label,
             before: b.doc,
             after: now,
             key: b.key,
             at: Instant::now(),
             open: b.open,
+            bytes,
         });
-        if self.undo.len() > KEEP {
+    }
+
+    /// Keeps a step, forgetting the oldest while there are too many or they hold too much.
+    fn push_step(&mut self, step: Step) {
+        self.undo.push(step);
+        self.trim();
+    }
+
+    /// Forgets the oldest steps while there are too many or they hold too much.
+    fn trim(&mut self) {
+        while self.undo.len() > KEEP
+            || (self.undo.len() > 1 && self.undo.iter().chain(&self.redo).map(|s| s.bytes).sum::<usize>() > MAX_BYTES)
+        {
             self.undo.remove(0);
         }
     }
@@ -306,6 +448,33 @@ mod tests {
     }
 
     #[test]
+    fn a_big_collections_history_stays_under_its_memory_cap() {
+        let mut h = History::default();
+        // A collection of about 2 MB of JSON, edited 100 times.
+        let big = |n: usize| {
+            serde_json::json!({ "n": n, "sources": (0..2_000).map(|i| serde_json::json!({
+            "name": format!("source number {i} with a longish name"), "settings": { "text": "x".repeat(600) } })).collect::<Vec<_>>() })
+        };
+        for n in 0..100 {
+            let (before, after) = (big(n), big(n + 1));
+            let bytes = approx_bytes(&before) + approx_bytes(&after);
+            h.push_step(Step {
+                label: format!("step {n}"),
+                before,
+                after,
+                key: None,
+                at: Instant::now(),
+                open: false,
+                bytes,
+            });
+            let held: usize = h.undo.iter().map(|s| s.bytes).sum();
+            assert!(held <= MAX_BYTES || h.undo.len() == 1, "{n}: {held} bytes in {} steps", h.undo.len());
+        }
+        assert!(h.undo.len() < KEEP, "the oldest went: {} steps kept", h.undo.len());
+        assert_eq!(h.labels().0, Some("step 99"), "the newest stays");
+    }
+
+    #[test]
     fn steps_undo_redo_and_drags_join() {
         let c = stage();
         let mut h = History::default();
@@ -333,6 +502,292 @@ mod tests {
         assert_eq!(h.list().0, ["Move Box", "Add scene Two"]);
         assert_eq!(h.undo(&c), Ok(Some("Move Box".into())));
         assert_eq!(c.transform("Main", id).map(|t| t.x).ok(), Some(0.0), "back to before the drag");
+    }
+
+    /// Moving, aligning or spacing out several items is one step however many there are, and a
+    /// drag of them is one step too; undo puts every one of them back.
+    #[test]
+    fn several_items_moved_at_once_are_one_undo_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let add = |name: &str| {
+            c.add_source("Main", "color_source_v3", name, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .id
+        };
+        let (a, b, d) = (add("A"), add("B"), add("C"));
+        let x_of = |id| c.transform("Main", id).map(|t| t.x).ok();
+        let run = |h: &mut History, ids: &[i64], x: f32, save: bool| {
+            let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
+            let out: Result<Value, String> =
+                c.set_item_boxes("Main", &boxes).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        // A drag of three: its moves are one step, labelled by how many.
+        for (x, save) in [(10.0, false), (20.0, false), (30.0, true)] {
+            run(&mut h, &[a, b, d], x, save);
+        }
+        assert_eq!(h.list().0, ["Move 3 sources"]);
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(30.0); 3]);
+        assert_eq!(h.undo(&c), Ok(Some("Move 3 sources".into())));
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(0.0); 3], "all three back");
+        assert_eq!(h.redo(&c), Ok(Some("Move 3 sources".into())));
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(30.0); 3]);
+        // Two of them is its own step; one alone reads as moving that one.
+        run(&mut h, &[a, b], 50.0, true);
+        run(&mut h, &[d], 60.0, true);
+        assert_eq!(h.list().0, ["Move C", "Move 2 sources", "Move 3 sources"]);
+    }
+
+    /// A drag that starts just after a finished move of the same sources is part of that step, and
+    /// stays so however long it is held still (the step is open again until the drag saves).
+    #[test]
+    fn a_drag_joining_a_finished_move_stays_one_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let go = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        c.add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        c.add_source("Main", "color_source_v3", "B", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        go(&mut h, 50.0, true); // a finished move
+        go(&mut h, 60.0, false); // a drag starts right after: joins it
+        assert!(h.undo.last().is_some_and(|s| s.open), "an unsaved drag keeps the step open");
+        // Held still past the nudge window: the next move of the drag is still that step.
+        if let Some(s) = h.undo.last_mut() {
+            s.at -= NUDGES * 2;
+        }
+        go(&mut h, 70.0, false);
+        go(&mut h, 80.0, true);
+        assert_eq!(h.list().0.len(), 1, "one step: {:?}", h.list().0);
+        assert!(h.undo.last().is_some_and(|s| !s.open), "the save closes it");
+    }
+
+    /// Dragging a source (or sources / crop) away and back to its exact origin before releasing
+    /// must drop the joined step instead of leaving a no-op undo entry.
+    #[test]
+    fn dragging_away_and_back_to_origin_leaves_no_noop_undo_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let a = c
+            .add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 100, "height": 100 }), false)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .id;
+
+        let move_a = |h: &mut History, x: f32, save: bool| {
+            let act = StudioAct::SetItemBox { scene: "Main".into(), id: a, x, y: 0.0, w: 100.0, h: 100.0, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_box("Main", a, x, 0.0, 100.0, 100.0).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+
+        // 1. Single-item drag away and back to exact (0, 0) on release: no undo step left.
+        move_a(&mut h, 40.0, false);
+        move_a(&mut h, 80.0, false);
+        assert_eq!(h.list().0, ["Move A"]);
+        move_a(&mut h, 0.0, true);
+        assert!(h.list().0.is_empty(), "single-item round-trip left no-op undo step: {:?}", h.list().0);
+
+        // 2. Passing through origin mid-drag (`save: false`) still records the step if released away.
+        move_a(&mut h, 50.0, false);
+        move_a(&mut h, 0.0, false);
+        move_a(&mut h, 25.0, true);
+        assert_eq!(h.list().0, ["Move A"]);
+        assert_eq!(h.undo(&c), Ok(Some("Move A".into())));
+
+        // 3. Multi-item batch drag away and back to origin: no undo step left either.
+        let b = c
+            .add_source("Main", "color_source_v3", "B", &serde_json::json!({ "width": 50, "height": 50 }), false)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .id;
+        let move_ab = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: a, x, y: 0.0, w: 100.0, h: 100.0 },
+                ItemBoxIn { id: b, x, y: 0.0, w: 50.0, h: 50.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(a, x, 0.0, 100.0, 100.0), (b, x, 0.0, 50.0, 50.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        move_ab(&mut h, 30.0, false);
+        move_ab(&mut h, 0.0, true);
+        assert!(h.list().0.is_empty(), "multi-item round-trip left no-op undo step: {:?}", h.list().0);
+
+        // 4. Crop drag away and back to uncropped: passing through [0;4] mid-drag keeps the open
+        //    step alive, while releasing at [0;4] drops it.
+        let crop_a = |h: &mut History, crop: [i32; 4], save: bool| {
+            let act = StudioAct::SetItemCrop { scene: "Main".into(), id: a, crop, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_crop("Main", a, crop).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        crop_a(&mut h, [20, 0, 0, 0], false);
+        crop_a(&mut h, [0, 0, 0, 0], false);
+        crop_a(&mut h, [10, 0, 0, 0], true);
+        assert_eq!(h.list().0, ["Crop A"]);
+        assert_eq!(h.undo(&c), Ok(Some("Crop A".into())));
+
+        crop_a(&mut h, [20, 0, 0, 0], false);
+        crop_a(&mut h, [0, 0, 0, 0], true);
+        assert!(h.list().0.is_empty(), "crop round-trip left no-op undo step: {:?}", h.list().0);
+    }
+
+    /// Align and Space out are steps of their own, named for what they do, even right after a
+    /// drag or another align of the same sources (Neon #6: they merged into "Move 2 sources").
+    #[test]
+    fn align_and_space_out_are_their_own_named_undo_steps() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in ["A", "B"] {
+            c.add_source("Main", "color_source_v3", n, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, x: f32, save: bool, reason: BoxReason| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, 50.0, true, BoxReason::Move); // a drag, saved
+        go(&mut h, 60.0, true, BoxReason::Align); // within a second: still its own step
+        go(&mut h, 70.0, true, BoxReason::Distribute);
+        go(&mut h, 71.0, true, BoxReason::Move); // an arrow key after them: not folded into them
+        let labels: Vec<String> = h.list().0.iter().map(|s| s.to_string()).collect();
+        assert_eq!(labels.len(), 4, "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("Align 2 sources")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("Space out 2 sources")), "{labels:?}");
+    }
+
+    /// A step that is joined and grows is counted at its new size, so the memory cap holds.
+    #[test]
+    fn a_joined_step_is_counted_at_its_new_size() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        c.add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let go = |h: &mut History, save: bool| {
+            let items = vec![ItemBoxIn { id: 1, x: 5.0, y: 0.0, w: 10.0, h: 10.0 }];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_box("Main", 1, 5.0, 0.0, 10.0, 10.0).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, false);
+        let first = h.undo.last().map(|s| s.bytes).unwrap_or(0);
+        // The collection grows while the drag is open, then the drag goes on.
+        c.add_source(
+            "Main",
+            "color_source_v3",
+            &"B".repeat(90),
+            &serde_json::json!({ "width": 10, "height": 10 }),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        go(&mut h, true);
+        let step = h.undo.last().unwrap_or_else(|| panic!("a step"));
+        assert!(step.bytes > first, "{} should be more than {first}", step.bytes);
+        assert_eq!(step.bytes, approx_bytes(&step.before) + approx_bytes(&step.after));
+    }
+
+    /// A drag that never saved (the pointer was lost, the page closed) leaves its step open; a
+    /// move of the same sources long after must not fold into it (Undo would go back that far).
+    #[test]
+    fn an_abandoned_drags_step_does_not_swallow_later_moves() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in ["A", "B"] {
+            c.add_source("Main", "color_source_v3", n, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, 50.0, false); // a drag that never saves
+        assert_eq!(h.list().0.len(), 1);
+        if let Some(s) = h.undo.last_mut() {
+            s.at -= OPEN_MAX * 2; // ...and is left for a minute
+        }
+        go(&mut h, 90.0, true); // a later, finished move of the same two
+        assert_eq!(h.list().0.len(), 2, "two steps: {:?}", h.list().0);
+    }
+
+    /// Two different sets of items moved within a second of each other are two steps, even when
+    /// their ids would hash alike ([1, 34] and [2, 3] do).
+    #[test]
+    fn different_sets_of_items_are_different_steps() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in 0..34 {
+            c.add_source(
+                "Main",
+                "color_source_v3",
+                &format!("S{n}"),
+                &serde_json::json!({ "width": 10, "height": 10 }),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, ids: [i64; 2], x: f32| {
+            let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save: true, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
+            let out: Result<Value, String> =
+                c.set_item_boxes("Main", &boxes).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, [1, 34], 100.0);
+        go(&mut h, [2, 3], 200.0);
+        assert_eq!(h.list().0.len(), 2, "two steps: {:?}", h.list().0);
+        // The same two in the other order are the same drag.
+        go(&mut h, [3, 2], 300.0);
+        assert_eq!(h.list().0.len(), 2, "the same set merges: {:?}", h.list().0);
     }
 
     /// Owner's check, 11 Nov: edits to a group's sources, and moving a source in or out of a
@@ -368,5 +823,297 @@ mod tests {
         assert_eq!(h.undo(&c), Ok(Some("Hide Box".into())));
         assert_eq!(h.undo(&c), Ok(Some("Move Box into Pair".into())));
         assert!(c.items("Main").unwrap_or_default().iter().any(|i| i.name == "Box"), "out of the group again");
+    }
+
+    /// Where an item is shown is an undo step like any other edit, and comes back with Redo.
+    #[test]
+    fn choosing_stream_or_recording_for_an_item_undoes_and_redoes() {
+        use ferrocast_engine::studio_host::ItemEdit;
+        let c = stage();
+        let mut h = History::default();
+        let it = c
+            .add_source("Main", "color_source_v3", "Chat", &serde_json::json!({ "width": 64, "height": 36 }), false)
+            .unwrap();
+        let show = |c: &Collection| c.items("Main").unwrap()[0].show.clone();
+        for edit in [ItemEdit::StreamOnly, ItemEdit::RecordingOnly] {
+            let act = StudioAct::EditItem { scene: "Main".into(), id: it.id, edit };
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            let r = c.edit_item(
+                "Main",
+                it.id,
+                match edit {
+                    ItemEdit::StreamOnly => ferrocast_studio::ItemEdit::StreamOnly,
+                    _ => ferrocast_studio::ItemEdit::RecordingOnly,
+                },
+            );
+            h.after(&c, b, &r.map(|()| Value::Null).map_err(|e| e.to_string()));
+        }
+        assert_eq!(show(&c), "recording");
+        assert_eq!(h.list().0, ["Set stream or recording for Chat", "Set stream or recording for Chat"]);
+        assert_eq!(h.undo(&c), Ok(Some("Set stream or recording for Chat".into())));
+        assert_eq!(show(&c), "stream");
+        assert_eq!(h.undo(&c), Ok(Some("Set stream or recording for Chat".into())));
+        assert_eq!(show(&c), "both");
+        assert!(!c.has_selective_items());
+        assert_eq!(h.redo(&c), Ok(Some("Set stream or recording for Chat".into())));
+        assert_eq!(show(&c), "stream");
+    }
+
+    #[test]
+    fn item_filter_and_scope_edits_undo_redo_and_merge_sliders_per_item() {
+        use ferrocast_engine::studio_host::ItemTarget;
+
+        let c = stage();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+        c.start_vertical("Vertical").unwrap();
+        let main_it = c
+            .add_source("Main", "color_source_v3", "Card", &serde_json::json!({ "width": 64, "height": 36 }), false)
+            .unwrap();
+        let vert_it = c.add_existing("Vertical", "Card").unwrap();
+        let tgt = Some(ItemTarget { scene: "Vertical".into(), id: vert_it.id });
+
+        step(&mut h, StudioAct::SetItemFilterScope { scene: "Vertical".into(), id: vert_it.id, own: true }, &|| {
+            c.set_item_filter_scope("Vertical", vert_it.id, true).map(|_| ()).map_err(|e| e.to_string())
+        });
+        step(
+            &mut h,
+            StudioAct::AddFilter {
+                name: String::new(),
+                filter: ferrocast_engine::studio_host::NewSource {
+                    kind: "ferrocast_rounded_corners".into(),
+                    name: "Round".into(),
+                    settings: serde_json::json!({ "radius": 8 }),
+                },
+                item: tgt.clone(),
+            },
+            &|| {
+                c.add_item_filter(
+                    "Vertical",
+                    vert_it.id,
+                    "ferrocast_rounded_corners",
+                    "Round",
+                    &serde_json::json!({ "radius": 8 }),
+                )
+                .map_err(|e| e.to_string())
+            },
+        );
+        // Two slider drags on Vertical item merge into one undo step.
+        for r in [14, 24] {
+            step(
+                &mut h,
+                StudioAct::UpdateFilter {
+                    name: String::new(),
+                    filter: "Round".into(),
+                    settings: serde_json::json!({ "radius": r }),
+                    item: tgt.clone(),
+                },
+                &|| {
+                    c.update_item_filter("Vertical", vert_it.id, "Round", &serde_json::json!({ "radius": r }))
+                        .map_err(|e| e.to_string())
+                },
+            );
+        }
+        assert_eq!(h.list().0, ["Change filter Round", "Add filter Round", "Use own filters for Card"]);
+        assert_eq!(c.item_filters("Main", main_it.id).unwrap().len(), 0);
+        assert_eq!(c.item_filter_settings("Vertical", vert_it.id, "Round").unwrap()["radius"], 24);
+
+        // Undo slider change restores radius to 8; undo again removes Round cleanly.
+        assert_eq!(h.undo(&c), Ok(Some("Change filter Round".into())));
+        assert_eq!(c.item_filter_settings("Vertical", vert_it.id, "Round").unwrap()["radius"], 8);
+        assert_eq!(h.undo(&c), Ok(Some("Add filter Round".into())));
+        assert!(c.item_filters("Vertical", vert_it.id).unwrap().is_empty());
+        // Undo scope switch reverts own_filters back to false.
+        assert_eq!(h.undo(&c), Ok(Some("Use own filters for Card".into())));
+        assert!(!c.items("Vertical").unwrap()[0].own_filters);
+        // Redo scope + add restores them.
+        assert_eq!(h.redo(&c), Ok(Some("Use own filters for Card".into())));
+        assert!(c.items("Vertical").unwrap()[0].own_filters);
+    }
+
+    #[test]
+    fn named_transition_and_matrix_edits_undo_and_redo() {
+        let c = stage();
+        c.add_scene("BRB").unwrap();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+        step(
+            &mut h,
+            StudioAct::AddNamedTransition {
+                transition: ferrocast_engine::studio_host::NamedTransitionInput {
+                    name: "Fast Cut".into(),
+                    kind: "cut_transition".into(),
+                    ms: 0,
+                    settings: serde_json::json!({}),
+                    default: false,
+                },
+            },
+            &|| {
+                c.add_named_transition(&ferrocast_studio::NamedTransition {
+                    name: "Fast Cut".into(),
+                    kind: "cut_transition".into(),
+                    ms: 0,
+                    settings: serde_json::json!({}),
+                    default: false,
+                })
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            },
+        );
+        step(
+            &mut h,
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("Main".into()),
+                to: Some("BRB".into()),
+                transition: Some("Fast Cut".into()),
+            },
+            &|| c.set_matrix_rule(Some("Main"), Some("BRB"), Some("Fast Cut")).map_err(|e| e.to_string()),
+        );
+        assert_eq!(c.resolve_transition("Main", "BRB").name, "Fast Cut");
+        assert_eq!(h.undo(&c), Ok(Some("Change transition matrix".into())));
+        assert_eq!(c.resolve_transition("Main", "BRB").name, "Fade");
+        assert_eq!(h.undo(&c), Ok(Some("Add transition Fast Cut".into())));
+        assert!(!c.named_transitions().iter().any(|t| t.name == "Fast Cut"));
+        assert_eq!(h.redo(&c), Ok(Some("Add transition Fast Cut".into())));
+        assert_eq!(h.redo(&c), Ok(Some("Change transition matrix".into())));
+        assert_eq!(c.resolve_transition("Main", "BRB").name, "Fast Cut");
+    }
+
+    #[test]
+    fn moving_scenes_including_vertical_undoes_and_noop_move_leaves_no_step() {
+        let c = stage();
+        c.add_scene("Two").unwrap();
+        c.start_vertical("Tall").unwrap();
+        c.add_vertical_scene("Tall 2").unwrap();
+        let mut h = History::default();
+        let run_move = |h: &mut History, scene: &str, to: usize| -> Result<(), String> {
+            let act = StudioAct::MoveScene { scene: scene.into(), to };
+            let b = h.before(&c, &act).unwrap();
+            let out = c.move_scene(scene, to).map(|()| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, b, &out);
+            out.map(|_| ())
+        };
+
+        // Real move then undo, so both undo and redo stacks are tested against a no-op move.
+        run_move(&mut h, "Two", 0).unwrap();
+        assert_eq!(h.labels().0, Some("Reorder Two"));
+        assert_eq!(h.undo(&c), Ok(Some("Reorder Two".into())));
+        assert_eq!(h.labels(), (None, Some("Reorder Two")));
+
+        // No-op move (exact and clamped) adds no undo step and keeps redo intact.
+        run_move(&mut h, "Main", 0).unwrap();
+        run_move(&mut h, "Two", 99).unwrap();
+        assert_eq!(h.labels(), (None, Some("Reorder Two")));
+
+        // Moving a vertical scene records an undo step and restores vertical order on undo/redo.
+        run_move(&mut h, "Tall 2", 0).unwrap();
+        assert_eq!(h.labels().0, Some("Reorder Tall 2"));
+        assert_eq!(
+            c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Tall 2", "Tall"]
+        );
+        // No-op vertical move leaves no extra undo step.
+        run_move(&mut h, "Tall 2", 0).unwrap();
+        assert_eq!(h.labels().0, Some("Reorder Tall 2"));
+
+        assert_eq!(h.undo(&c), Ok(Some("Reorder Tall 2".into())));
+        assert_eq!(
+            c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Tall", "Tall 2"]
+        );
+        assert_eq!(h.redo(&c), Ok(Some("Reorder Tall 2".into())));
+        assert_eq!(
+            c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Tall 2", "Tall"]
+        );
+    }
+
+    #[test]
+    fn global_channel_set_and_remove_undo_and_redo_preserving_volume_and_filters() {
+        use ferrocast_engine::studio_host::{AudioChange, NewSource};
+
+        let c = stage();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} must record an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+
+        // Removing an already-empty channel must not push a spurious undo step.
+        assert!(h.before(&c, &StudioAct::SetChannel { channel: 3, device: None }).is_none());
+
+        // Set global Mic on channel 3, adjust volume, and add an audio filter.
+        let dev = NewSource {
+            kind: "coreaudio_input_capture".into(),
+            name: "Mic".into(),
+            settings: serde_json::json!({ "device_id": "default" }),
+        };
+        step(&mut h, StudioAct::SetChannel { channel: 3, device: Some(dev) }, &|| {
+            c.set_channel(3, Some(("coreaudio_input_capture", "Mic", &serde_json::json!({ "device_id": "default" }))))
+                .map_err(|e| e.to_string())
+        });
+        step(
+            &mut h,
+            StudioAct::SetAudio {
+                name: "Mic".into(),
+                change: AudioChange { volume_db: Some(-6.0), ..Default::default() },
+            },
+            &|| c.set_volume("Mic", -6.0).map_err(|e| e.to_string()),
+        );
+        step(
+            &mut h,
+            StudioAct::AddFilter {
+                name: "Mic".into(),
+                filter: NewSource {
+                    kind: "noise_suppress_filter_v2".into(),
+                    name: "Remove background noise".into(),
+                    settings: serde_json::json!({ "method": "rnnoise" }),
+                },
+                item: None,
+            },
+            &|| {
+                c.add_filter(
+                    "Mic",
+                    "noise_suppress_filter_v2",
+                    "Remove background noise",
+                    &serde_json::json!({ "method": "rnnoise" }),
+                )
+                .map_err(|e| e.to_string())
+            },
+        );
+
+        assert_eq!(c.channels().len(), 1);
+        assert_eq!(c.filters("Mic").unwrap().len(), 1);
+        assert!((c.audio_of("Mic").unwrap().volume_db - (-6.0)).abs() < 0.01);
+
+        // Remove the global Mic via SetChannel { channel: 3, device: None }.
+        step(&mut h, StudioAct::SetChannel { channel: 3, device: None }, &|| {
+            c.set_channel(3, None).map_err(|e| e.to_string())
+        });
+        assert!(c.channels().is_empty());
+        assert_eq!(h.labels().0, Some("Remove Mic"));
+
+        // Undo must bring back channel 3 with its exact volume and filters, not an earlier edit.
+        assert_eq!(h.undo(&c), Ok(Some("Remove Mic".into())));
+        let channels = c.channels();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "Mic");
+        assert_eq!(channels[0].channel, Some(3));
+        assert!((channels[0].volume_db - (-6.0)).abs() < 0.01);
+        let filters = c.filters("Mic").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].name, "Remove background noise");
+
+        // Redo removes it again; undo brings it back again.
+        assert_eq!(h.redo(&c), Ok(Some("Remove Mic".into())));
+        assert!(c.channels().is_empty());
+        assert_eq!(h.undo(&c), Ok(Some("Remove Mic".into())));
+        assert_eq!(c.channels().len(), 1);
     }
 }

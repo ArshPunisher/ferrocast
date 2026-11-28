@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use ferrocast_core::alert::AlertRule;
 use ferrocast_core::goal::{Goal, GoalView};
+use ferrocast_core::links::account_url;
 use ferrocast_core::overlay::{Overlay, Preset, Widget};
 use ferrocast_store::{backup, repo};
 use serde::Deserialize;
@@ -80,11 +81,33 @@ pub async fn accounts(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     let out: Vec<Value> = list
         .into_iter()
         .map(|a| {
-            json!({ "platform": a.platform, "name": a.display_name, "avatar_url": a.avatar_url,
-                         "connected_at": a.connected_at, "scopes_ok": true })
+            let url = account_url(&a.platform, &a.login, &a.user_id);
+            json!({ "platform": a.platform, "name": a.display_name, "login": a.login, "url": url,
+                         "avatar_url": a.avatar_url, "connected_at": a.connected_at, "scopes_ok": true })
         })
         .collect();
     Ok(Json(json!(out)))
+}
+
+pub async fn links(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.links().await?)))
+}
+
+pub async fn save_links(State(app): State<AppState>, Body(b): Body<Value>) -> ApiResult<Json<Value>> {
+    let Some(patch) = b.as_object() else {
+        return Err(ApiError::invalid("Links must be a JSON object."));
+    };
+    Ok(Json(json!(app.engine.patch_links(patch).await?)))
+}
+
+#[derive(Deserialize, Default)]
+pub struct LabelsQuery {
+    #[serde(default)]
+    pub tz_offset_min: Option<i32>,
+}
+
+pub async fn labels(State(app): State<AppState>, Query(q): Query<LabelsQuery>) -> Json<Value> {
+    Json(json!(app.engine.all_labels_for_offset(q.tz_offset_min.unwrap_or(0)).await))
 }
 
 pub async fn connect(State(app): State<AppState>, Path(p): Path<String>) -> ApiResult<Json<Value>> {
@@ -211,7 +234,26 @@ pub async fn rules(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.rules()))
 }
 
-pub async fn create_rule(State(app): State<AppState>, Body(mut r): Body<AlertRule>) -> ApiResult<impl IntoResponse> {
+/// Custom alert HTML and fields are code-like content: PC only, for an API key as for a phone.
+fn refuse_custom_code(
+    app: &AppState,
+    api_key: &Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
+    stored_id: Option<&str>,
+    rule: &AlertRule,
+) -> ApiResult<()> {
+    if api_key.is_some() && crate::remote::rule_custom_changed(&app.engine, stored_id, &json!(rule)) {
+        return Err(ApiError::forbidden("Custom alert code can only be added or changed on the PC itself.")
+            .hint("Everything else about an alert works with an API key."));
+    }
+    Ok(())
+}
+
+pub async fn create_rule(
+    State(app): State<AppState>,
+    api_key: Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
+    Body(mut r): Body<AlertRule>,
+) -> ApiResult<impl IntoResponse> {
+    refuse_custom_code(&app, &api_key, None, &r)?;
     if r.id.trim().is_empty() {
         r.id = ferrocast_store::new_id();
     }
@@ -223,12 +265,14 @@ pub async fn create_rule(State(app): State<AppState>, Body(mut r): Body<AlertRul
 
 pub async fn update_rule(
     State(app): State<AppState>,
+    api_key: Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
     Path(id): Path<String>,
     Body(mut r): Body<AlertRule>,
 ) -> ApiResult<Json<Value>> {
     if !app.engine.rules().iter().any(|x| x.id == id) {
         return Err(ApiError::not_found("alert rule"));
     }
+    refuse_custom_code(&app, &api_key, Some(&id), &r)?;
     r.id = id;
     Ok(Json(json!(app.engine.save_rule(r).await?)))
 }
@@ -264,6 +308,14 @@ pub async fn queue(State(app): State<AppState>) -> Json<Value> {
 
 pub async fn queue_pause(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.queue_pause().await))
+}
+
+pub async fn queue_mute(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.queue_set_muted(true).await))
+}
+
+pub async fn queue_unmute(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.queue_set_muted(false).await))
 }
 
 pub async fn queue_resume(State(app): State<AppState>) -> Json<Value> {
@@ -379,10 +431,31 @@ pub async fn settings(State(app): State<AppState>) -> Json<Value> {
 
 /// Saves the fields that were sent and keeps the rest, so an older dashboard that doesn't
 /// know a setting can't reset it.
-pub async fn save_settings(State(app): State<AppState>, Body(patch): Body<Value>) -> ApiResult<Json<Value>> {
+pub async fn save_settings(
+    State(app): State<AppState>,
+    api_key: Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
+    Body(patch): Body<Value>,
+) -> ApiResult<Json<Value>> {
     let Some(patch) = patch.as_object() else {
         return Err(ApiError::invalid("Settings must be an object."));
     };
+    // Opening this PC to the network (and to keys over it) is the owner's, on the PC itself.
+    if api_key.is_some() {
+        let now = json!(app.engine.settings());
+        for field in ["lan_access", "api_keys_over_lan"] {
+            if let Some(want) = patch.get(field)
+                && now.get(field) != Some(want)
+            {
+                return Err(ApiError::forbidden("Local API keys can't change LAN access settings.")
+                    .hint("Change Allow other devices in Settings on this PC."));
+            }
+        }
+    }
+    // Agreeing to send crash reports without asking is the owner's too, on the PC itself.
+    if api_key.is_some() && super::remote_scope::crash_reports_to_always(&app.engine, patch) {
+        return Err(ApiError::forbidden("Local API keys can't turn on automatic crash reports.")
+            .hint("Change Send crash reports in Settings on this PC."));
+    }
     Ok(Json(json!(app.engine.patch_settings(patch).await?)))
 }
 

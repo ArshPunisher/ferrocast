@@ -7,19 +7,23 @@ mod assets;
 mod auth;
 mod error;
 mod extract;
+pub(crate) mod rate_limit;
 mod remote;
 mod routes;
+pub mod spec;
 mod ws;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use ferrocast_engine::Engine;
+use ferrocast_engine::api_keys::ApiKeyAuth;
 use tokio::net::TcpListener;
 
 pub use auth::Sessions;
@@ -51,6 +55,7 @@ pub(crate) struct AppState {
     pub engine: Engine,
     pub sessions: Arc<Sessions>,
     pub guard: auth::Guard,
+    pub api_limiter: rate_limit::ApiKeyRateLimiter,
 }
 
 /// A running server.
@@ -67,30 +72,103 @@ impl Server {
     }
 }
 
-/// Binds and starts serving. Tries `opts.port`, then the next 20 ports.
-pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server> {
-    let ip = if opts.lan { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
+/// The OS's "not now" errors from opening a socket: out of network buffers (ENOBUFS, os error 55
+/// on a Mac, 105 on Linux, 10055 on Windows), out of memory or file handles, or "try again".
+/// They pass by themselves, so binding waits and tries again; an address already in use does
+/// not (it moves to the next port).
+fn is_transient_bind_error(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    const CODES: [i32; 5] = [55, 12, 23, 24, 35];
+    #[cfg(target_os = "windows")]
+    const CODES: [i32; 3] = [10055, 10024, 8];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    const CODES: [i32; 5] = [105, 12, 23, 24, 11];
+    e.kind() == std::io::ErrorKind::OutOfMemory || e.raw_os_error().is_some_and(|c| CODES.contains(&c))
+}
+
+/// What the person sees when the computer stays out of network resources for the whole wait.
+fn out_of_network_resources(e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        e.kind(),
+        format!(
+            "Your computer has run out of network resources ({e}). Close apps that use the network \
+             (a VPN, a download manager, many browser tabs), wait a minute and open Ferrocast again; \
+             if it keeps happening, restart your computer."
+        ),
+    )
+}
+
+/// How one round of opening the listener ended.
+enum Round {
+    Bound(TcpListener),
+    /// The computer is short of a resource for now (see [`is_transient_bind_error`]).
+    Transient(std::io::Error),
+    Failed(std::io::Error),
+}
+
+/// One round: `port`, then the next 20 ports when one is taken, and any free port when all are.
+async fn bind_round<B, F>(ip: Ipv4Addr, port: u16, bind: &mut B) -> Round
+where
+    B: FnMut(SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<TcpListener>>,
+{
     let mut last_err = None;
-    let mut listener = None;
-    for port in opts.port..opts.port.saturating_add(20) {
-        match TcpListener::bind((ip, port)).await {
-            Ok(l) => {
-                listener = Some(l);
-                break;
-            }
+    for p in port..port.saturating_add(20) {
+        match bind(SocketAddr::from((ip, p))).await {
+            Ok(l) => return Round::Bound(l),
+            Err(e) if is_transient_bind_error(&e) => return Round::Transient(e),
             Err(e) => last_err = Some(e),
         }
     }
-    let listener = match listener {
-        Some(l) => l,
-        None => TcpListener::bind((ip, 0)).await.map_err(|e| last_err.unwrap_or(e))?,
-    };
+    match bind(SocketAddr::from((ip, 0))).await {
+        Ok(l) => Round::Bound(l),
+        Err(e) if is_transient_bind_error(&e) => Round::Transient(e),
+        Err(e) => Round::Failed(last_err.unwrap_or(e)),
+    }
+}
+
+/// Opens the listener. A transient resource error waits `pause`, doubling up to 2 s, and tries
+/// the whole round again, up to `rounds` times; any other failure ends it at once.
+async fn bind_listener<B, F>(
+    ip: Ipv4Addr,
+    port: u16,
+    rounds: u32,
+    pause: Duration,
+    mut bind: B,
+) -> std::io::Result<TcpListener>
+where
+    B: FnMut(SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<TcpListener>>,
+{
+    let rounds = rounds.max(1);
+    let mut wait = pause;
+    for round in 1..=rounds {
+        match bind_round(ip, port, &mut bind).await {
+            Round::Bound(l) => return Ok(l),
+            Round::Failed(e) => return Err(e),
+            Round::Transient(e) if round == rounds => return Err(out_of_network_resources(&e)),
+            Round::Transient(e) => {
+                tracing::warn!(error = %e, round, "the local server waits for network resources");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+    unreachable!("the last round returns")
+}
+
+/// Binds and starts serving. Tries `opts.port`, then the next 20 ports.
+pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server> {
+    let ip = if opts.lan { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
+    // About 20 s of patience for a computer short of network buffers (os error 55) before giving up.
+    let listener = bind_listener(ip, opts.port, 12, Duration::from_millis(250), TcpListener::bind).await?;
     let addr = listener.local_addr()?;
     let sessions = Arc::new(Sessions::new());
     let state = AppState {
         engine: engine.clone(),
         sessions: sessions.clone(),
         guard: auth::Guard { port: addr.port(), lan: opts.lan, dev_origins: opts.dev_origins },
+        api_limiter: rate_limit::ApiKeyRateLimiter::default(),
     };
     engine.set_base_url(&format!("http://127.0.0.1:{}", addr.port()));
     // The built-in designs ship inside the overlay bundle (API.md §4 Designs).
@@ -98,8 +176,10 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
     let app = router(state);
     // The dashboard from anywhere answers phones through this same router (Pro F2).
     engine.set_remote_handler(remote::handler(app.clone(), engine.clone(), addr.port()));
+    // The obs-websocket server, when the owner switched it on.
+    engine.start_obsws();
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
             tracing::error!(error = %e, "the local server stopped");
         }
     });
@@ -119,6 +199,19 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(assets::routes())
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
         .with_state(state)
+}
+
+pub(crate) fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// Whether a local API key may be used from `peer`: this PC always; another device only when the
+/// owner switched on "API keys over LAN". (No peer address: an in-process call, which is this PC.)
+pub(crate) fn key_peer_ok(app: &AppState, peer: Option<std::net::SocketAddr>) -> bool {
+    peer.is_none_or(|p| is_loopback(p.ip()) || app.engine.settings().api_keys_over_lan)
 }
 
 /// Every request: the Host must be ours (anti DNS-rebinding).
@@ -158,22 +251,128 @@ async fn api_guard(State(app): State<AppState>, req: Request, next: Next) -> Res
         return res;
     }
     let path = req.uri().path();
-    let open = path.ends_with("/session/pair") || path.ends_with("/live");
-    if !open {
-        // GETs may carry the token as ?session= so <img>/<audio> previews can load media.
-        let query_token =
-            (req.method() == Method::GET).then(|| query_param(req.uri().query().unwrap_or(""), "session")).flatten();
-        let token = auth::bearer(req.headers()).map(str::to_string).or(query_token);
-        let ok = token.is_some_and(|t| app.sessions.valid(&t));
-        if !ok {
-            let mut res = ApiError::unauthorized().into_response();
-            add_cors(&mut res, dev_origin.as_deref());
-            return res;
+    let rel = path.strip_prefix("/api/v1").unwrap_or(path).to_string();
+    // GETs may carry the token as ?session= or ?key= so <img>/<audio> and WebSocket clients can auth.
+    // An API key in the query is for the live socket only (a URL ends up in logs and history).
+    let query_token = (req.method() == Method::GET)
+        .then(|| {
+            let q = req.uri().query().unwrap_or("");
+            query_param(q, "session").or_else(|| if rel == "/live" { query_param(q, "key") } else { None })
+        })
+        .flatten();
+    let token = auth::bearer(req.headers()).map(str::to_string).or(query_token);
+    if let Some(tok) = token.as_deref()
+        && ferrocast_core::api_keys::has_api_key_prefix(tok)
+    {
+        // `/api/v1/live` authenticates inside `ws::live` where `WebSocketUpgrade` runs. All other
+        // routes, including `/session/pair`, are checked here so an API key can never pair.
+        if rel != "/live" {
+            return handle_api_key_request(app, req, next, tok, &rel, dev_origin.as_deref()).await;
+        }
+    } else {
+        let open = rel == "/session/pair" || rel == "/live";
+        if !open {
+            let ok = token.is_some_and(|t| app.sessions.valid(&t));
+            if !ok {
+                let mut res = ApiError::unauthorized().into_response();
+                add_cors(&mut res, dev_origin.as_deref());
+                return res;
+            }
         }
     }
     let mut res = next.run(req).await;
     add_cors(&mut res, dev_origin.as_deref());
     res
+}
+
+async fn handle_api_key_request(
+    app: AppState,
+    mut req: Request,
+    next: Next,
+    token: &str,
+    rel: &str,
+    dev_origin: Option<&str>,
+) -> Response {
+    // A key is for programs on this PC: not from another device (unless the owner allowed it),
+    // and never from a web page (a browser sends an Origin; only the dashboard's dev servers do).
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    let from_a_page = req
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|o| !o.to_str().is_ok_and(|o| app.guard.dev_origins.iter().any(|d| d == o)));
+    if !key_peer_ok(&app, peer) || from_a_page {
+        let mut res = ApiError::forbidden(if from_a_page {
+            "An API key can't be used from a web page."
+        } else {
+            "API keys only work from this computer."
+        })
+        .hint("Turn on API keys over LAN in Settings on this PC to use one from another device.")
+        .into_response();
+        add_cors(&mut res, dev_origin);
+        return res;
+    }
+    // Failed tries are counted by address: past the allowance a guesser is turned away before
+    // the database is touched.
+    let ip = peer.map_or_else(|| "local".to_string(), |p| p.ip().to_string());
+    if rate_limit::BAD_KEYS.is_over(&ip) {
+        let mut res = ApiError::too_many(60).into_response();
+        add_cors(&mut res, dev_origin);
+        return res;
+    }
+    let Ok(ApiKeyAuth::Valid(summary)) = app.engine.authenticate_api_key(token).await else {
+        let _ = rate_limit::BAD_KEYS.check(&ip);
+        let mut res = ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "Invalid, revoked, or expired API key.")
+            .into_response();
+        add_cors(&mut res, dev_origin);
+        return res;
+    };
+
+    let method = req.method().as_str().to_string();
+    let safe_path = routes::remote_scope::audit_path(rel);
+    let (limit, remaining) = match app.api_limiter.check(&summary.id) {
+        rate_limit::RateDecision::Allowed { limit, remaining } => (limit, remaining),
+        rate_limit::RateDecision::Exceeded { limit, retry_after_secs } => {
+            // One row per key per window: a flood of refused requests isn't a flood of writes.
+            if rate_limit::audit_429_now(&summary.id) {
+                app.engine.record_api_key_usage(&summary.id, &summary.name, &method, &safe_path, 429).await;
+            }
+            let mut res = ApiError::too_many(retry_after_secs).into_response();
+            insert_rate_headers(&mut res, limit, 0);
+            add_cors(&mut res, dev_origin);
+            return res;
+        }
+    };
+
+    if !routes::remote_scope::api_key_allowed(&summary.scopes, &method, rel) {
+        app.engine.record_api_key_usage(&summary.id, &summary.name, &method, &safe_path, 403).await;
+        let mut res = ApiError::forbidden(format!("This API key does not have permission for {method} {safe_path}."))
+            .into_response();
+        insert_rate_headers(&mut res, limit, remaining);
+        add_cors(&mut res, dev_origin);
+        return res;
+    }
+
+    req.extensions_mut().insert(routes::api_keys::ApiKeyPrincipal {
+        id: summary.id.clone(),
+        name: summary.name.clone(),
+        scopes: summary.scopes.clone(),
+    });
+    let mut res = next.run(req).await;
+    let status = res.status().as_u16();
+    app.engine.record_api_key_usage(&summary.id, &summary.name, &method, &safe_path, status).await;
+    insert_rate_headers(&mut res, limit, remaining);
+    add_cors(&mut res, dev_origin);
+    res
+}
+
+fn insert_rate_headers(res: &mut Response, limit: usize, remaining: usize) {
+    let h = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
+        h.insert(HeaderName::from_static("x-ratelimit-limit"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
+        h.insert(HeaderName::from_static("x-ratelimit-remaining"), v);
+    }
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
@@ -191,16 +390,34 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type"));
     h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE"));
+    h.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("content-disposition, retry-after, x-ratelimit-limit, x-ratelimit-remaining"),
+    );
     h.insert(header::VARY, HeaderValue::from_static("Origin"));
 }
 
 #[cfg(test)]
+mod api_keys_tests;
+#[cfg(test)]
 mod automations_tests;
 #[cfg(test)]
+mod bind_tests;
+#[cfg(test)]
+mod clips_exposure_tests;
+#[cfg(test)]
 mod designs_tests;
+#[cfg(test)]
+mod obsws_tests;
 #[cfg(test)]
 mod plugins_tests;
 #[cfg(test)]
 mod remote_tests;
+#[cfg(test)]
+mod scope_tests;
+#[cfg(test)]
+mod spec_tests;
+#[cfg(test)]
+mod store_tests;
 #[cfg(test)]
 mod tests;

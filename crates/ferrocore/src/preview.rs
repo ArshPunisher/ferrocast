@@ -4,6 +4,9 @@
 //! canvas too), and a dimming layer while a dialog is open. Into a window's surface
 //! (`present`), or read back (`render_preview`) for tests and screenshots.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
 use crate::compose::Target;
 use crate::{AvError, Compositor, Scene, Transition};
 
@@ -18,6 +21,18 @@ pub struct Outline {
     pub width: f32,
     /// Picked: handles at its corners and edges' middles.
     pub handles: bool,
+}
+
+/// Diagonal stripes over the part of a source's box that lies outside the canvas, the way
+/// Streamlabs shows what won't be seen: a fill in `a`, bands of `b` over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Overflow {
+    /// The fill (straight alpha, the view's gamma): the page's colour round the canvas.
+    pub a: [f32; 4],
+    /// The bands' colour, same encoding.
+    pub b: [f32; 4],
+    /// Distance between two bands' starts across the bands, in view pixels.
+    pub period: f32,
 }
 
 /// How the preview looks round and over the picture.
@@ -45,6 +60,8 @@ pub struct PreviewLook {
     /// a line from each side to the canvas edge with its length in canvas pixels. The view's
     /// pixels per point, so the labels read the same size on any screen; None draws none.
     pub guides: Option<f32>,
+    /// Stripes over what runs past the canvas, for every outlined source; None draws none.
+    pub overflow: Option<Overflow>,
 }
 
 impl Default for PreviewLook {
@@ -58,6 +75,7 @@ impl Default for PreviewLook {
             marks: None,
             shade: 0.0,
             guides: None,
+            overflow: None,
         }
     }
 }
@@ -89,10 +107,111 @@ impl Shown<'_> {
     }
 }
 
+/// Coalesces rapid preview surface resize requests without blocking the caller thread.
+#[derive(Debug, Default)]
+pub struct PendingResize {
+    /// Packed `(width << 32) | height` (both >= 1); `0` means no pending resize.
+    packed: AtomicU64,
+    /// True while a live window resize is active so `preview_loop` skips swapchain reconfigures.
+    live_resizing: AtomicBool,
+}
+
+/// Previews now being live-resized, and when that last changed (ns): so Stats can tell a burst of
+/// missed frames from a window or divider drag (`live_resize_recent`).
+static LIVE_RESIZERS: AtomicU32 = AtomicU32::new(0);
+static LIVE_RESIZE_CHANGED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// A drag that ended this recently (ns) still counts: the surface is re-made when it ends.
+const LIVE_RESIZE_GRACE_NS: u64 = 2_000_000_000;
+/// A drag that never says it ended (its preview went away) is believed this long (ns) at most.
+const LIVE_RESIZE_MAX_NS: u64 = 60_000_000_000;
+
+fn note_live_resize(active: bool) {
+    if active {
+        LIVE_RESIZERS.fetch_add(1, Ordering::AcqRel);
+    } else {
+        let _ = LIVE_RESIZERS.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+    LIVE_RESIZE_CHANGED_NS.store(crate::engine::now_ns(), Ordering::Release);
+}
+
+/// Whether a window or divider was being resized at `now_ns`, or stopped a moment ago.
+pub fn live_resize_recent(now_ns: u64) -> bool {
+    let since = now_ns.saturating_sub(LIVE_RESIZE_CHANGED_NS.load(Ordering::Acquire));
+    (LIVE_RESIZERS.load(Ordering::Acquire) > 0 && since < LIVE_RESIZE_MAX_NS)
+        || (LIVE_RESIZE_CHANGED_NS.load(Ordering::Acquire) != 0 && since < LIVE_RESIZE_GRACE_NS)
+}
+
+impl Drop for PendingResize {
+    fn drop(&mut self) {
+        // A preview that goes away mid-drag never says the drag ended.
+        if self.live_resizing.load(Ordering::Acquire) {
+            note_live_resize(false);
+        }
+    }
+}
+
+impl PendingResize {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn pack(width: u32, height: u32) -> u64 {
+        (u64::from(width.max(1)) << 32) | u64::from(height.max(1))
+    }
+
+    fn unpack(raw: u64) -> Option<(u32, u32)> {
+        if raw == 0 {
+            return None;
+        }
+        Some((((raw >> 32) as u32).max(1), (raw as u32).max(1)))
+    }
+
+    /// Queues the latest target dimensions in device pixels, overwriting any unconsumed request.
+    pub fn request(&self, width: u32, height: u32) {
+        self.packed.store(Self::pack(width, height), Ordering::Release);
+    }
+
+    /// Marks whether an OS live-resize drag is active.
+    pub fn set_live_resizing(&self, active: bool) {
+        if self.live_resizing.swap(active, Ordering::AcqRel) != active {
+            note_live_resize(active);
+        }
+    }
+
+    /// Whether an OS live-resize drag is active.
+    pub fn is_live_resizing(&self) -> bool {
+        self.live_resizing.load(Ordering::Acquire)
+    }
+
+    /// Returns and clears the latest queued dimensions if no live resize is active.
+    pub fn take_if_ready(&self) -> Option<(u32, u32)> {
+        self.take_after(|| {})
+    }
+
+    /// `take_if_ready`, with `between` run after the live check and before the swap (where a
+    /// drag on another thread can begin; a test makes it do so).
+    fn take_after(&self, between: impl FnOnce()) -> Option<(u32, u32)> {
+        if self.is_live_resizing() {
+            return None;
+        }
+        between();
+        let raw = self.packed.swap(0, Ordering::AcqRel);
+        // A drag may have begun between the check and the swap, and its first size with it:
+        // that size stays queued until the drag settles (a newer one, if any, wins).
+        if raw != 0 && self.is_live_resizing() {
+            let _ = self.packed.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        }
+        Self::unpack(raw)
+    }
+}
+
 /// A window surface the preview is presented to.
 pub struct PreviewSurface {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    pending: Arc<PendingResize>,
 }
 
 impl std::fmt::Debug for PreviewSurface {
@@ -104,6 +223,16 @@ impl std::fmt::Debug for PreviewSurface {
 impl PreviewSurface {
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Handle for queuing async surface resizes off the render thread.
+    pub fn pending_resize(&self) -> Arc<PendingResize> {
+        self.pending.clone()
+    }
+
+    /// Queues a resize without blocking on GPU submission or surface locks.
+    pub fn request_resize(&self, width: u32, height: u32) {
+        self.pending.request(width, height);
     }
 }
 
@@ -166,7 +295,7 @@ impl Compositor {
     }
 
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-    fn surface_from(
+    pub(crate) fn surface_from(
         &self,
         surface: wgpu::Surface<'static>,
         width: u32,
@@ -181,11 +310,12 @@ impl Compositor {
             .find(|f| !f.is_srgb())
             .or_else(|| caps.formats.first().copied())
             .ok_or_else(|| AvError::NoGpu("the preview's surface takes no format this card draws".into()))?;
+        let (w, h) = self.clamped_surface_size(width, height);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: width.max(1),
-            height: height.max(1),
+            width: w,
+            height: h,
             // Never waits for the screen: the engine's frame loop draws it and mustn't stall.
             present_mode: wgpu::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
@@ -194,42 +324,77 @@ impl Compositor {
             color_space: Default::default(),
         };
         self.configure(&surface, &config);
-        Ok(PreviewSurface { surface, config })
+        Ok(PreviewSurface { surface, config, pending: Arc::new(PendingResize::new()) })
+    }
+
+    fn clamped_surface_size(&self, width: u32, height: u32) -> (u32, u32) {
+        let max_dim = self.device.limits().max_texture_dimension_2d.max(1);
+        (width.clamp(1, max_dim), height.clamp(1, max_dim))
     }
 
     /// The view changed size (device pixels).
     pub fn resize_preview(&self, s: &mut PreviewSurface, width: u32, height: u32) {
-        let (w, h) = (width.max(1), height.max(1));
+        let _ = s.pending.packed.swap(0, Ordering::AcqRel);
+        let (w, h) = self.clamped_surface_size(width, height);
         if (s.config.width, s.config.height) != (w, h) {
             (s.config.width, s.config.height) = (w, h);
             self.configure(&s.surface, &s.config);
         }
     }
 
+    /// Applies any queued surface resize when no live resize is active.
+    /// Returns `true` if the surface dimensions changed and `configure` ran.
+    pub fn apply_pending_resize(&self, s: &mut PreviewSurface) -> bool {
+        let Some((width, height)) = s.pending.take_if_ready() else {
+            return false;
+        };
+        let (w, h) = self.clamped_surface_size(width, height);
+        if (s.config.width, s.config.height) != (w, h) {
+            (s.config.width, s.config.height) = (w, h);
+            self.configure(&s.surface, &s.config);
+            return true;
+        }
+        false
+    }
+
     /// Draws `shown` and presents it in the surface. A frame the window can't take now (hidden,
     /// being resized) is skipped.
     pub fn present(&self, s: &mut PreviewSurface, shown: Shown<'_>, look: &PreviewLook) -> Result<(), AvError> {
-        let frame = match s.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                self.configure(&s.surface, &s.config);
-                f
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.configure(&s.surface, &s.config);
-                return Ok(());
-            }
-            _ => return Ok(()),
+        let got = s.surface.get_current_texture();
+        let Some(frame) = self.finish_surface_acquire(s, got) else {
+            return Ok(());
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
         let canvas = self.canvas_of(&mut enc, shown)?;
         self.paint(&mut enc, &view, s.config.format, (s.config.width, s.config.height), &canvas, look);
         self.submit([enc.finish()]);
-        self.queue.present(frame);
+        self.present_surface(frame);
         // What finished drawing is let go now (Direct3D and Vulkan hold it until asked).
         let _ = self.device.poll(wgpu::PollType::Poll);
         Ok(())
+    }
+
+    fn finish_surface_acquire(
+        &self,
+        s: &mut PreviewSurface,
+        got: wgpu::CurrentSurfaceTexture,
+    ) -> Option<wgpu::SurfaceTexture> {
+        match got {
+            wgpu::CurrentSurfaceTexture::Success(f) => Some(f),
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                // Drop the acquired swapchain texture before reconfiguring; configuring while it is
+                // still alive raises `PreviousOutputExists` and leaves the surface unconfigured.
+                drop(f);
+                self.configure(&s.surface, &s.config);
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.configure(&s.surface, &s.config);
+                None
+            }
+            _ => None,
+        }
     }
 
     /// The same, read back: RGBA rows of a `width`×`height` view.
@@ -502,11 +667,13 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
     let (vw, vh) = (size.0.max(1) as f32, size.1.max(1) as f32);
     let clip = |x: f32, y: f32| [x / vw * 2.0 - 1.0, 1.0 - y / vh * 2.0];
     let mut v: Vec<Vertex> = Vec::new();
-    let mut quad = |p: [(f32, f32); 4], uv: [(f32, f32); 4], color: [f32; 4], picture: bool| {
+    // `mode`: 0 a colour, 1 the canvas picture, 2 a colour only outside the canvas, and
+    // 3 + the period: stripes of the colour only outside the canvas (see preview.wgsl).
+    let mut quad = |p: [(f32, f32); 4], uv: [(f32, f32); 4], color: [f32; 4], mode: f32| {
         for i in [0, 1, 2, 0, 2, 3] {
             let [x, y] = clip(p[i].0, p[i].1);
             let [r, g, b, a] = color;
-            v.push([x, y, uv[i].0, uv[i].1, r, g, b, a, if picture { 1.0 } else { 0.0 }]);
+            v.push([x, y, uv[i].0, uv[i].1, r, g, b, a, mode]);
         }
     };
     let none = [(0.0, 0.0); 4];
@@ -515,10 +682,25 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
         [(ax, ay), (ax + aw, ay), (ax + aw, ay + ah), (ax, ay + ah)],
         [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
         [0.0; 4],
-        true,
+        1.0,
     );
     let scale = aw / canvas.0.max(1) as f32;
     let place = |(x, y): (f32, f32)| (ax + x * scale, ay + y * scale);
+    // What runs past the canvas, under the outlines: only boxes that leave it get a layer, and
+    // the shader keeps it to the part outside (each corner says where it is on the canvas).
+    if let Some(o) = look.overflow {
+        let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
+        for out in &look.outlines {
+            let leaves = out.corners.iter().any(|&(x, y)| x < 0.0 || y < 0.0 || x > cw || y > ch);
+            if !leaves {
+                continue;
+            }
+            let c = out.corners.map(place);
+            let uv = out.corners.map(|(x, y)| (x / cw, y / ch));
+            quad(c, uv, o.a, 2.0);
+            quad(c, uv, o.b, 3.0 + o.period.max(2.0));
+        }
+    }
     // Outlines (picked ones last, so they're on top), then their handles.
     let mut order: Vec<&Outline> = look.outlines.iter().filter(|o| !o.handles).collect();
     order.extend(look.outlines.iter().filter(|o| o.handles));
@@ -541,7 +723,7 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
                 ],
                 none,
                 o.color,
-                false,
+                0.0,
             );
         }
         if o.handles {
@@ -553,7 +735,7 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
                         [(x - side, y - side), (x + side, y - side), (x + side, y + side), (x - side, y + side)],
                         none,
                         o.color,
-                        false,
+                        0.0,
                     );
                 }
             }
@@ -566,22 +748,22 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
             let (a, b) = (place(from), place(to));
             let half = ppp.max(0.5) / 2.0;
             let (x0, x1, y0, y1) = (a.0.min(b.0) - half, a.0.max(b.0) + half, a.1.min(b.1) - half, a.1.max(b.1) + half);
-            quad([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], none, GUIDE, false);
+            quad([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], none, GUIDE, 0.0);
             let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
             for (r, color) in label(&format!("{n}px"), mid, ppp) {
-                quad(r, none, color, false);
+                quad(r, none, color, 0.0);
             }
         }
     }
     if look.shade > 0.0 {
         let [r, g, b] = SHADE;
-        quad([(0.0, 0.0), (vw, 0.0), (vw, vh), (0.0, vh)], none, [r, g, b, look.shade.min(1.0)], false);
+        quad([(0.0, 0.0), (vw, 0.0), (vw, vh), (0.0, vh)], none, [r, g, b, look.shade.min(1.0)], 0.0);
     }
     v
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{Item, Picture, Placement};
 
@@ -701,6 +883,74 @@ mod tests {
         assert!(glyph('?').iter().all(|b| *b == 0), "a character it can't draw is a space");
     }
 
+    fn box_at(x0: f32, x1: f32) -> Outline {
+        Outline {
+            corners: [(x0, 20.0), (x1, 20.0), (x1, 70.0), (x0, 70.0)],
+            color: [0.0, 1.0, 0.0, 1.0],
+            width: 2.0,
+            handles: false,
+        }
+    }
+
+    #[test]
+    fn stripes_are_laid_only_over_boxes_that_leave_the_canvas() {
+        let stripes = Some(Overflow { a: [0.0, 0.0, 1.0, 1.0], b: [1.0, 1.0, 0.0, 1.0], period: 18.0 });
+        let mut look = PreviewLook { margin: 10.0, overflow: stripes, ..Default::default() };
+        let picture = |l: &PreviewLook| layout((200, 100), (160, 90), l);
+        let overflow_quads = |l: &PreviewLook| picture(l).iter().filter(|v| v[8] >= 2.0).count();
+        // Inside the canvas: nothing to stripe.
+        look.outlines = vec![box_at(40.0, 120.0)];
+        assert_eq!(overflow_quads(&look), 0);
+        // Hanging off the right edge: a fill and a stripe layer, a quad (6 vertices) each.
+        look.outlines = vec![box_at(100.0, 220.0)];
+        let v = picture(&look);
+        assert_eq!(v.iter().filter(|v| v[8] == 2.0).count(), 6, "the fill under the stripes");
+        assert_eq!(v.iter().filter(|v| v[8] == 21.0).count(), 6, "the stripes, 3 + the period");
+        // The corners carry canvas positions, so the shader can tell which side of the edge.
+        assert!(v.iter().filter(|v| v[8] >= 2.0).any(|v| v[2] > 1.0), "uv past the canvas's right edge");
+        // Not asked for: as before.
+        look.overflow = None;
+        assert_eq!(overflow_quads(&look), 0);
+    }
+
+    #[test]
+    fn the_part_of_a_box_outside_the_canvas_is_striped_in_the_two_colours() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let scene = Scene {
+            width: 160,
+            height: 90,
+            items: vec![Item::picture(Picture::solid(160, 90, [255, 0, 0, 255]), Placement::default())],
+        };
+        // A box from canvas x 100 to 220: 60 of it on the canvas, the rest past its right edge.
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        let yellow = [1.0, 1.0, 0.0, 1.0];
+        let look = PreviewLook {
+            background: [0.5, 0.5, 0.5, 1.0],
+            margin: 10.0,
+            outlines: vec![box_at(100.0, 220.0)],
+            overflow: Some(Overflow { a: blue, b: yellow, period: 18.0 }),
+            ..Default::default()
+        };
+        let px = gpu.render_preview(200, 100, Shown::Scene(&scene), &look).unwrap_or_else(|e| panic!("{e}"));
+        let at = |x: usize, y: usize| [px[(y * 200 + x) * 4], px[(y * 200 + x) * 4 + 1], px[(y * 200 + x) * 4 + 2]];
+        // The canvas fills 142x80 at (29, 10): its right edge is view x 171. Inside it, under the box:
+        // still the picture.
+        assert_eq!(at(150, 50), [255, 0, 0], "the canvas shows through");
+        // Past the edge, inside the box (to view x 200, the view's edge): both stripe colours.
+        let row: Vec<[u8; 3]> = (174..200).map(|x| at(x, 50)).collect();
+        assert!(row.contains(&[0, 0, 255]), "the first colour: {row:?}");
+        assert!(row.contains(&[255, 255, 0]), "the second colour: {row:?}");
+        assert!(row.iter().all(|p| *p == [0, 0, 255] || *p == [255, 255, 0]), "nothing else: {row:?}");
+        // Past the edge but outside the box (below its bottom): the plain surround.
+        let below = at(185, 95);
+        assert!(below.iter().all(|c| (127..=128).contains(c)), "background {below:?}");
+        // Without the stripes the same place is the surround.
+        let plain = gpu
+            .render_preview(200, 100, Shown::Scene(&scene), &PreviewLook { overflow: None, ..look.clone() })
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(plain[(50 * 200 + 185) * 4..(50 * 200 + 185) * 4 + 3].iter().all(|c| (127..=128).contains(c)));
+    }
+
     #[test]
     fn the_preview_draws_guides_only_when_asked() {
         let o = Outline {
@@ -720,5 +970,199 @@ mod tests {
         look.outlines[0].handles = false;
         let plain = layout((200, 100), (160, 90), &PreviewLook { guides: None, ..look.clone() }).len();
         assert_eq!(layout((200, 100), (160, 90), &look).len(), plain);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub(crate) fn test_metal_surface(
+        gpu: &Compositor,
+        width: u32,
+        height: u32,
+    ) -> (objc2::rc::Retained<objc2::runtime::AnyObject>, PreviewSurface) {
+        use objc2::msg_send;
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyClass, AnyObject};
+        use std::ffi::c_void;
+        let Some(cls) = AnyClass::get(c"CAMetalLayer") else {
+            panic!("CAMetalLayer class missing");
+        };
+        // SAFETY: `CAMetalLayer` is an Objective-C `CALayer` subclass; `+new` returns a retained instance.
+        let layer: Retained<AnyObject> = unsafe { msg_send![cls, new] };
+        let ptr: *mut c_void = Retained::as_ptr(&layer).cast_mut().cast();
+        // SAFETY: `layer` is kept alive by the returned `Retained<AnyObject>`, which callers drop after the surface.
+        let raw = unsafe { gpu.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(ptr)) }
+            .unwrap_or_else(|e| panic!("metal surface: {e}"));
+        let surf = gpu.surface_from(raw, width, height).unwrap_or_else(|e| panic!("surface_from: {e}"));
+        (layer, surf)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oversized_preview_surface_clamps_without_validation_error() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer, mut surf) = test_metal_surface(&gpu, 100_000, 100_000);
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "initial oversized configure must clamp instead of triggering TooLarge validation error"
+        );
+        gpu.resize_preview(&mut surf, 100_000, 100_000);
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "resize_preview with oversized bounds must clamp instead of triggering validation error"
+        );
+        let scene = Scene { width: 320, height: 180, items: Vec::new() };
+        gpu.resize_preview(&mut surf, 320, 180);
+        let _ = gpu.present(&mut surf, Shown::Scene(&scene), &PreviewLook::default());
+        assert_eq!(gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(surf);
+        drop(layer);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn suboptimal_surface_reconfigures_cleanly_without_previous_output_exists() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer, mut surf) = test_metal_surface(&gpu, 320, 180);
+        let wgpu::CurrentSurfaceTexture::Success(frame) = surf.surface.get_current_texture() else {
+            return;
+        };
+        if let Some(left) = gpu.finish_surface_acquire(&mut surf, wgpu::CurrentSurfaceTexture::Suboptimal(frame)) {
+            gpu.present_surface(left);
+        }
+        let scene = Scene { width: 320, height: 180, items: Vec::new() };
+        let _ = gpu.present(&mut surf, Shown::Scene(&scene), &PreviewLook::default());
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Suboptimal surface must drop the acquired texture before reconfiguring so NotConfigured never follows"
+        );
+        drop(surf);
+        drop(layer);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_present_and_resize_surfaces_emit_zero_validation_errors() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer_a, mut surf_a) = test_metal_surface(&gpu, 320, 180);
+        let (layer_b, mut surf_b) = test_metal_surface(&gpu, 320, 180);
+        std::thread::scope(|s| {
+            let gpu_b = &gpu;
+            s.spawn(move || {
+                for i in 0..30u32 {
+                    let w = 300 + (i % 10) * 8;
+                    gpu_b.resize_preview(&mut surf_b, w, 180);
+                }
+                drop(surf_b);
+            });
+            let scene = Scene { width: 320, height: 180, items: Vec::new() };
+            for _ in 0..30 {
+                let _ = gpu.present(&mut surf_a, Shown::Scene(&scene), &PreviewLook::default());
+            }
+            drop(surf_a);
+        });
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "concurrent present_surface and configure must not trigger GpuWaitTimeout"
+        );
+        drop(layer_b);
+        drop(layer_a);
+    }
+
+    #[test]
+    fn a_live_resize_is_noticed_while_it_lasts_and_for_a_moment_after() {
+        // The counters are the process's: run alone (nextest does).
+        let start = crate::engine::now_ns();
+        assert!(!live_resize_recent(start + 3_000_000_000), "nothing resized yet");
+        let a = PendingResize::new();
+        a.set_live_resizing(true);
+        a.set_live_resizing(true); // the same state again counts once
+        let t = crate::engine::now_ns();
+        assert!(live_resize_recent(t));
+        assert!(live_resize_recent(t + 30_000_000_000), "still dragging half a minute on");
+        a.set_live_resizing(false);
+        let ended = crate::engine::now_ns();
+        assert!(live_resize_recent(ended + 1_000_000_000), "the surface is re-made as it ends");
+        assert!(!live_resize_recent(ended + 3_000_000_000));
+        // A preview that goes away mid-drag lets it go.
+        let b = PendingResize::new();
+        b.set_live_resizing(true);
+        drop(b);
+        assert!(!live_resize_recent(crate::engine::now_ns() + 3_000_000_000));
+    }
+
+    #[test]
+    fn pending_resize_coalesces_100_writes_and_gates_on_live_resize() {
+        let pending = PendingResize::new();
+        assert_eq!(pending.take_if_ready(), None);
+
+        pending.set_live_resizing(true);
+        for i in 1..=100u32 {
+            pending.request(640 + i, 360 + i);
+        }
+        assert_eq!(pending.take_if_ready(), None, "must not consume while live resizing");
+
+        pending.set_live_resizing(false);
+        assert_eq!(pending.take_if_ready(), Some((740, 460)));
+        assert_eq!(pending.take_if_ready(), None, "consumed once");
+    }
+
+    #[test]
+    fn a_drag_that_begins_while_a_size_is_taken_keeps_its_size_queued() {
+        let pending = PendingResize::new();
+        pending.request(500, 300);
+        // The drag starts (and queues its first size) after the check, before the swap.
+        let taken = pending.take_after(|| {
+            pending.set_live_resizing(true);
+            pending.request(510, 310);
+        });
+        assert_eq!(taken, None, "no reconfigure mid-drag");
+        assert_eq!(pending.take_if_ready(), None, "still held while the drag lasts");
+        pending.set_live_resizing(false);
+        assert_eq!(pending.take_if_ready(), Some((510, 310)), "the drag's size, once it settles");
+    }
+
+    #[test]
+    fn pending_resize_clamps_zero_dimensions_without_dropping_sentinel() {
+        let pending = PendingResize::new();
+        pending.request(0, 0);
+        assert_eq!(pending.take_if_ready(), Some((1, 1)));
+        assert_eq!(pending.take_if_ready(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_resize_coalesces_100_writes_into_one_metal_reconfigure() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer, mut surf) = test_metal_surface(&gpu, 320, 180);
+        let pending = surf.pending_resize();
+        pending.set_live_resizing(true);
+        for i in 0..100u32 {
+            pending.request(400 + i, 220 + i);
+        }
+        assert!(!gpu.apply_pending_resize(&mut surf), "must defer reconfigure while live resizing");
+        assert_eq!(surf.size(), (320, 180));
+
+        pending.set_live_resizing(false);
+        assert!(gpu.apply_pending_resize(&mut surf), "single reconfigure on end");
+        assert_eq!(surf.size(), (499, 319));
+        assert!(!gpu.apply_pending_resize(&mut surf), "no redundant second reconfigure");
+        assert_eq!(gpu.uncaptured_errors.load(Ordering::Relaxed), 0);
+        drop(surf);
+        drop(layer);
+    }
+
+    #[test]
+    fn wgpu_validation_error_collapses_to_single_diagnostic_line() {
+        let err = wgpu::Error::Validation {
+            source: Box::new(std::io::Error::other("surface not configured")),
+            description: "Validation Error\n\nCaused by:\n  Surface is not configured for presentation\n".into(),
+        };
+        let line = crate::compose::format_wgpu_error(&err);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains("Caused by: Surface is not configured"), "{line:?}");
     }
 }

@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use reqwest::Method;
@@ -37,6 +38,12 @@ pub struct KickApi {
     tokens: Mutex<KickTokens>,
     refresher: Refresher,
     on_tokens: OnTokens,
+    /// The newest tokens couldn't be saved: tried again at every use (the saved refresh token
+    /// is the one already spent).
+    unsaved: AtomicBool,
+    /// When saving was last retried while `unsaved`: not again for a while, so a locked Keychain isn't
+    /// asked, under the token lock, at every call.
+    last_save_try: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl fmt::Debug for KickApi {
@@ -60,13 +67,23 @@ impl KickApi {
             .user_agent(concat!("Ferrocast/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
-        KickApi { http, base: base.trim_end_matches('/').to_string(), tokens: Mutex::new(tokens), refresher, on_tokens }
+        KickApi {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+            tokens: Mutex::new(tokens),
+            refresher,
+            on_tokens,
+            unsaved: AtomicBool::new(false),
+            last_save_try: std::sync::Mutex::new(None),
+        }
     }
 
     async fn access(&self) -> Result<String, KickError> {
         let mut t = self.tokens.lock().await;
         if t.needs_refresh(now_ms()) {
             *t = self.refresh_locked(&t).await?;
+        } else {
+            self.save_again(&t);
         }
         Ok(t.access_token.clone())
     }
@@ -74,6 +91,7 @@ impl KickApi {
     async fn refresh_after_401(&self, seen: &str) -> Result<String, KickError> {
         let mut t = self.tokens.lock().await;
         if t.access_token != seen {
+            self.save_again(&t);
             return Ok(t.access_token.clone());
         }
         *t = self.refresh_locked(&t).await?;
@@ -82,8 +100,32 @@ impl KickApi {
 
     async fn refresh_locked(&self, current: &KickTokens) -> Result<KickTokens, KickError> {
         let fresh = (self.refresher)(current.refresh_token.clone()).await?;
-        (self.on_tokens)(&fresh).map_err(|e| KickError::Refused(format!("couldn't save the new Kick sign-in: {e}")))?;
+        // The relay already spent the old refresh token with Kick: the new tokens are used even
+        // when saving them failed (a keychain hiccup), else the next refresh would sign out for
+        // good; saving is tried again at every use.
+        self.save(&fresh);
         Ok(fresh)
+    }
+
+    fn save(&self, t: &KickTokens) {
+        match (self.on_tokens)(t) {
+            Ok(()) => self.unsaved.store(false, Ordering::Release),
+            Err(e) => {
+                if !self.unsaved.swap(true, Ordering::AcqRel) {
+                    tracing::error!(error = %e, "couldn't save the new Kick sign-in; it's kept for this session, saving is retried");
+                }
+            }
+        }
+    }
+
+    fn save_again(&self, t: &KickTokens) {
+        if self.unsaved.load(Ordering::Acquire) {
+            let mut last = self.last_save_try.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(30)) {
+                *last = Some(std::time::Instant::now());
+                self.save(t);
+            }
+        }
     }
 
     async fn call(
@@ -247,6 +289,53 @@ impl KickApi {
     }
 }
 
+/// Unverified against a live Kick API call: Kick Public API v1 `/public/v1/channels` is
+/// documented to expose `data[0].stream.{is_live, viewer_count}` and `/public/v1/livestreams`
+/// to expose `data[0].viewer_count`; confirm against an active Kick broadcast in QA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickChannelViewers {
+    Offline,
+    Live(u64),
+    LiveMissingCount,
+}
+
+fn parse_u64_lenient(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parses `GET /public/v1/channels` for live status and `stream.viewer_count`.
+pub fn parse_channel_viewers(v: &Value) -> KickChannelViewers {
+    let Some(stream) = v.pointer("/data/0/stream") else {
+        return KickChannelViewers::Offline;
+    };
+    if stream.get("is_live").and_then(Value::as_bool) != Some(true) {
+        return KickChannelViewers::Offline;
+    }
+    match parse_u64_lenient(stream.get("viewer_count")) {
+        Some(count) => KickChannelViewers::Live(count),
+        None => KickChannelViewers::LiveMissingCount,
+    }
+}
+
+/// Parses `GET /public/v1/livestreams` for `viewer_count`.
+pub fn parse_livestream_viewers(v: &Value, broadcaster_id: Option<&str>) -> Option<u64> {
+    let items = v.get("data").and_then(Value::as_array)?;
+    let entry = if let Some(bid) = broadcaster_id {
+        items.iter().find(|item| match item.get("broadcaster_user_id") {
+            Some(Value::Number(n)) => n.to_string() == bid,
+            Some(Value::String(s)) => s == bid,
+            _ => false,
+        })
+    } else {
+        items.first()
+    }?;
+    parse_u64_lenient(entry.get("viewer_count"))
+}
+
 impl KickApi {
     /// Go live everywhere: `GET /public/v1/channels` for the signed-in channel's stream URL and
     /// key. Kick leaves the key out without `streamkey:read`, so an older sign-in is told to
@@ -269,7 +358,32 @@ impl KickApi {
         let url = field("url")
             .filter(|u| u.starts_with("rtmps://") || u.starts_with("rtmp://"))
             .ok_or_else(|| KickError::Refused("Kick didn't give out the stream address".into()))?;
-        Ok(ferrocast_connector::Ingest { url: with_app(&url), key })
+        Ok(ferrocast_connector::Ingest { url: with_app(&url), key, backup: None, note: None })
+    }
+
+    /// Concurrent viewer count for the signed-in Kick channel when live.
+    /// Reads `/public/v1/channels` first and falls back to `/public/v1/livestreams` if
+    /// `is_live` is true without a `viewer_count` field on the channel stream object.
+    pub async fn stream_viewers(&self, broadcaster_id: &str) -> Result<Option<u64>, KickError> {
+        let v = match self.call(Method::GET, "/public/v1/channels", &[], None).await {
+            Err(KickError::Forbidden(_)) => return Err(KickError::MissingScope("channel:read".into())),
+            other => other?,
+        };
+        match parse_channel_viewers(&v) {
+            KickChannelViewers::Offline => Ok(None),
+            KickChannelViewers::Live(count) => Ok(Some(count)),
+            KickChannelViewers::LiveMissingCount => {
+                let id = numeric(broadcaster_id)?.to_string();
+                let lv = match self
+                    .call(Method::GET, "/public/v1/livestreams", &[("broadcaster_user_id", id.as_str())], None)
+                    .await
+                {
+                    Err(KickError::Forbidden(_)) => return Err(KickError::MissingScope("channel:read".into())),
+                    other => other?,
+                };
+                Ok(parse_livestream_viewers(&lv, Some(id.as_str())))
+            }
+        }
     }
 }
 

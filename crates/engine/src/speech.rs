@@ -31,6 +31,9 @@ pub use cloud::{
 /// The longest a synthesis may take before we give up and the overlay falls back to the
 /// browser's own voice.
 const SYNTH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard byte and duration bounds for locally synthesized WAV files.
+const MAX_WAV_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_WAV_DURATION_MS: u64 = 45_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Voice {
@@ -107,21 +110,200 @@ pub async fn voices() -> Vec<Voice> {
     }
 }
 
-/// Speaks `text` into a WAV file at `out`.
+/// Lines waiting for the voice, at most; one more is let go (the overlay reads it with the
+/// browser's voice). A raid or a gift-sub bomb would else start a speech process per alert.
+const MAX_QUEUED: usize = 16;
+
+/// One line is spoken at a time: each is a `say` or a PowerShell with the .NET runtime (60-100 MB
+/// and a core on Windows). The app has one [`Line`]; a test can make its own, so a flood of lines
+/// in one test never fills the line another is waiting in.
+#[derive(Debug)]
+pub struct Line {
+    gate: tokio::sync::Semaphore,
+    /// Lines in the line, the one being spoken included.
+    line: std::sync::atomic::AtomicUsize,
+}
+
+impl Line {
+    pub const fn new() -> Self {
+        Self { gate: tokio::sync::Semaphore::const_new(1), line: std::sync::atomic::AtomicUsize::new(0) }
+    }
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The app's line of text waiting for the voice.
+static VOICE: Line = Line::new();
+
+/// How many lines are being spoken at once and the most there were (tests count their own: a
+/// process-wide counter picked up other tests' calls and cancelled futures).
+#[derive(Debug, Default)]
+pub struct Gauge {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl Gauge {
+    /// The most lines spoken at the same moment so far.
+    pub fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Counts one line in a [`Gauge`] for as long as it lives (also when its future is dropped).
+struct Counted<'a>(Option<&'a Gauge>);
+
+impl<'a> Counted<'a> {
+    fn new(gauge: Option<&'a Gauge>) -> Self {
+        if let Some(g) = gauge {
+            let now = g.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            g.peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self(gauge)
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        if let Some(g) = self.0 {
+            g.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Takes a place in a voice's line, or says there's no room.
+struct Place<'a>(&'a Line);
+
+impl<'a> Place<'a> {
+    fn take(voice: &'a Line) -> Option<Self> {
+        let before = voice.line.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if before >= MAX_QUEUED {
+            voice.line.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return None;
+        }
+        Some(Place(voice))
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.0.line.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A name no other line's input file shares: the process, a counter and the clock (the clock
+/// alone repeats on Windows, ~15 ms granularity, and two lines deleted each other's input).
+fn input_name() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("tts-{}-{seq}-{}.txt", std::process::id(), rand_suffix())
+}
+
+/// Speaks `text` into a WAV file at `out`. One at a time, in order; with a long line of them
+/// waiting, the newest are let go (`Err`).
 pub async fn synthesize(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
+    synthesize_counted(text, voice, work, out, None).await
+}
+
+/// As [`synthesize`], counting the lines spoken at once in `gauge` (tests).
+pub async fn synthesize_counted(
+    text: &str,
+    voice: Option<&str>,
+    work: &Path,
+    out: &Path,
+    gauge: Option<&Gauge>,
+) -> Result<(), SpeechError> {
+    synthesize_in(&VOICE, text, voice, work, out, gauge).await
+}
+
+/// As [`synthesize_counted`] in a line of its own (tests).
+pub async fn synthesize_in(
+    line: &Line,
+    text: &str,
+    voice: Option<&str>,
+    work: &Path,
+    out: &Path,
+    gauge: Option<&Gauge>,
+) -> Result<(), SpeechError> {
+    let Some(_place) = Place::take(line) else {
+        return Err(SpeechError::Failed("too many lines are waiting to be read".into()));
+    };
+    let _turn = line.gate.acquire().await.map_err(|_| SpeechError::Failed("the voice is closed".into()))?;
+    let _counted = Counted::new(gauge);
+    synthesize_inner(text, voice, work, out).await
+}
+
+pub(crate) fn parse_wav_duration_ms(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut byte_rate = 0u32;
+    let mut data_bytes = 0u32;
+    let mut seen_data = false;
+    for _ in 0..64 {
+        if pos + 8 > bytes.len() {
+            break;
+        }
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]);
+        let payload_start = pos + 8;
+        let payload_end = payload_start.saturating_add(size as usize).min(bytes.len());
+        if id == b"fmt " && payload_end.saturating_sub(payload_start) >= 12 {
+            byte_rate = u32::from_le_bytes([
+                bytes[payload_start + 8],
+                bytes[payload_start + 9],
+                bytes[payload_start + 10],
+                bytes[payload_start + 11],
+            ]);
+        } else if id == b"data" {
+            data_bytes = size;
+            seen_data = true;
+            break;
+        }
+        let padded = (size as usize).saturating_add((size as usize) & 1);
+        pos = payload_start.saturating_add(padded);
+    }
+    if byte_rate == 0 || !seen_data || data_bytes == 0 {
+        return None;
+    }
+    Some(u64::from(data_bytes).saturating_mul(1_000).saturating_div(u64::from(byte_rate)))
+}
+
+async fn validate_wav_output(out: &Path) -> Result<(), SpeechError> {
+    let meta = tokio::fs::metadata(out).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
+    if meta.len() > MAX_WAV_BYTES {
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(SpeechError::Failed("the voice output exceeded the size limit".into()));
+    }
+    let bytes = tokio::fs::read(out).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
+    let Some(duration_ms) = parse_wav_duration_ms(&bytes) else {
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(SpeechError::Failed("the voice didn't produce a WAV file".into()));
+    };
+    if duration_ms > MAX_WAV_DURATION_MS {
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(SpeechError::Failed("the voice output exceeded the duration limit".into()));
+    }
+    Ok(())
+}
+
+async fn synthesize_inner(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
+    let safe = ferrocast_core::tts::sanitize_synth_text(text);
+    if safe.is_empty() {
+        return Err(SpeechError::Failed("nothing to speak".into()));
+    }
     tokio::fs::create_dir_all(work).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
-    let input: PathBuf =
-        work.join(format!("tts-{}.txt", std::process::id() as u64 * 1_000_000 + u64::from(rand_suffix())));
-    tokio::fs::write(&input, text.as_bytes()).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
+    let input: PathBuf = work.join(input_name());
+    tokio::fs::write(&input, safe.as_bytes()).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
     let result = run(&input, voice.and_then(safe_voice), out).await;
     let _ = tokio::fs::remove_file(&input).await;
     result?;
-    let head = tokio::fs::read(out).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
-    if !(head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WAVE")) {
-        let _ = tokio::fs::remove_file(out).await;
-        return Err(SpeechError::Failed("the voice didn't produce a WAV file".into()));
-    }
-    Ok(())
+    validate_wav_output(out).await
 }
 
 fn rand_suffix() -> u32 {
@@ -202,5 +384,122 @@ mod tests {
         assert!(bytes.starts_with(b"RIFF") && bytes.len() > 1_000);
         assert!(!std::path::Path::new("/tmp/pwned").exists());
         assert!(!voices().await.is_empty());
+    }
+
+    #[test]
+    fn input_names_never_repeat_even_across_threads() {
+        let all: Vec<String> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..2_000).map(|_| input_name()).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len());
+    }
+
+    /// A raid's worth of lines at once: one voice at a time, a long line of them let go (review
+    /// GAPS #11).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_alert_flood_speaks_one_at_a_time_and_lets_a_long_line_go() {
+        let dir = tempfile::tempdir().unwrap();
+        // The old behaviour (no gate, every line at once): several voices at the same time.
+        let ungated_gauge = std::sync::Arc::new(Gauge::default());
+        let ungated: Vec<_> = (0..6)
+            .map(|i| {
+                let (work, out) = (dir.path().to_path_buf(), dir.path().join(format!("old{i}.wav")));
+                let gauge = ungated_gauge.clone();
+                tokio::spawn(async move {
+                    let _counted = Counted::new(Some(&gauge));
+                    synthesize_inner("hi", None, &work, &out).await
+                })
+            })
+            .collect();
+        for t in ungated {
+            t.await.unwrap().unwrap();
+        }
+        assert!(ungated_gauge.peak() > 1, "without the gate, voices overlap");
+        let gauge = std::sync::Arc::new(Gauge::default());
+        // This test's own line: its flood never fills the global one other tests wait in.
+        let own = std::sync::Arc::new(Line::new());
+        let work = dir.path().to_path_buf();
+        let tasks: Vec<_> = (0..40)
+            .map(|i| {
+                let (work, out) = (work.clone(), dir.path().join(format!("{i}.wav")));
+                let gauge = gauge.clone();
+                let own = own.clone();
+                tokio::spawn(async move { synthesize_in(&own, "hi", None, &work, &out, Some(&gauge)).await })
+            })
+            .collect();
+        let mut done = 0;
+        let mut dropped = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(()) => done += 1,
+                Err(e) if e.to_string().contains("too many") => dropped += 1,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(gauge.peak(), 1, "never two voices at once");
+        assert!(dropped > 0 && done >= 1 && done + dropped == 40, "done {done}, dropped {dropped}");
+        assert!(done <= MAX_QUEUED + 1);
+        // No input file is left behind.
+        let left = std::fs::read_dir(&work)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "txt"))
+            .count();
+        assert_eq!(left, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn embedded_say_commands_do_not_extend_wav_duration_or_bypass_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("slnc.wav");
+        synthesize("[[slnc 5000]] hi", None, dir.path(), &out).await.unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let ms = cloud::wav_duration_ms(&bytes);
+        assert!(ms > 0 && ms < 2_500, "[[slnc 5000]] must be neutralised, got {ms} ms");
+
+        let out_phon = dir.path().join("phon.wav");
+        synthesize("[[inpt PHON]] [[slnc 99999]] [[inpt TEXT]] ok", None, dir.path(), &out_phon).await.unwrap();
+        let phon_bytes = std::fs::read(&out_phon).unwrap();
+        let phon_ms = cloud::wav_duration_ms(&phon_bytes);
+        assert!(phon_ms > 0 && phon_ms < 10_000, "[[slnc 99999]] must be neutralised, got {phon_ms} ms");
+    }
+
+    #[tokio::test]
+    async fn validate_wav_output_enforces_size_and_duration_caps() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Synthetic WAV header claiming ~98 s at 44,100 bytes/s (under MAX_WAV_BYTES).
+        let over_dur = dir.path().join("long.wav");
+        let mut hdr = Vec::with_capacity(44);
+        hdr.extend_from_slice(b"RIFF");
+        hdr.extend_from_slice(&(44u32 + 4_321_800).to_le_bytes());
+        hdr.extend_from_slice(b"WAVE");
+        hdr.extend_from_slice(b"fmt ");
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        hdr.extend_from_slice(&1u16.to_le_bytes()); // mono
+        hdr.extend_from_slice(&22_050u32.to_le_bytes());
+        hdr.extend_from_slice(&44_100u32.to_le_bytes());
+        hdr.extend_from_slice(&2u16.to_le_bytes());
+        hdr.extend_from_slice(&16u16.to_le_bytes());
+        hdr.extend_from_slice(b"data");
+        hdr.extend_from_slice(&4_321_800u32.to_le_bytes());
+        std::fs::write(&over_dur, &hdr).unwrap();
+        let err = validate_wav_output(&over_dur).await.unwrap_err();
+        assert!(err.to_string().contains("duration limit"), "{err}");
+        assert!(!over_dur.exists());
+
+        // Oversized output (> MAX_WAV_BYTES) is rejected and deleted.
+        let over_size = dir.path().join("big.wav");
+        std::fs::write(&over_size, vec![0u8; usize::try_from(MAX_WAV_BYTES).unwrap() + 1]).unwrap();
+        let err = validate_wav_output(&over_size).await.unwrap_err();
+        assert!(err.to_string().contains("size limit"), "{err}");
+        assert!(!over_size.exists());
     }
 }

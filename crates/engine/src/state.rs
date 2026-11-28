@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 
 use ferrocast_core::alert::AlertRule;
 use ferrocast_core::command::{Command, Timer};
+use ferrocast_core::credits::Credits;
 use ferrocast_core::event::{ConnectorStatus, Event, EventKind, Millis, Platform};
 use ferrocast_core::filter::FilterConfig;
 use ferrocast_core::goal::Goal;
@@ -25,7 +26,8 @@ pub struct EngineSettings {
     pub bot_enabled: bool,
     /// Ban accounts on the shared ban list automatically when they chat.
     pub auto_ban_on_sight: bool,
-    /// The dashboard's look: "system", "dark" or "light".
+    /// The dashboard's look: "system", one of the ten themes, or the older "dark" and "light"
+    /// (aliases of Slate and Daylight).
     pub theme: String,
     /// "system", "on" or "off".
     pub reduced_motion: String,
@@ -33,6 +35,8 @@ pub struct EngineSettings {
     pub low_motion_overlays: bool,
     /// Let phones and tablets on this network open the dashboard (applies on next start).
     pub lan_access: bool,
+    /// Let local API keys work from other devices on the network (off: this PC only).
+    pub api_keys_over_lan: bool,
     /// Never install an update while any platform is live (R-60).
     pub never_update_while_live: bool,
     pub launch_at_login: bool,
@@ -42,6 +46,13 @@ pub struct EngineSettings {
     /// The streamer's main currency (ISO 4217), e.g. for the TTS minimum. Defaults from the
     /// computer's region.
     pub currency: String,
+    /// Who can watch a YouTube broadcast Ferrocast makes (main and vertical): `public`,
+    /// `unlisted` or `private`. Public unless chosen, as before.
+    pub youtube_privacy: String,
+    /// Send a redacted crash report to Ferrocast's relay after a crash: `ask` (the person
+    /// is asked each time), `always` or `never`. Never changes by a pack, an API key or a phone
+    /// to `always` (docs/API.md).
+    pub crash_reports: String,
 }
 
 impl Default for EngineSettings {
@@ -55,11 +66,14 @@ impl Default for EngineSettings {
             reduced_motion: "system".into(),
             low_motion_overlays: false,
             lan_access: false,
+            api_keys_over_lan: false,
             never_update_while_live: true,
             launch_at_login: false,
             close_to_tray: true,
             language: "en".into(),
             currency: currency_for_locale(sys_locale::get_locale().as_deref().unwrap_or("")).into(),
+            youtube_privacy: "public".into(),
+            crash_reports: "ask".into(),
         }
     }
 }
@@ -118,8 +132,28 @@ impl EngineSettings {
         let one_of = |field: &str, v: &str, ok: &[&str]| {
             if ok.contains(&v) { Ok(()) } else { Err(format!("{field}: use one of {}.", ok.join(", "))) }
         };
-        one_of("theme", &self.theme, &["system", "dark", "light"])?;
+        one_of(
+            "theme",
+            &self.theme,
+            &[
+                "system",
+                "dark",
+                "light",
+                "graphite",
+                "slate",
+                "moonlight",
+                "forest",
+                "ember",
+                "obsidian",
+                "daylight",
+                "mist",
+                "linen",
+                "contrast",
+            ],
+        )?;
         one_of("reduced_motion", &self.reduced_motion, &["system", "on", "off"])?;
+        one_of("youtube_privacy", &self.youtube_privacy, &["public", "unlisted", "private"])?;
+        one_of("crash_reports", &self.crash_reports, &["ask", "always", "never"])?;
         if self.currency.len() != 3 || !self.currency.bytes().all(|b| b.is_ascii_uppercase()) {
             return Err("currency: a three-letter code like INR or USD.".into());
         }
@@ -171,6 +205,8 @@ pub struct ConnectorView {
 pub struct AccountView {
     pub name: String,
     pub avatar_url: Option<String>,
+    pub login: String,
+    pub url: Option<String>,
 }
 
 impl ConnectorView {
@@ -184,8 +220,9 @@ impl ConnectorView {
             ConnectorStatus::Reconnecting { attempt } => ("reconnecting", Some(format!("Attempt {attempt}"))),
             ConnectorStatus::Disconnected { reason } => ("disconnected", Some(reason.clone())),
             ConnectorStatus::SignInNeeded => ("sign_in_needed", Some("Sign in again to keep events coming.".into())),
-            ConnectorStatus::ScopesMissing { scopes } => {
-                ("scopes_missing", Some(format!("Needs permission: {}", scopes.join(", "))))
+            ConnectorStatus::ScopesMissing { .. } => {
+                // The scope names are the platform's own words; the streamer needs the fix, not them.
+                ("scopes_missing", Some("Needs more permission: reconnect it in Settings, Accounts.".into()))
             }
         };
         self.state = state.into();
@@ -238,11 +275,15 @@ pub struct Session {
     /// Payments already taken off `tips` (a refund and a dispute can both arrive).
     #[serde(skip)]
     pub reversed: std::collections::HashSet<String>,
+    /// End-credits participants (followers, subs, gifters, tippers/bits, raiders, mods).
+    #[serde(default)]
+    pub credits: Credits,
 }
 
 impl Session {
-    /// Updates counts from a live event.
-    pub fn record(&mut self, event: &Event) {
+    /// Updates counts from a live event. Returns `true` when end-credits data changed.
+    pub fn record(&mut self, event: &Event) -> bool {
+        let credits_changed = self.credits.record(event);
         match &event.kind {
             EventKind::Follow { actor } => {
                 self.follows += 1;
@@ -280,6 +321,7 @@ impl Session {
             }
             _ => {}
         }
+        credits_changed
     }
 
     /// Text for a label widget source (API.md widget `label`).

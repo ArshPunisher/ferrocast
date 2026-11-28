@@ -5,6 +5,7 @@ use ferrocast_core::money::{Money, PlatformValue, ValueUnit, exponent};
 
 use crate::proto::live_chat_message_snippet::DisplayedContent;
 use crate::proto::live_chat_message_snippet::type_wrapper::Type;
+use crate::proto::live_chat_poll_details::poll_status_wrapper::PollStatus;
 use crate::proto::{LiveChatMessage, LiveChatMessageAuthorDetails};
 
 fn author(a: Option<&LiveChatMessageAuthorDetails>) -> Actor {
@@ -130,11 +131,21 @@ pub fn map(m: &LiveChatMessage, at: Millis) -> Option<Event> {
         // A tombstone replaces a deleted message under the same id.
         (Type::Tombstone, _) => EventKind::MessageDeleted { message_id: id.clone()? },
         (Type::ChatEndedEvent, _) => EventKind::StreamOffline,
+        (Type::PollEvent, Some(DisplayedContent::PollDetails(d))) => {
+            let poll_id = id.clone()?;
+            let counts = d
+                .metadata
+                .as_ref()
+                .map(|meta| meta.options.iter().map(|opt| u64::try_from(opt.tally().max(0)).unwrap_or(0)).collect())
+                .unwrap_or_default();
+            let ended = d.status() == PollStatus::Closed;
+            EventKind::NativePoll { poll_id, counts, ended }
+        }
         _ => return None,
     };
-    // Tombstones and chat-end notices reuse ids of earlier messages; give them their own key.
+    // Tombstones, chat-end notices, and poll updates reuse or share ids across snapshots.
     let source = match kind {
-        EventKind::MessageDeleted { .. } | EventKind::StreamOffline => {
+        EventKind::MessageDeleted { .. } | EventKind::StreamOffline | EventKind::NativePoll { .. } => {
             id.map(|i| format!("{i}#{}", snippet.r#type().as_str_name()))
         }
         _ => id,

@@ -123,7 +123,8 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
         "glitch",
         "Glitch",
         r"fn noise(x: f32) -> f32 {
-    return fract(sin(x * 127.1) * 43758.547);
+    let k = x - floor(x / 251.0) * 251.0;
+    return fract(sin(k * 127.1) * 43758.547);
 }
 
 fn effect(uv: vec2<f32>) -> vec4<f32> {
@@ -151,7 +152,8 @@ fn effect(uv: vec2<f32>) -> vec4<f32> {
         "old_film",
         "Old film",
         r"fn grain(uv: vec2<f32>, t: f32) -> f32 {
-    return fract(sin(dot(uv * 997.0 + vec2<f32>(t, t * 1.7), vec2<f32>(12.9898, 78.233))) * 43758.547);
+    let tt = t - floor(t / 251.0) * 251.0;
+    return fract(sin(dot(uv * 997.0 + vec2<f32>(tt, tt * 1.7), vec2<f32>(12.9898, 78.233))) * 43758.547);
 }
 
 fn effect(uv: vec2<f32>) -> vec4<f32> {
@@ -159,7 +161,8 @@ fn effect(uv: vec2<f32>) -> vec4<f32> {
     let c = pic(uv);
     let y = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));
     let sepia = vec3<f32>(y * 1.07, y * 0.88, y * 0.68);
-    let flicker = 1.0 - 0.06 * p.x * sin(time() * 23.0);
+    let ft = time() - floor(time() / 6.2831853) * 6.2831853;
+    let flicker = 1.0 - 0.06 * p.x * sin(ft * 23.0);
     let noise = (grain(uv, floor(time() * 24.0)) - 0.5) * 0.25 * p.y;
     let rgb = mix(c.rgb, sepia, p.x) * flicker + vec3<f32>(noise);
     return vec4<f32>(rgb, c.a);

@@ -173,17 +173,7 @@ pub fn apply_scheduled_restore(dir: &Path) -> Result<Option<String>> {
 /// Renames, retrying for up to about two seconds when the OS says the file is busy: on
 /// Windows an antivirus scan or the search indexer often holds a just-written file.
 pub(crate) fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut wait = std::time::Duration::from_millis(25);
-    for _ in 0..7 {
-        match std::fs::rename(from, to) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                std::thread::sleep(wait);
-                wait *= 2;
-            }
-            other => return other,
-        }
-    }
-    std::fs::rename(from, to)
+    crate::durable::rename_patiently(from, to)
 }
 
 /// Keeps the newest [`KEEP_DAILY`] daily snapshots and the newest [`KEEP`] others, and

@@ -1,7 +1,6 @@
 //! What an overlay receives first (API.md §6 `snapshot`) and overlay CRUD for the API.
 
 use ferrocast_core::overlay::{Overlay, Preset, WidgetKind};
-use ferrocast_core::template::{Template, Vars};
 use ferrocast_store::repo;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -71,7 +70,8 @@ impl Engine {
         }
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
         let view = self.overlay_view(&saved);
-        self.push_config(&saved);
+        self.push_config(&saved).await;
+        self.push_overlay_labels_for(&saved).await;
         Ok(view)
     }
 
@@ -80,12 +80,13 @@ impl Engine {
         let mut o = self.overlay(id).await?;
         o.name = name.to_string();
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
-        self.push_config(&saved);
+        self.push_config(&saved).await;
         Ok(self.overlay_view(&saved))
     }
 
-    /// Sends an overlay's new layout to its open pages.
-    pub(crate) fn push_config(&self, o: &Overlay) {
+    /// Sends an overlay's new layout (and initial widget state for newly added interactive
+    /// widgets) to its open pages.
+    pub(crate) async fn push_config(&self, o: &Overlay) {
         self.cloud_changed();
         let view = self.overlay_view(o);
         self.send_overlay(OverlayFrame::new(
@@ -94,6 +95,29 @@ impl Engine {
             "config",
             &view_public(&view),
         ));
+        let mut patch = serde_json::Map::new();
+        if o.widgets.iter().any(|w| w.kind == WidgetKind::EndCredits) {
+            // After a restart the in-memory session is empty: send what the log rebuilds.
+            let credits = match self.credits().await {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::warn!(%err, "couldn't rebuild the credits for an overlay edit");
+                    self.state().session.credits.clone()
+                }
+            };
+            patch.insert("credits".into(), json!(credits));
+        }
+        if o.widgets.iter().any(|w| w.kind == WidgetKind::ChatHighlight) {
+            patch.insert("chat_highlight".into(), json!(self.chat_highlight()));
+        }
+        if !patch.is_empty() {
+            self.send_overlay(OverlayFrame::new(
+                Audience::Overlay(o.id.clone()),
+                self.next_seq(),
+                "state",
+                &Value::Object(patch),
+            ));
+        }
     }
 
     pub async fn regenerate_overlay_url(&self, id: &str) -> Result<OverlayView, EngineError> {
@@ -160,32 +184,28 @@ impl Engine {
         };
         let mut events = events;
         events.reverse();
-        let (goals, viewers, labels) = {
+        let (labels, label_trains) = self.overlay_labels_and_trains(o).await;
+        let (goals, viewers) = {
             let st = self.state();
             let viewers: serde_json::Map<String, Value> =
                 st.viewers.iter().map(|(p, c)| (platform_key(*p).to_string(), json!(c))).collect();
-            let labels: serde_json::Map<String, Value> = o
-                .widgets
-                .iter()
-                .filter(|w| w.kind == WidgetKind::Label)
-                .map(|w| {
-                    let source = w.config.get("source").and_then(Value::as_str).unwrap_or("");
-                    let tpl = w.config.get("template").and_then(Value::as_str).unwrap_or("{value}");
-                    let mut vars = Vars::new();
-                    vars.insert("value".into(), st.session.label(source));
-                    self.counter_vars(&mut vars); // `{count:deaths}` (Studio counters)
-                    let text = Template::parse(tpl).map(|t| t.render(&vars)).unwrap_or_default();
-                    (w.id.clone(), json!(text))
-                })
-                .collect();
-            (st.goals.iter().map(ferrocast_core::goal::Goal::view).collect::<Vec<_>>(), viewers, labels)
+            (st.goals.iter().map(ferrocast_core::goal::Goal::view).collect::<Vec<_>>(), viewers)
         };
+        let has = |k: WidgetKind| o.widgets.iter().any(|w| w.kind == k);
+        let credits = if has(WidgetKind::EndCredits) { Some(self.credits().await?) } else { None };
+        let chat_highlight = if has(WidgetKind::ChatHighlight) { self.chat_highlight() } else { None };
         let view = self.overlay_view(o);
+        let links = self.resolved_links().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, overlay_id = %o.id, "failed to load resolved links for snapshot; falling back to empty links");
+            ferrocast_core::links::ResolvedLinks::default()
+        });
         Ok(json!({
             "overlay": view_public(&view),
-            "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
+            "state": { "goals": goals, "labels": labels, "label_trains": label_trains, "viewers": viewers, "events": events, "chat": chat,
                        "poll": self.poll(), "giveaway": self.giveaway_card().await,
-                       "show": self.show_overlay_state(), "music": self.music_now() },
+                       "credits": credits, "chat_highlight": chat_highlight,
+                       "show": self.show_overlay_state(), "music": self.music_now(),
+                       "links": links },
         }))
     }
 }

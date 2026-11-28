@@ -6,7 +6,7 @@
 //! scale filter's shader and the blend mode. Following the same path keeps every rounding the
 //! same, so both engines' pictures match pixel for pixel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -28,6 +28,77 @@ const BGRA_SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 const MAX: u32 = 16_384;
 /// libobs's `EPSILON` for "scaled at all".
 const EPSILON: f32 = 0.0001;
+/// Custom shader pipeline cache cap: live-editing WGSL code can never leak GPU pipelines forever.
+const MAX_CUSTOM_PIPELINES: usize = 64;
+/// Period at which custom shader `time()` wraps (1 hour in ms) so `f32` retains sub-millisecond
+/// precision and trig hashes stay crisp after 4–8+ hours live.
+pub const SHADER_TIME_WRAP_MS: u64 = 3_600_000;
+
+/// Shader `time()` in seconds, wrapped modulo [`SHADER_TIME_WRAP_MS`] in `f64` before narrowing
+/// to `f32` so 8-hour or week-long streams never lose millisecond step precision.
+pub fn shader_time_s(elapsed_ms: u64) -> f32 {
+    ((elapsed_ms % SHADER_TIME_WRAP_MS) as f64 / 1000.0) as f32
+}
+
+/// Bounded FIFO cache for compiled custom shader pipelines (or `None` when a shader failed validation).
+#[derive(Debug, Default)]
+struct CustomPipelineCache {
+    map: HashMap<u64, Option<wgpu::RenderPipeline>>,
+    order: VecDeque<u64>,
+}
+
+impl CustomPipelineCache {
+    fn get(&self, key: u64) -> Option<Option<wgpu::RenderPipeline>> {
+        self.map.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: u64, value: Option<wgpu::RenderPipeline>) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        while self.map.len() >= MAX_CUSTOM_PIPELINES {
+            let Some(oldest) = self.order.pop_front() else {
+                self.map.clear();
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+        self.order.push_back(key);
+        self.map.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Every transition pipeline the compositor makes: the fragment entry and whether it draws the
+/// linear view of its target.
+const TRANSITION_PIPELINES: [(&str, bool); 5] =
+    [("fs_fade", false), ("fs_fade_to_color", false), ("fs_slide", true), ("fs_swipe", true), ("fs_luma", true)];
+
+/// Every filter's fragment entry in `effects.wgsl`.
+const EFFECT_ENTRIES: [&str; 17] = [
+    "fs_rounded",
+    "fs_border",
+    "fs_shadow",
+    "fs_shape",
+    "fs_blur_area",
+    "fs_look",
+    "fs_chroma_key",
+    "fs_color_correction",
+    "fs_color_key",
+    "fs_luma_key",
+    "fs_sharpen",
+    "fs_crop",
+    "fs_mask",
+    "fs_cutout",
+    "fs_lut",
+    "fs_scroll",
+    "fs_adjust",
+];
 
 /// The fragment shaders: libobs's effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,7 +167,7 @@ struct Planes {
 
 /// NV12 → RGB as three rows, each `dot(row.xyz, (y, u, v)) + row.w` on values 0-1: BT.709's or
 /// BT.601's matrix, TV range (Y 16-235, U and V 16-240) or full.
-fn yuv_rows(bt709: bool, full: bool) -> [f32; 12] {
+pub(crate) fn yuv_rows(bt709: bool, full: bool) -> [f32; 12] {
     let (kr, kb) = if bt709 { (0.2126_f32, 0.0722_f32) } else { (0.299, 0.114) };
     let kg = 1.0 - kr - kb;
     // Y' = sy·Y + oy, and each colour difference C = sc·U + oc.
@@ -150,6 +221,42 @@ pub struct PendingNv12 {
     state: Arc<Readback>,
     /// Its own work on the card: waiting for it doesn't wait for frames drawn after it.
     done_at: wgpu::SubmissionIndex,
+    /// Drawn straight into this pooled surface (no readback buffers): `state` then turns ready when
+    /// the card's work is done.
+    #[cfg(target_os = "macos")]
+    surface: Option<crate::apple::surface::PixelFrame>,
+}
+
+/// A frame the card finished: host planes, or (Mac) a pooled surface shared by reference.
+#[derive(Debug)]
+pub enum Drawn {
+    Host(Nv12),
+    #[cfg(target_os = "macos")]
+    Surface {
+        px: crate::apple::surface::PixelFrame,
+        /// Host planes, made once if a consumer needs them.
+        host: std::sync::OnceLock<Option<Nv12>>,
+    },
+}
+
+impl Drawn {
+    /// What an encoder takes: the surface itself, or the host planes (`stride` is the row width).
+    pub fn as_frame(&self, stride: usize) -> crate::video::Frame<'_> {
+        match self {
+            Self::Host(f) => crate::video::Frame::Nv12 { y: &f.y, y_stride: stride, uv: &f.uv, uv_stride: stride },
+            #[cfg(target_os = "macos")]
+            Self::Surface { px, .. } => crate::video::Frame::Surface(px),
+        }
+    }
+
+    /// Host planes for a consumer that needs the bytes (a tap): made once, counted.
+    pub fn host(&self) -> Option<&Nv12> {
+        match self {
+            Self::Host(f) => Some(f),
+            #[cfg(target_os = "macos")]
+            Self::Surface { px, host } => host.get_or_init(|| px.to_host()).as_ref(),
+        }
+    }
 }
 
 impl PendingNv12 {
@@ -169,11 +276,41 @@ impl std::fmt::Debug for Rig {
     }
 }
 
+/// Tests: a closure run by the compositor (it has no `Debug`).
+#[cfg(test)]
+pub(crate) struct TestHook(pub(crate) Box<dyn Fn(&Compositor) + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
+}
+
 /// Rigs kept at most. Each size an output draws at needs one per frame on the card plus the one
-/// being drawn ([`crate::engine::IN_FLIGHT`] + 1); this covers four sizes (main, two Twitch
-/// Enhanced Broadcasting qualities and a vertical or virtual-camera canvas) without remaking
-/// textures every frame.
-const RIGS: usize = 4 * (crate::engine::IN_FLIGHT + 1) + 2;
+/// being drawn ([`crate::engine::IN_FLIGHT`] + 1); this covers eight sizes (main, up to four
+/// Twitch Enhanced Broadcasting qualities, a vertical and a virtual-camera canvas) without
+/// remaking textures every frame.
+const RIGS: usize = 8 * (crate::engine::IN_FLIGHT + 1) + 2;
+
+/// Whether frames are drawn into pooled surfaces (Mac) from the start: on unless
+/// FERROCORE_COPY_FRAMES is set (to compare against the copying path).
+#[cfg(target_os = "macos")]
+fn surfaces_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FERROCORE_COPY_FRAMES").is_none())
+}
+
+/// An uploaded source texture kept on the card between frames.
+#[derive(Debug)]
+struct Upload {
+    texture: wgpu::Texture,
+    width: u32,
+    height: u32,
+    /// True when backed by an external OS surface (`zerocopy::texture` pinning a `CVImageBuffer`):
+    /// copied onto a private GPU texture when hidden or frozen so buffer pools don't starve.
+    pinned: bool,
+}
 
 /// The compositor: a graphics card and what drawing needs on it.
 #[derive(Debug)]
@@ -191,6 +328,8 @@ pub struct Compositor {
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<(Shader, Blend, bool), wgpu::RenderPipeline>>,
+    /// Textures kept for the filter chains.
+    pool: Arc<TexPool>,
     /// Alpha blends as libobs's Metal renderer does (see `blend_state`).
     metal_alpha: bool,
     pub(crate) bilinear: wgpu::Sampler,
@@ -212,13 +351,23 @@ pub struct Compositor {
     luts: Mutex<HashMap<usize, (std::sync::Weak<crate::lut::Lut>, wgpu::Texture)>>,
     effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Shader effects of one's own, by their code's key: None when the card refused it.
-    custom_pipelines: Mutex<HashMap<u64, Option<wgpu::RenderPipeline>>>,
-    /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
-    uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
+    custom_pipelines: Mutex<CustomPipelineCache>,
+    /// Pictures kept on the card between frames, by the caller's id.
+    uploads: Mutex<HashMap<u64, Upload>>,
     /// Buffers kept between frames to send each upload through (see `write_staged`).
     staging: Mutex<HashMap<u64, Staging>>,
     /// NV12 frames' resources, kept between frames (see `Rig`).
     rigs: Mutex<Vec<Rig>>,
+    /// Pooled IOSurface frames the card draws into, one pool per size (the newest few).
+    #[cfg(target_os = "macos")]
+    surfaces: Mutex<Vec<crate::apple::surface::SurfacePool>>,
+    /// Tests: run between a frame's submit and its completion callback (other threads submit
+    /// there too).
+    #[cfg(test)]
+    after_submit: Mutex<Option<TestHook>>,
+    /// Whether frames go into those (see `surfaces_default`).
+    #[cfg(target_os = "macos")]
+    surfaces_on: AtomicBool,
     /// NV12 out: the Y and UV pipelines.
     nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
     /// NV12 in (a file's pictures, `upload_nv12`): the pipeline and its layout, made when first
@@ -229,6 +378,11 @@ pub struct Compositor {
     pub(crate) preview_pipelines: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
     /// Held to submit and to configure a window surface (see `configure`).
     submitting: Mutex<()>,
+    /// Number of uncaptured GPU errors reported by `device` on this compositor (read by the
+    /// macOS preview tests).
+    #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) uncaptured_errors: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// What an item draws: a picture, a texture made on the GPU (filtered), or other items.
@@ -236,7 +390,7 @@ enum Src<'a> {
     Pic(&'a Picture),
     /// An uploaded picture: its id, and whether it's premultiplied.
     Up(u64, bool),
-    Tex(Box<Target>),
+    Tex(Arc<Target>),
     Items(&'a [Item]),
 }
 
@@ -247,6 +401,86 @@ pub(crate) struct Target {
     pub(crate) gamma: wgpu::TextureView,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// The pool it goes back to when dropped (filter intermediates), if it came from one.
+    home: Option<Arc<TexPool>>,
+}
+
+type PooledTexture = (wgpu::Texture, wgpu::TextureView, wgpu::TextureView);
+
+/// Textures the filter chains draw into, kept between frames by size so each frame reuses
+/// them (a fresh texture for every filter of every item every frame was ~hundreds of
+/// allocations a second). Only plain render targets (no readback or copy usage), which a
+/// chain always clears before drawing.
+#[derive(Default)]
+struct TexPool {
+    free: Mutex<HashMap<(u32, u32), Vec<PooledTexture>>>,
+    /// Counters for `Compositor::texture_stats`.
+    created: std::sync::atomic::AtomicU64,
+    reused: std::sync::atomic::AtomicU64,
+    shared: std::sync::atomic::AtomicU64,
+    /// Measuring switches (default on): the pool, and one chain shared by identical items.
+    pool_off: std::sync::atomic::AtomicBool,
+    share_off: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for TexPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TexPool")
+    }
+}
+
+/// Most textures kept for one size, and in all.
+const POOL_PER_SIZE: usize = 8;
+const POOL_TOTAL: usize = 48;
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        let Some(pool) = self.home.take() else { return };
+        let mut free = pool.free.lock().unwrap_or_else(|e| e.into_inner());
+        let total: usize = free.values().map(Vec::len).sum();
+        if total >= POOL_TOTAL {
+            return;
+        }
+        let list = free.entry((self.width, self.height)).or_default();
+        if list.len() < POOL_PER_SIZE {
+            list.push((self.texture.clone(), self.linear.clone(), self.gamma.clone()));
+        }
+    }
+}
+
+/// What a frame's filter chains made, by what they were made from, so an item with the same
+/// picture and the same filters as another (copy-on-add gives a camera in two scenes identical
+/// lists) draws the first one's result. Per thread, cleared at the start and end of each render.
+struct ChainKey {
+    id: u64,
+    size: (u32, u32),
+    premultiplied: bool,
+    linear: bool,
+    effects: Vec<Effect>,
+}
+
+thread_local! {
+    static CHAINS: std::cell::RefCell<Vec<(ChainKey, Arc<Target>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Renders in progress on this thread (chains are kept only inside one, or they would go stale).
+    static SCOPES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Clears the thread's chain cache when made and when dropped (a render's start and end).
+struct ChainScope;
+
+impl ChainScope {
+    fn new() -> Self {
+        CHAINS.with(|c| c.borrow_mut().clear());
+        SCOPES.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ChainScope {
+    fn drop(&mut self) {
+        SCOPES.with(|n| n.set(n.get().saturating_sub(1)));
+        CHAINS.with(|c| c.borrow_mut().clear());
+    }
 }
 
 /// One quad to draw: where it goes and how.
@@ -278,6 +512,14 @@ impl Compositor {
     pub(crate) fn configure(&self, surface: &wgpu::Surface<'_>, config: &wgpu::SurfaceConfiguration) {
         let _turn = self.submitting.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         surface.configure(&self.device, config);
+    }
+
+    /// Presents an acquired preview frame while holding `submitting`: `wgpu::Queue::present`
+    /// submits a transition to `PRESENT` on the queue, so holding the lock prevents it from racing
+    /// `configure`'s `maintain(Wait)` on another preview or resize (`GpuWaitTimeout`).
+    pub(crate) fn present_surface(&self, frame: wgpu::SurfaceTexture) {
+        let _turn = self.submitting.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.queue.present(frame);
     }
 
     /// Opens the system's graphics card, headless (no window needed).
@@ -333,18 +575,22 @@ impl Compositor {
         // A graphics card error is logged, never the end of the app: the frame it hit is lost,
         // the engine draws the next (wgpu would otherwise panic on the thread it happened on).
         let gpu_error = std::sync::Arc::new(Mutex::new(None::<String>));
+        let error_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
             let gpu_error = gpu_error.clone();
+            let error_count = error_count.clone();
             device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
-                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                // Count per Compositor so a Studio restart logs from error #1 again rather than
+                // inheriting an old power-of-two count from before the restart.
+                let n = error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let summary = format_wgpu_error(&e);
                 if n.is_power_of_two() {
-                    tracing::error!(times = n, "the graphics card refused something: {e}");
+                    tracing::error!(times = n, "the graphics card refused something: {summary}");
                 }
                 // Out of memory (or worse) is said where the Studio shows the engine's errors.
                 if let wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. } = e {
                     *gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!(
-                        "The graphics card had a problem ({e}). Stop and start the Studio; if it keeps happening, \
+                        "The graphics card had a problem ({summary}). Stop and start the Studio; if it keeps happening, \
                          use fewer or smaller sources."
                     ));
                 }
@@ -517,15 +763,23 @@ impl Compositor {
             })
         };
         let nv12 = (conv("fs_y", wgpu::TextureFormat::R8Unorm), conv("fs_uv", wgpu::TextureFormat::Rg8Unorm));
-        Ok(Self {
+        let c = Self {
             gpu_error,
             instance,
             adapter,
             preview_pipelines: Mutex::new(HashMap::new()),
             submitting: Mutex::new(()),
+            #[cfg(test)]
+            uncaptured_errors: error_count,
             uploads: Mutex::new(HashMap::new()),
             staging: Mutex::new(HashMap::new()),
             rigs: Mutex::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            surfaces: Mutex::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            surfaces_on: AtomicBool::new(surfaces_default()),
+            #[cfg(test)]
+            after_submit: Mutex::new(None),
             nv12,
             yuv_in: std::sync::OnceLock::new(),
             planes: Mutex::new(HashMap::new()),
@@ -536,7 +790,7 @@ impl Compositor {
             blank_cube,
             luts: Mutex::new(HashMap::new()),
             effect_pipelines: Mutex::new(HashMap::new()),
-            custom_pipelines: Mutex::new(HashMap::new()),
+            custom_pipelines: Mutex::new(CustomPipelineCache::default()),
             transition_module,
             transition_layout,
             transition_pipeline_layout,
@@ -547,10 +801,33 @@ impl Compositor {
             layout,
             pipeline_layout,
             pipelines: Mutex::new(HashMap::new()),
+            pool: Arc::default(),
             metal_alpha: cfg!(target_os = "macos"),
             bilinear,
             point,
-        })
+        };
+        c.warm_up();
+        Ok(c)
+    }
+
+    /// Builds the pipelines that were made the first time something used them, so that first use
+    /// is no slower than the next: a swipe's built mid-transition cost 85 ms (a late frame and a
+    /// hole in the stream, the first time each of a swipe and a slide was used, 20 Nov). The
+    /// transitions' and the filters' shaders, and the plain picture's.
+    fn warm_up(&self) {
+        let began = std::time::Instant::now();
+        for (entry, linear) in TRANSITION_PIPELINES {
+            let _ = self.transition_pipeline(entry, linear);
+        }
+        for entry in EFFECT_ENTRIES {
+            for linear in [false, true] {
+                let _ = self.effect_pipeline(entry, linear);
+            }
+        }
+        for linear in [false, true] {
+            let _ = self.pipeline(Shader::Default, Blend::Normal, linear);
+        }
+        tracing::debug!(ms = began.elapsed().as_millis() as u64, "the compositor's pipelines are built");
     }
 
     /// Which libobs renderer's alpha blending to match: Metal's (the Mac's default here) or
@@ -560,6 +837,8 @@ impl Compositor {
         if self.metal_alpha != metal {
             self.metal_alpha = metal;
             self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.warm_up();
         }
     }
 
@@ -610,6 +889,7 @@ impl Compositor {
     pub fn render(&self, scene: &Scene) -> Result<Vec<u8>, AvError> {
         check_size(scene.width, scene.height)?;
         self.validate(&scene.items)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let target = self.target(scene.width, scene.height, wgpu::TextureUsages::COPY_SRC);
         self.clear(&mut enc, &target);
@@ -621,6 +901,7 @@ impl Compositor {
     pub fn render_transition(&self, tr: &Transition) -> Result<Vec<u8>, AvError> {
         let (w, h) = (tr.from.width, tr.from.height);
         check_size(w, h)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let canvas = self.target(w, h, wgpu::TextureUsages::COPY_SRC);
         self.transition_into(&mut enc, &canvas, tr)?;
@@ -634,6 +915,7 @@ impl Compositor {
         if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(AvError::BadSize(w, h));
         }
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -760,6 +1042,13 @@ impl Compositor {
         Ok(())
     }
 
+    /// How many transition pipelines exist. A test's way of seeing that none is built when a
+    /// transition is first used (they are built when the compositor is).
+    #[doc(hidden)]
+    pub fn transition_pipeline_count(&self) -> usize {
+        self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     fn transition_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {
         let mut cache = self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner());
         cache
@@ -809,7 +1098,47 @@ impl Compositor {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | extra,
             view_formats: &[LINEAR],
         });
-        Target { linear: view(&texture, LINEAR), gamma: view(&texture, GAMMA), texture, width, height }
+        Target { linear: view(&texture, LINEAR), gamma: view(&texture, GAMMA), texture, width, height, home: None }
+    }
+
+    /// A filter chain's texture: one kept from an earlier frame when there is one (not cleared:
+    /// the chain clears it before drawing), else a new one that comes back to the pool when dropped.
+    fn pooled_target(&self, width: u32, height: u32) -> Target {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.pool.pool_off.load(Relaxed) {
+            self.pool.created.fetch_add(1, Relaxed);
+            return self.target(width, height, wgpu::TextureUsages::empty());
+        }
+        let got = self.pool.free.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(width, height)).and_then(Vec::pop);
+        match got {
+            Some((texture, linear, gamma)) => {
+                self.pool.reused.fetch_add(1, Relaxed);
+                Target { texture, linear, gamma, width, height, home: Some(self.pool.clone()) }
+            }
+            None => {
+                self.pool.created.fetch_add(1, Relaxed);
+                let mut t = self.target(width, height, wgpu::TextureUsages::empty());
+                t.home = Some(self.pool.clone());
+                t
+            }
+        }
+    }
+
+    /// (textures made new, reused from the pool, filter chains shared between items) since the
+    /// start: what the pool saves, for measuring.
+    #[doc(hidden)]
+    pub fn texture_stats(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.pool.created.load(Relaxed), self.pool.reused.load(Relaxed), self.pool.shared.load(Relaxed))
+    }
+
+    /// Switches the texture pool and the sharing of identical chains off (`true`), as they were
+    /// before: for measuring.
+    #[doc(hidden)]
+    pub fn set_filter_savings_off(&self, off: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.pool.pool_off.store(off, Relaxed);
+        self.pool.share_off.store(off, Relaxed);
     }
 
     pub(crate) fn clear(&self, enc: &mut wgpu::CommandEncoder, t: &Target) {
@@ -861,10 +1190,10 @@ impl Compositor {
         } else {
             // Ferrocast's filters run in gamma space (they aren't sRGB-aware), OBS's own in linear
             // light: the result mixes as the last one ran.
-            let t = self.apply_effects(enc, item)?;
+            let t = self.chain_for(enc, item)?;
             let (w, h) = (t.width, t.height);
             let linear = item.effects.last().is_some_and(Effect::linear);
-            (Src::Tex(Box::new(t)), w, h, linear)
+            (Src::Tex(t), w, h, linear)
         };
         if w == 0 || h == 0 {
             return Ok(());
@@ -979,11 +1308,54 @@ impl Compositor {
         Ok(())
     }
 
+    /// An item's filter chain's result: the one an item with the same uploaded picture and the
+    /// same filters already made this render, else made now.
+    fn chain_for(&self, enc: &mut wgpu::CommandEncoder, item: &Item) -> Result<Arc<Target>, AvError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let key = match &item.content {
+            Content::Uploaded { id, width, height, premultiplied }
+                if !self.pool.share_off.load(Relaxed) && SCOPES.with(std::cell::Cell::get) > 0 =>
+            {
+                Some(ChainKey {
+                    id: *id,
+                    size: (*width, *height),
+                    premultiplied: *premultiplied,
+                    linear: item.linear,
+                    effects: item.effects.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(k) = &key {
+            let hit = CHAINS.with(|c| {
+                c.borrow()
+                    .iter()
+                    .find(|(o, _)| {
+                        o.id == k.id
+                            && o.size == k.size
+                            && o.premultiplied == k.premultiplied
+                            && o.linear == k.linear
+                            && o.effects == k.effects
+                    })
+                    .map(|(_, t)| t.clone())
+            });
+            if let Some(t) = hit {
+                self.pool.shared.fetch_add(1, Relaxed);
+                return Ok(t);
+            }
+        }
+        let t = Arc::new(self.apply_effects(enc, item)?);
+        if let Some(k) = key {
+            CHAINS.with(|c| c.borrow_mut().push((k, t.clone())));
+        }
+        Ok(t)
+    }
+
     /// Runs an item's filters (libobs's filter chain): its picture drawn raw into a texture, then
     /// each filter into the next, as big as it draws.
     fn apply_effects(&self, enc: &mut wgpu::CommandEncoder, item: &Item) -> Result<Target, AvError> {
         let (w, h) = item.content.size();
-        let mut cur = self.target(w.max(1), h.max(1), wgpu::TextureUsages::empty());
+        let mut cur = self.pooled_target(w.max(1), h.max(1));
         self.clear(enc, &cur);
         // The picture goes in as the first filter reads it: linear for OBS's, raw for ours.
         // Each filter runs in linear light (OBS's v2 kinds always; Ferrocast's own when the item
@@ -1036,7 +1408,7 @@ impl Compositor {
         }
         for e in &item.effects {
             // Freeze only holds the picture (the engine stops taking new ones): nothing to draw.
-            if matches!(e, Effect::Freeze) {
+            if matches!(e, Effect::Freeze | Effect::Delay { .. }) {
                 continue;
             }
             // A shader effect of one's own that can't run is left out (the picture as it was).
@@ -1050,7 +1422,7 @@ impl Compositor {
             let pad = e.pad();
             let (ow, oh) = e.out_size(cur.width, cur.height);
             check_size(ow, oh)?;
-            let next = self.target(ow, oh, wgpu::TextureUsages::empty());
+            let next = self.pooled_target(ow, oh);
             self.clear(enc, &next);
             let lin = in_linear(e);
             // A colour picked (straight sRGB) is mixed as the picture is: in linear light there.
@@ -1063,7 +1435,7 @@ impl Compositor {
             let (entry, p, color) = match e {
                 Effect::Custom { params, elapsed_ms, .. } => {
                     q = *params;
-                    ("fx_fs", [*elapsed_ms as f32 / 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                    ("fx_fs", [shader_time_s(*elapsed_ms), 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => {
@@ -1124,7 +1496,7 @@ impl Compositor {
                 }
                 Effect::Sharpen { sharpness } => ("fs_sharpen", [*sharpness, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 // Skipped above, before a target is made.
-                Effect::Freeze => continue,
+                Effect::Freeze | Effect::Delay { .. } => continue,
                 Effect::Crop { left, top, .. } => {
                     ("fs_crop", [*left as f32, *top as f32, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
@@ -1277,56 +1649,58 @@ impl Compositor {
     /// A shader effect's pipeline, made once per code; None when it doesn't pass `shaderfx::check`
     /// or the card refuses it (caught, never a crash), and not tried again.
     fn custom_pipeline(&self, code: &str) -> Option<wgpu::RenderPipeline> {
+        let key = crate::shaderfx::key(code);
         let mut cache = self.custom_pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .entry(crate::shaderfx::key(code))
-            .or_insert_with(|| {
-                if let Err(e) = crate::shaderfx::check(code) {
-                    tracing::warn!(error = %e, "a shader effect was left out");
-                    return None;
+        if let Some(hit) = cache.get(key) {
+            return hit;
+        }
+        let built = if let Err(e) = crate::shaderfx::check(code) {
+            tracing::warn!(error = %e, "a shader effect was left out");
+            None
+        } else {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shader effect"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaderfx::source(code).into()),
+            });
+            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shader effect"),
+                layout: Some(&self.effect_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("fx_vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fx_fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: GAMMA,
+                        blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            match pollster::block_on(scope.pop()) {
+                None => Some(pipeline),
+                Some(e) => {
+                    tracing::warn!(error = %e, "the graphics card refused a shader effect: left out");
+                    None
                 }
-                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("shader effect"),
-                    source: wgpu::ShaderSource::Wgsl(crate::shaderfx::source(code).into()),
-                });
-                let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("shader effect"),
-                    layout: Some(&self.effect_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some("fx_vs"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some("fx_fs"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: GAMMA,
-                            blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                });
-                match pollster::block_on(scope.pop()) {
-                    None => Some(pipeline),
-                    Some(e) => {
-                        tracing::warn!(error = %e, "the graphics card refused a shader effect: left out");
-                        None
-                    }
-                }
-            })
-            .clone()
+            }
+        };
+        cache.insert(key, built.clone());
+        built
     }
 
     fn effect_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {
@@ -1376,7 +1750,9 @@ impl Compositor {
         }
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         match ups.get(&id) {
-            Some((tex, w, h)) if *w == p.width && *h == p.height && tex.format() == GAMMA => {
+            Some(Upload { texture: tex, width: w, height: h, pinned: false })
+                if *w == p.width && *h == p.height && tex.format() == GAMMA =>
+            {
                 let sent = self.write_staged(id, tex, (p.width, p.height), |dst| {
                     dst.copy_from_slice(&p.rgba);
                     true
@@ -1387,9 +1763,12 @@ impl Compositor {
             }
             _ => {
                 let tex = self.new_picture(p);
-                ups.insert(id, (tex, p.width, p.height));
+                ups.insert(id, Upload { texture: tex, width: p.width, height: p.height, pinned: false });
             }
         }
+        drop(ups);
+        // Drop any NV12 Y/UV planes left over if this source id previously used `upload_nv12`.
+        self.planes.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         Ok(())
     }
 
@@ -1400,18 +1779,24 @@ impl Compositor {
     pub fn upload_surface(&self, id: u64, s: &crate::screen::Surface) -> Result<(), AvError> {
         let (w, h) = s.size();
         check_size(w, h)?;
+        // Drop any NV12 planes left over if this source id previously uploaded video via NV12.
+        self.planes.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         // On a Mac the frame's own memory becomes the texture: no copy at all.
         #[cfg(target_os = "macos")]
         if crate::apple::zerocopy::enabled()
             && let Some(t) = crate::apple::zerocopy::texture(&self.device, s, "screen")
         {
-            self.uploads.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (t, w, h));
+            self.uploads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, Upload { texture: t, width: w, height: h, pinned: true });
             // The copying path's buffers for it aren't needed now.
             self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             return Ok(());
         }
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(ups.get(&id), Some((t, tw, th)) if (*tw, *th) == (w, h) && t.format() == BGRA) {
+        if !matches!(ups.get(&id), Some(Upload { texture: t, width: tw, height: th, pinned: false }) if (*tw, *th) == (w, h) && t.format() == BGRA)
+        {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("screen"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1422,9 +1807,9 @@ impl Compositor {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[BGRA_SRGB],
             });
-            ups.insert(id, (texture, w, h));
+            ups.insert(id, Upload { texture, width: w, height: h, pinned: false });
         }
-        let Some((texture, ..)) = ups.get(&id) else { return Err(AvError::NotUploaded(id)) };
+        let Some(Upload { texture, .. }) = ups.get(&id) else { return Err(AvError::NotUploaded(id)) };
         let row = w as usize * 4;
         let staged = self.write_staged(id, texture, (w, h), |dst| {
             s.with_bytes(|src, stride| {
@@ -1463,11 +1848,13 @@ impl Compositor {
             return Err(AvError::BadPixels(w, h));
         }
         let (pipeline, layout) = self.yuv_in.get_or_init(|| self.yuv_pipeline());
+        // Drop any RGBA/BGRA staging ring buffers left over if this source id previously used `upload`.
+        self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         // The picture it becomes: the source's own texture, drawn into here.
         let target = {
             let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
             match ups.get(&id) {
-                Some((t, tw, th))
+                Some(Upload { texture: t, width: tw, height: th, pinned: false })
                     if (*tw, *th) == (w, h)
                         && t.format() == GAMMA
                         && t.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT) =>
@@ -1487,7 +1874,7 @@ impl Compositor {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT,
                         view_formats: &[LINEAR],
                     });
-                    ups.insert(id, (t.clone(), w, h));
+                    ups.insert(id, Upload { texture: t.clone(), width: w, height: h, pinned: false });
                     t
                 }
             }
@@ -1645,6 +2032,48 @@ impl Compositor {
         Planes { key, y, uv, _buf: buf, bind }
     }
 
+    /// Copies a zero-copy external surface upload onto a GPU-owned texture and drops the
+    /// external surface reference so finite capture buffer pools (Continuity Camera) aren't
+    /// starved while hidden or frozen. No-op when `id` isn't uploaded or already GPU-owned.
+    pub fn unpin_surface(&self, id: u64) {
+        let (src_tex, w, h) = {
+            let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(u) = ups.get(&id).filter(|u| u.pinned) else { return };
+            (u.texture.clone(), u.width, u.height)
+        };
+        let dst = self.target(w, h, wgpu::TextureUsages::COPY_DST);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("unpin") });
+        self.clear(&mut enc, &dst);
+        self.quad(
+            &mut enc,
+            &dst,
+            &Quad {
+                corners: corners(&Affine::IDENTITY, w as f32, h as f32),
+                view: &view(&src_tex, GAMMA),
+                size: (w, h),
+                shader: Shader::Default,
+                blend: Blend::Normal,
+                linear: false,
+                straight: false,
+                point: true,
+                opacity: 1.0,
+            },
+        );
+        let done_at = self.submit(std::iter::once(enc.finish()));
+        let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if ups.get(&id).is_some_and(|u| u.pinned && u.width == w && u.height == h) {
+            ups.insert(id, Upload { texture: dst.texture.clone(), width: w, height: h, pinned: false });
+        }
+        drop(ups);
+        drop(src_tex);
+        // Wait briefly for the copy submission so wgpu drops the external HAL texture and
+        // releases the CVImageBuffer even when no output or preview is polling the GPU.
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(done_at),
+            timeout: Some(std::time::Duration::from_millis(50)),
+        });
+    }
+
     /// Lets an uploaded picture go.
     pub fn forget(&self, id: u64) {
         self.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1702,7 +2131,7 @@ impl Compositor {
 
     fn uploaded(&self, id: u64) -> Result<wgpu::Texture, AvError> {
         let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
-        ups.get(&id).map(|(t, _, _)| t.clone()).ok_or(AvError::NotUploaded(id))
+        ups.get(&id).map(|u| u.texture.clone()).ok_or(AvError::NotUploaded(id))
     }
 
     /// Draws a scene → NV12 (BT.709, limited range, as libobs gives its encoders).
@@ -1713,6 +2142,7 @@ impl Compositor {
             return Err(AvError::BadSize(w, h));
         }
         self.validate(&scene.items)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -1786,7 +2216,16 @@ impl Compositor {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
             ],
         });
-        for (tex, pipeline) in [(&rig.y, &self.nv12.0), (&rig.uv, &self.nv12.1)] {
+        #[cfg(target_os = "macos")]
+        let (surface, planes) = match self.surface_frame(w, h) {
+            Some((px, y, uv)) => (Some(px), Some((y, uv))),
+            None => (None, None),
+        };
+        #[cfg(target_os = "macos")]
+        let (tex_y, tex_uv) = planes.as_ref().map_or((&rig.y, &rig.uv), |(y, uv)| (y, uv));
+        #[cfg(not(target_os = "macos"))]
+        let (tex_y, tex_uv) = (&rig.y, &rig.uv);
+        for (tex, pipeline) in [(tex_y, &self.nv12.0), (tex_uv, &self.nv12.1)] {
             let v = tex.create_view(&Default::default());
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nv12"),
@@ -1805,8 +2244,12 @@ impl Compositor {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
+        #[cfg(target_os = "macos")]
+        let direct = surface.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let direct = false;
         for ((buf, padded), (plane, pw, ph, bpp)) in
-            rig.read.iter().zip([(&rig.y, w, h, 1u32), (&rig.uv, w / 2, h / 2, 2)])
+            rig.read.iter().zip([(&rig.y, w, h, 1u32), (&rig.uv, w / 2, h / 2, 2)]).filter(|_| !direct)
         {
             debug_assert!(*padded >= pw * bpp);
             enc.copy_texture_to_buffer(
@@ -1823,32 +2266,142 @@ impl Compositor {
             );
         }
         let done_at = self.submit([enc.finish()]);
-        let state = Arc::new(Readback::default());
-        for (buf, _) in &rig.read {
-            let state = state.clone();
-            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                if r.is_err() {
-                    state.failed.store(true, Ordering::Release);
-                }
-                state.mapped.fetch_add(1, Ordering::AcqRel);
-            });
+        #[cfg(test)]
+        if let Some(hook) = self.after_submit.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            (hook.0)(self);
         }
-        PendingNv12 { rig, state, done_at }
+        let state = Arc::new(Readback::default());
+        if direct {
+            // No buffers to map: the surface is ready when the card says its work is done.
+            let state = state.clone();
+            self.queue.on_submitted_work_done(move || state.mapped.store(2, Ordering::Release));
+        } else {
+            for (buf, _) in &rig.read {
+                let state = state.clone();
+                buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    if r.is_err() {
+                        state.failed.store(true, Ordering::Release);
+                    }
+                    state.mapped.fetch_add(1, Ordering::AcqRel);
+                });
+            }
+        }
+        PendingNv12 {
+            rig,
+            state,
+            done_at,
+            #[cfg(target_os = "macos")]
+            surface,
+        }
+    }
+
+    /// Mac: a pooled surface for a `w`x`h` frame and its two planes as render targets, or None
+    /// (switched off, pool at its cap, no Metal: the frame is read back the copying way, and
+    /// counted). Never waits for a free buffer.
+    #[cfg(target_os = "macos")]
+    fn surface_frame(
+        &self,
+        w: u32,
+        h: u32,
+    ) -> Option<(crate::apple::surface::PixelFrame, wgpu::Texture, wgpu::Texture)> {
+        use crate::apple::surface::{Empty, SurfacePool};
+        /// Buffers a size's pool may hold: the frames on the card plus what the encoders keep
+        /// (VideoToolbox's reorder window and queue), shared by every output of the canvas.
+        const MAX_BUFFERS: u32 = 16;
+        /// Sizes kept (main, up to four Twitch qualities, a vertical canvas, a camera): the least
+        /// recently used goes, so a cycle through them all never evicts the one needed next.
+        const SIZES: usize = 8;
+        if !self.surfaces_on.load(Ordering::Relaxed) {
+            return None;
+        }
+        let taken = {
+            let mut pools = self.surfaces.lock().unwrap_or_else(|e| e.into_inner());
+            let at = match pools.iter().position(|p| p.size() == (w, h)) {
+                Some(at) => {
+                    let used = pools.remove(at);
+                    pools.push(used);
+                    pools.len() - 1
+                }
+                None => {
+                    let Some(p) = SurfacePool::new(w, h, MAX_BUFFERS) else {
+                        crate::video::note_fallback_frame();
+                        return None;
+                    };
+                    if pools.len() >= SIZES {
+                        pools.remove(0);
+                    }
+                    crate::video::note_pool_made();
+                    pools.push(p);
+                    pools.len() - 1
+                }
+            };
+            pools[at].take()
+        };
+        match taken {
+            Ok(px) => match px.textures(&self.device) {
+                Some((y, uv)) => {
+                    crate::video::note_zero_copy_frame();
+                    Some((px, y, uv))
+                }
+                None => {
+                    crate::video::note_fallback_frame();
+                    None
+                }
+            },
+            Err(Empty::Full | Empty::Failed) => {
+                crate::video::note_fallback_frame();
+                None
+            }
+        }
     }
 
     /// The NV12 frame `p` read back: at once when [`PendingNv12::ready`], else after waiting for
-    /// the card. Its rig goes back for the next frames.
+    /// the card. Its rig goes back for the next frames. A frame drawn into a pooled surface is
+    /// read out of it (a copy, counted).
     fn nv12_finish(&self, p: PendingNv12) -> Result<Nv12, AvError> {
+        match self.nv12_drawn(p)? {
+            Drawn::Host(f) => Ok(f),
+            #[cfg(target_os = "macos")]
+            Drawn::Surface { px, .. } => {
+                px.to_host().ok_or_else(|| AvError::Readback("the frame couldn't be read".into()))
+            }
+        }
+    }
+
+    /// The frame `p` as the card made it: host planes, or a pooled surface with no copy.
+    fn nv12_drawn(&self, p: PendingNv12) -> Result<Drawn, AvError> {
+        #[cfg(target_os = "macos")]
+        let PendingNv12 { rig, state, done_at, surface } = p;
+        #[cfg(not(target_os = "macos"))]
         let PendingNv12 { rig, state, done_at } = p;
+        let mut waited = false;
         if !(state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) >= 2) {
             self.device
                 .poll(wgpu::PollType::Wait { submission_index: Some(done_at), timeout: None })
                 .map_err(|e| AvError::Readback(e.to_string()))?;
+            waited = true;
         }
-        if state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) < 2 {
+        // A surface frame has no buffers to map: its work being done (the wait above came back) is
+        // all it needs. The completion callback may hang on a later submission (another thread
+        // submitted between ours and the callback's registering), so it is not waited for.
+        #[cfg(target_os = "macos")]
+        let finished_without_callback = waited && surface.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let finished_without_callback = {
+            let _ = waited;
+            false
+        };
+        if state.failed.load(Ordering::Acquire)
+            || (state.mapped.load(Ordering::Acquire) < 2 && !finished_without_callback)
+        {
             // Mapped halfway or not at all: this rig is let go (a new one is made).
             drop(rig);
             return Err(AvError::Readback("the card couldn't hand the frame back".into()));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(px) = surface {
+            self.rig_back(rig);
+            return Ok(Drawn::Surface { px, host: std::sync::OnceLock::new() });
         }
         let (w, h) = (rig.canvas.width, rig.canvas.height);
         let mut planes = Vec::with_capacity(2);
@@ -1861,17 +2414,22 @@ impl Compositor {
             }
             drop(data);
             buf.unmap();
+            crate::video::note_readback_bytes(px.len() as u64);
             planes.push(px);
         }
         let uv = planes.pop().unwrap_or_default();
         let y = planes.pop().unwrap_or_default();
+        self.rig_back(rig);
+        Ok(Drawn::Host(Nv12 { width: w, height: h, y, uv }))
+    }
+
+    fn rig_back(&self, rig: Rig) {
         let mut rigs = self.rigs.lock().unwrap_or_else(|e| e.into_inner());
         // The oldest goes when full: sizes no longer drawn mustn't keep the one in use out.
         if rigs.len() >= RIGS {
             rigs.remove(0);
         }
         rigs.push(rig);
-        Ok(Nv12 { width: w, height: h, y, uv })
     }
 
     /// Draws a scene and starts reading it back as NV12, without waiting for the card.
@@ -1882,6 +2440,7 @@ impl Compositor {
             return Err(AvError::BadSize(w, h));
         }
         self.validate(&scene.items)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -1896,6 +2455,7 @@ impl Compositor {
         if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(AvError::BadSize(w, h));
         }
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -1906,6 +2466,25 @@ impl Compositor {
     /// A frame begun with [`Self::begin_nv12`], read back (waiting for the card if it isn't done).
     pub fn finish_nv12(&self, p: PendingNv12) -> Result<Nv12, AvError> {
         self.nv12_finish(p)
+    }
+
+    /// Mac: draws frames into pooled surfaces (no copy) or reads them back the copying way. Tests
+    /// and A/B runs; FERROCORE_COPY_FRAMES sets the start.
+    #[cfg(target_os = "macos")]
+    pub fn set_zero_copy(&self, on: bool) {
+        self.surfaces_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Lets the card's finished work call back (what makes a begun frame [`PendingNv12::ready`]),
+    /// without waiting.
+    pub fn poll(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+
+    /// The same, without copying a surface-backed frame to host planes: what the engine hands its
+    /// encoders.
+    pub fn finish_drawn(&self, p: PendingNv12) -> Result<Drawn, AvError> {
+        self.nv12_drawn(p)
     }
 
     /// Sends a picture to its texture through a buffer of ours that stays mapped between frames.
@@ -1959,6 +2538,7 @@ impl Compositor {
         drop(view);
         ready.store(false, Ordering::Release);
         buf.unmap();
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
@@ -2154,7 +2734,7 @@ impl Compositor {
                 Content::Uploaded { id, width, height, .. } => {
                     let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
                     match ups.get(id) {
-                        Some((_, w, h)) if w == width && h == height => {}
+                        Some(Upload { width: w, height: h, .. }) if w == width && h == height => {}
                         _ => return Err(AvError::NotUploaded(*id)),
                     }
                 }
@@ -2210,12 +2790,14 @@ fn color_correction_matrix(
     multiply: u32,
     add: u32,
 ) -> [f32; 16] {
-    // color-correction-filter.c (v2): the setting plus one, round mid-grey (the `(1 - c) / 2`
-    // row). Ours took the keys' contrast curve and no middle: "contrast" only brightened or
-    // darkened everything (owner, 15 Nov).
-    let c = contrast + 1.0;
-    let mid = (1.0 - c) / 2.0;
-    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [mid, mid, mid, 1.0]];
+    // OBS's v2 Color Correction: `contrast < 0 ? 1 / (1 - contrast) : contrast + 1` and a plain
+    // multiply of the colour, no pivot (`con_matrix` in color-correction-filter.c's
+    // `color_correction_filter_update_v2`: the diagonal `contrast` and a last row of 0, 0, 0, 1,
+    // lines 263-265; its effect file applies it as `mul(color_matrix, currentPixel)`). An imported
+    // scene has to look as it does in OBS. v1's round-mid-grey contrast is the same multiply with
+    // `(1 - c) / 2` added to the brightness, which the import does.
+    let c = obs_contrast(contrast);
+    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [0.0, 0.0, 0.0, 1.0]];
     let bright: M4 =
         [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [brightness, brightness, brightness, 1.0]];
     let s = saturation + 1.0;
@@ -2289,8 +2871,8 @@ fn scroll_offset(per_sec_x: f32, per_sec_y: f32, ms: u64, looping: bool) -> (f32
     let one = |v: f32| {
         let o = f64::from(v) * secs;
         if looping {
-            // Past 1 wraps; below 0 it keeps going (the sampler wraps it), as OBS's.
-            if o > 1.0 { o.fract() as f32 } else { o as f32 }
+            // Wrap both directions past ±1 so hours-long negative scroll never loses f32 precision.
+            if o.abs() > 1.0 { o.fract() as f32 } else { o as f32 }
         } else {
             o.min(1.0) as f32
         }
@@ -2309,6 +2891,16 @@ fn mask_mapping(source: (u32, u32), mask: (u32, u32), stretch: bool) -> [f32; 4]
     let fix = if sx / sy < mx / my { sx / mx } else { sy / my };
     let (mx, my) = (mx * fix, my * fix);
     [sx / mx, sy / my, -(sx / 2.0 - mx / 2.0) / mx, -(sy / 2.0 - my / 2.0) / my]
+}
+
+/// Collapses a multi-line `wgpu::Error` onto one log line so callers and log greps see the cause,
+/// not only `"Validation Error"`.
+pub(crate) fn format_wgpu_error(e: &wgpu::Error) -> String {
+    collapse_whitespace(&e.to_string())
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureView {
@@ -2401,6 +2993,11 @@ mod mask_tests {
         assert!((x - 0.5).abs() < 1e-6 && y == 0.0, "{x} {y}");
         assert_eq!(scroll_offset(0.25, 0.0, 6_000, false).0, 1.0, "not looping: it's gone");
         assert!((scroll_offset(-0.25, 0.0, 2_000, true).0 + 0.5).abs() < 1e-6, "backwards keeps going");
+        let (neg_long, _) = scroll_offset(-0.25, 0.0, 10 * 3_600_000 + 2_000, true);
+        assert!(
+            neg_long.abs() < 1.0 && (neg_long + 0.5).abs() < 1e-5,
+            "long negative scroll wraps cleanly: {neg_long}"
+        );
     }
 
     /// A half see-through picture through each of Ferrocast's own filters, set to change
@@ -2468,5 +3065,59 @@ mod mask_tests {
         let [mx, my, ax, ay] = mask_mapping((200, 100), (50, 50), false);
         assert_eq!((mx, my, ay), (2.0, 1.0, 0.0));
         assert!((ax + 0.5).abs() < 1e-6, "{ax}");
+    }
+
+    #[test]
+    fn shader_time_keeps_sub_millisecond_precision_after_hours_and_days() {
+        let eight_h = 8 * 3_600_000u64 + 123_456;
+        let seven_d = 7 * 24 * 3_600_000u64 + 3_599_000;
+        for base in [0u64, eight_h, seven_d] {
+            let t0 = super::shader_time_s(base);
+            let t1 = super::shader_time_s(base + 16);
+            assert!(t0 >= 0.0 && t0 < (super::SHADER_TIME_WRAP_MS as f32 / 1000.0));
+            let dt = t1 - t0;
+            assert!((dt - 0.016).abs() < 0.0005, "base={base}: t0={t0}, t1={t1}, dt={dt}");
+        }
+    }
+
+    #[test]
+    fn custom_pipeline_cache_evicts_at_cap() {
+        let mut cache = super::CustomPipelineCache::default();
+        for k in 0..10_000u64 {
+            cache.insert(k, None);
+            assert!(cache.len() <= super::MAX_CUSTOM_PIPELINES);
+        }
+        assert_eq!(cache.len(), super::MAX_CUSTOM_PIPELINES);
+        // Oldest keys were evicted; newest are retained.
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(9_999).is_some());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod surface_tests {
+    use super::TestHook;
+    use super::*;
+
+    /// Other threads submit to the same queue (previews, NDI, uploads): work submitted between a
+    /// frame's submit and its completion callback must not make the frame look unfinished when
+    /// it is waited for (that failed the readback and tore down every output on the canvas).
+    #[test]
+    fn a_surface_frame_waited_for_is_whole_whatever_else_submits() {
+        let Ok(c) = Compositor::new() else { return };
+        c.set_zero_copy(true);
+        *c.after_submit.lock().unwrap_or_else(|e| e.into_inner()) = Some(TestHook(Box::new(|c: &Compositor| {
+            for _ in 0..4 {
+                let e = c.device.create_command_encoder(&Default::default());
+                c.submit([e.finish()]);
+            }
+        })));
+        let scene = Scene { width: 640, height: 360, items: vec![] };
+        for _ in 0..20 {
+            let p = c.begin_nv12(&scene).unwrap_or_else(|e| panic!("{e}"));
+            // Waited for at once, as `deliver` does past its in-flight limit or when flushing.
+            let d = c.finish_drawn(p).unwrap_or_else(|e| panic!("{e}"));
+            assert!(matches!(d, Drawn::Surface { .. }));
+        }
     }
 }

@@ -51,51 +51,98 @@ async fn platform(listener: TcpListener, key: &'static str) -> mpsc::UnboundedRe
     rx
 }
 
+#[derive(Clone, Copy)]
+enum ServeAction {
+    Continue,
+    CloseAfter(Duration),
+}
+
 async fn serve_platform(sock: &mut TcpStream, key: &str, tx: &mpsc::UnboundedSender<Got>) -> Option<()> {
+    serve_platform_with(sock, key, tx, false).await
+}
+
+/// As [`serve_platform`]; with `hang_up_on_publish` it takes the handshake and the connect, then
+/// closes the socket at the publish without a word (an ingest node draining, or Twitch on a key).
+async fn serve_platform_with(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    hang_up_on_publish: bool,
+) -> Option<()> {
+    serve_platform_inspected(sock, key, tx, hang_up_on_publish, |_| ServeAction::Continue).await
+}
+
+async fn serve_platform_inspected(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    hang_up_on_publish: bool,
+    mut on_event: impl FnMut(&ServerSessionEvent) -> ServeAction,
+) -> Option<()> {
     let rest = conn::handshake(sock, PeerType::Server).await.ok()?;
     let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
     let mut queue: Vec<ServerSessionResult> = first;
     queue.extend(s.handle_input(&rest).ok()?);
     let mut buf = vec![0u8; 65536];
+    let mut close_deadline: Option<tokio::time::Instant> = None;
     loop {
         while !queue.is_empty() {
             for r in std::mem::take(&mut queue) {
                 match r {
                     ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await.ok()?,
-                    ServerSessionResult::RaisedEvent(ev) => match ev {
-                        ServerSessionEvent::ConnectionRequested { request_id, .. } => {
-                            queue.extend(s.accept_request(request_id).ok()?)
+                    ServerSessionResult::RaisedEvent(ev) => {
+                        if close_deadline.is_none()
+                            && let ServeAction::CloseAfter(delay) = on_event(&ev)
+                        {
+                            close_deadline = Some(tokio::time::Instant::now() + delay);
                         }
-                        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
-                            if stream_key == key {
-                                let _ = tx.send(Got::Publish(stream_key));
-                                queue.extend(s.accept_request(request_id).ok()?);
-                            } else {
-                                // Like Twitch: refuse, then hang up.
-                                for r in s.reject_request(request_id, "NetStream.Publish.BadName", "bad key").ok()? {
-                                    if let ServerSessionResult::OutboundResponse(p) = r {
-                                        sock.write_all(&p.bytes).await.ok()?;
-                                    }
-                                }
-                                return None;
+                        match ev {
+                            ServerSessionEvent::ConnectionRequested { request_id, .. } => {
+                                queue.extend(s.accept_request(request_id).ok()?)
                             }
+                            ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                                if hang_up_on_publish {
+                                    return None;
+                                }
+                                if stream_key == key {
+                                    let _ = tx.send(Got::Publish(stream_key));
+                                    queue.extend(s.accept_request(request_id).ok()?);
+                                } else {
+                                    // Like Twitch: refuse, then hang up.
+                                    for r in
+                                        s.reject_request(request_id, "NetStream.Publish.BadName", "bad key").ok()?
+                                    {
+                                        if let ServerSessionResult::OutboundResponse(p) = r {
+                                            sock.write_all(&p.bytes).await.ok()?;
+                                        }
+                                    }
+                                    return None;
+                                }
+                            }
+                            ServerSessionEvent::StreamMetadataChanged { .. } => {
+                                let _ = tx.send(Got::Meta);
+                            }
+                            ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                                let _ = tx.send(Got::Video(timestamp.value, data));
+                            }
+                            ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+                                let _ = tx.send(Got::Audio(timestamp.value, data));
+                            }
+                            _ => {}
                         }
-                        ServerSessionEvent::StreamMetadataChanged { .. } => {
-                            let _ = tx.send(Got::Meta);
-                        }
-                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
-                            let _ = tx.send(Got::Video(timestamp.value, data));
-                        }
-                        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
-                            let _ = tx.send(Got::Audio(timestamp.value, data));
-                        }
-                        _ => {}
-                    },
+                    }
                     ServerSessionResult::UnhandleableMessageReceived(_) => {}
                 }
             }
         }
-        let n = sock.read(&mut buf).await.ok()?;
+        let n = if let Some(deadline) = close_deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return None,
+                res = sock.read(&mut buf) => res.ok()?,
+            }
+        } else {
+            sock.read(&mut buf).await.ok()?
+        };
         if n == 0 {
             return None;
         }
@@ -215,6 +262,7 @@ fn destination(port: u16, key: &str) -> Destination {
         retry: Default::default(),
         extra_audio: false,
         extra_video: false,
+        backup: None,
     }
 }
 
@@ -427,6 +475,427 @@ async fn an_unreachable_destination_retries_until_it_answers() {
     assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
 }
 
+/// A router reboot or a Wi-Fi drop of a minute: connecting fails at once (no route), over and over.
+/// That is not the platform failing, so the tries aren't counted against it: the destination waits
+/// for the network (still Reconnecting, never Failed) and goes live again by itself, and a later
+/// ordinary failure still has all its own tries.
+/// A platform whose first connection is taken and dropped after `live` (a long stream, then the
+/// network or the node goes), whose next `resets` connections hang up at the publish, and which
+/// then takes the stream for good.
+async fn flaky_platform(
+    listener: TcpListener,
+    key: &'static str,
+    live: Duration,
+    resets: usize,
+) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut n = 0usize;
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (tx, this) = (tx.clone(), n);
+            n += 1;
+            tokio::spawn(async move {
+                if (1..=resets).contains(&this) {
+                    let _ = serve_platform_with(&mut sock, key, &tx, true).await;
+                } else if this == 0 {
+                    let (itx, mut irx) = mpsc::unbounded_channel();
+                    let serve = serve_platform(&mut sock, key, &itx);
+                    let drop_later = async {
+                        while let Some(g) = irx.recv().await {
+                            let published = matches!(g, Got::Publish(_));
+                            let _ = tx.send(g);
+                            if published {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(live).await;
+                    };
+                    tokio::select! { _ = serve => {} _ = drop_later => {} }
+                } else {
+                    let _ = serve_platform(&mut sock, key, &tx).await;
+                }
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+/// An ingest node that drains hangs up at the publish, over and over, while a stream that was live
+/// is reconnecting. That is the server dropping the connection, not the key being refused: the key
+/// worked a moment ago, so it is retried with all the ordinary tries (and the backup ingest),
+/// and it is not reported as a refused key.
+#[tokio::test]
+async fn a_hang_up_at_the_publish_after_the_stream_was_live_is_not_a_refused_key() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = flaky_platform(l, "k", Duration::from_millis(300), 4).await;
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 6 };
+    let health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // The first connection takes the stream; then it drops, four hang-ups follow at the publish;
+    // the sixth connection is taken. Never Failed on the way.
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    loop {
+        let state = health.borrow().state.clone();
+        if let PushState::Failed { reason, refused, .. } = state {
+            panic!("gave up (refused {refused}): {reason}");
+        }
+        match next(&mut got).await {
+            Got::Publish(k) => {
+                assert_eq!(k, "k");
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let mut health = health;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+}
+
+/// A server that took the stream and then stops accepting connections for a while (an ingest
+/// restarting; one's own server rebooting) is an outage, waited for like a network that is down:
+/// a destination that never took the stream still gives up on a wrong address in a few tries.
+#[tokio::test]
+async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_for() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let (tx, mut got) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        while let Ok((mut sock, _)) = l.accept().await {
+            let tx = tx.clone();
+            conns.spawn(async move {
+                let _ = serve_platform(&mut sock, "k", &tx).await;
+            });
+        }
+    });
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    // It has been live a while (not a moment), then the server goes: its listener and connections
+    // close; nothing listens for a while (refused at once on every OS: a real refusal takes 2 s
+    // a try on Windows, and eight of them don't fit the wait).
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    push::fault::set_refused(dport, true);
+    server.abort();
+    let _ = server.await;
+    let state = state_is(&mut health, |s| {
+        matches!(s, PushState::Failed { .. }) || matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= 8)
+    })
+    .await;
+    assert!(matches!(state, PushState::Reconnecting { .. }), "gave up on a server that had been live: {state:?}");
+    // It comes back.
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    push::fault::set_refused(dport, false);
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+}
+
+/// A name that never resolved (a typo in a custom server) or an address that never answered is not a
+/// network being down: it fails in the few ordinary tries with the real reason, not after ten minutes
+/// of "your network is down". Only a destination that took the stream earlier gets the long wait.
+/// While the network is waited for, the destination shows Reconnecting (with why) the whole time:
+/// a try in progress doesn't turn it back into a bare Connecting (it did for the length of every
+/// connect timeout, 10 of every 18 seconds).
+#[tokio::test]
+async fn a_destination_waiting_for_the_network_stays_reconnecting_while_a_try_is_made() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set(dport, true);
+    push::fault::set_slow(dport, 150);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(30), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(900);
+    while tokio::time::Instant::now() < deadline {
+        let s = health.borrow().state.clone();
+        assert!(matches!(s, PushState::Reconnecting { .. }), "turned back into {s:?} during a try");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    push::fault::set_slow(dport, 0);
+    push::fault::set(dport, false);
+}
+
+/// One platform's bad half hour: it gives up after its tries (the stream goes on to the others), and
+/// then tries again by itself every so often: when the platform is back it is live again without
+/// anyone toggling it. (A refusal stays parked: see the key tests.)
+#[tokio::test]
+async fn a_destination_that_gave_up_tries_again_slowly_and_comes_back() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    // Refused at once on every OS (Windows takes 2 s a real refusal: three don't fit the wait).
+    push::fault::set_refused(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Failed { refused: false, .. })).await;
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    push::fault::set_refused(dport, false);
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+}
+
+/// After giving up, a destination probes once per wait, and stays Failed while it does: it doesn't
+/// start the whole retry loop again (a connect storm for hours, Health and the status flickering
+/// between Failed and Connecting, and two out-of-phase platforms never being Failed together).
+#[tokio::test]
+async fn a_destination_that_gave_up_probes_once_per_wait_and_stays_failed() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set_no_name(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    let before = push::fault::connects(dport);
+    // Three waits' worth of time.
+    let until = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    while tokio::time::Instant::now() < until {
+        let s = health.borrow().state.clone();
+        assert!(matches!(s, PushState::Failed { .. }), "left Failed for {s:?} while probing");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let probes = push::fault::connects(dport) - before;
+    assert!((1..=4).contains(&probes), "one probe per wait, not a retry loop each time: {probes}");
+    push::fault::set_no_name(dport, false);
+}
+
+/// Reconnecting turned off (the Studio's Advanced setting): the first failure is final: one try,
+/// Failed at once, and no slow probe afterwards either (it was six tries, then a probe each minute).
+#[tokio::test]
+async fn a_destination_with_reconnecting_off_tries_once_and_stays_failed() {
+    for no_name in [false, true] {
+        let w = world().await;
+        let l = free_listener().await;
+        let dport = l.local_addr().unwrap().port();
+        drop(l);
+        // Nothing listens there; or the name doesn't resolve (a network that is down is waited for
+        // otherwise: not when reconnecting is off).
+        push::fault::set_no_name(dport, no_name);
+        let mut d = destination(dport, "k");
+        d.retry = push::Retry::never();
+        let mut health = start(&w, d);
+        let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+        let s = state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+        assert!(matches!(s, PushState::Failed { attempts: 1, .. }), "{s:?}");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(push::fault::connects(dport), 1, "no_name={no_name}: one try, no probes after it");
+        assert!(matches!(health.borrow().state, PushState::Failed { .. }));
+        push::fault::set_no_name(dport, false);
+    }
+}
+
+/// Reconnect tries = 2 (the Studio's setting): the destination gives up after exactly two tries.
+#[tokio::test]
+async fn a_destination_with_two_tries_gives_up_after_two() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let s = state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    assert!(matches!(s, PushState::Failed { attempts: 2, .. }), "{s:?}");
+    assert_eq!(push::fault::connects(dport), 2);
+}
+
+/// IPv4 only dials 127.0.0.1 and never [::1]; IPv6 only the reverse (against a server on both).
+#[tokio::test]
+async fn an_ip_version_chosen_is_the_only_one_dialled() {
+    let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let Ok(v6) = tokio::net::TcpListener::bind(("::1", port)).await else {
+        return; // no IPv6 loopback on this machine
+    };
+    for (family, want_v6) in [(crate::target::IpFamily::V4, false), (crate::target::IpFamily::V6, true)] {
+        let (c, got4, got6) = tokio::join!(
+            push::tcp_family("localhost", port, family),
+            tokio::time::timeout(Duration::from_millis(800), v4.accept()),
+            tokio::time::timeout(Duration::from_millis(800), v6.accept()),
+        );
+        let c = c.unwrap();
+        assert_eq!(c.peer_addr().unwrap().is_ipv6(), want_v6, "{family:?}");
+        // Only the listener of that version ever saw a connection.
+        assert_eq!((got4.is_ok(), got6.is_ok()), (!want_v6, want_v6), "{family:?}");
+    }
+    // A name with no address of the version asked for says so by version.
+    let e = push::tcp_family("127.0.0.1", port, crate::target::IpFamily::V6).await.unwrap_err();
+    assert!(e.to_string().contains("IPv6"), "{e}");
+}
+
+/// A connection the streamer pinned is the one used (checked on the loopback, which every machine
+/// has), and one that isn't there fails by name, without hanging and without moving to another.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pinned_connection_is_used_and_a_missing_one_is_named() {
+    let w = world().await;
+    let l = free_listener().await;
+    let port = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let lo = if_addrs::get_if_addrs().unwrap().into_iter().find(|i| i.ip().is_ipv4() && i.is_loopback()).unwrap();
+    let mut d = destination(port, "k");
+    d.target.bind = Some(lo.name.clone());
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+
+    // Gone: no connection by that name.
+    let l2 = free_listener().await;
+    let port2 = l2.local_addr().unwrap().port();
+    let mut d = destination(port2, "k");
+    d.target.bind = Some("no-such-network0".into());
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 };
+    let mut health = start(&w, d);
+    let s = state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    let PushState::Failed { reason, attempts, .. } = s else { unreachable!() };
+    assert!(reason.contains("no-such-network0"), "names the connection: {reason}");
+    assert_eq!(attempts, 2);
+    assert!(health.borrow().via.is_none(), "never moved to another connection");
+}
+
+/// How many of the frames sent while one worker of a sender runtime is blocked (a call that never
+/// yields, for 2 s) reach the platform.
+fn frames_through_while_a_worker_is_blocked(workers: usize) -> (u32, u32) {
+    let rt = push::sender_runtime_with("test-sender", workers).unwrap();
+    let (_w, mut got, mut obs) = rt.block_on(async {
+        let w = world().await;
+        let l = free_listener().await;
+        let port = l.local_addr().unwrap().port();
+        let got = platform(l, "k").await;
+        let mut health = start(&w, destination(port, "k"));
+        let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+        state_is(&mut health, |s| *s == PushState::Live).await;
+        (w, got, obs)
+    });
+    // A worker is parked for two seconds by a call that never yields (spawned from outside, so it
+    // takes a worker as a stuck call inside the sender would).
+    rt.spawn(async { std::thread::sleep(Duration::from_secs(2)) });
+    std::thread::sleep(Duration::from_millis(200));
+    rt.block_on(async {
+        let mut sent = 0u32;
+        let mut videos = 0u32;
+        let until = tokio::time::Instant::now() + Duration::from_millis(1_500);
+        while tokio::time::Instant::now() < until {
+            obs.video(10 + sent, KEY).await;
+            sent += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // What reached the platform meanwhile (a stalled worker delivers it late, which is too late).
+            while let Ok(g) = got.try_recv() {
+                if matches!(g, Got::Video(..)) {
+                    videos += 1;
+                }
+            }
+        }
+        (videos, sent)
+    })
+}
+
+/// Something blocking on the sender's runtime (never found for sure, but with a single worker any
+/// slow system call or lock held for long stops everything the Studio's own sender does, and its
+/// timers, with nothing logged: the S42 stall's signature) must not stop the stream going out.
+#[test]
+fn a_blocking_call_on_the_senders_runtime_does_not_stop_the_stream() {
+    let (one, sent) = frames_through_while_a_worker_is_blocked(1);
+    // The injected call does stop a single worker (the control: the test can see the problem).
+    assert!(one < 3 && sent < 10, "one worker: {one} of {sent} got through, it should have stalled");
+    let (two, sent) = frames_through_while_a_worker_is_blocked(push::sender_runtime_workers());
+    assert!(sent >= 20 && two + 3 >= sent, "{two} of {sent} frames got through while a worker was blocked");
+}
+
+/// Kick taking the stream and closing it at once (no multistreaming, 40 ms) has
+/// not shown that it works: the next refusal to connect is an ordinary failure, not a ten-minute wait.
+#[tokio::test]
+async fn a_stream_taken_and_closed_at_once_does_not_earn_the_long_wait() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let got = platform_that_drops(l, "k", Duration::from_millis(40)).await;
+    let mut d = destination(dport, "k");
+    d.id = "kick".into();
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    // Nothing listens any more after the first take.
+    drop(got);
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { attempts, .. } => assert!(attempts <= 3, "{attempts}"),
+        s => panic!("{s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_name_that_never_resolved_fails_fast_a_destination_that_was_live_waits() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set_no_name(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, attempts, .. } => {
+            assert_eq!(attempts, 3);
+            assert!(!reason.to_lowercase().contains("network is down"), "{reason}");
+        }
+        s => panic!("{s:?}"),
+    }
+    push::fault::set_no_name(dport, false);
+}
+
+#[tokio::test]
+async fn a_network_that_is_down_is_waited_for_not_counted_against_the_destination() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // Well past the 3 tries an ordinary refusal would get.
+    let state = state_is(&mut health, |s| {
+        matches!(s, PushState::Failed { .. }) || matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= 8)
+    })
+    .await;
+    match state {
+        PushState::Reconnecting { reason, .. } => assert!(reason.to_lowercase().contains("network"), "{reason}"),
+        s => panic!("gave up while the network was down: {s:?}"),
+    }
+    // The network comes back with the platform: live by itself.
+    push::fault::set(dport, false);
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
+}
+
 #[tokio::test]
 async fn obs_stopping_ends_the_stream_everywhere_and_waits_for_the_next() {
     let w = world().await;
@@ -589,6 +1058,29 @@ async fn a_platform_that_takes_the_stream_and_drops_it_at_once_waits_longer_each
     }
 }
 
+/// How long a session has been live is measured on the monotonic clock: an NTP step or a wake from
+/// sleep moves the wall clock, and a forward one made a session live for a moment count as one live
+/// for hours (the retry count started over and the waits never grew; a backward one made a long
+/// one count as a moment: a false "Kick refused the stream").
+#[tokio::test]
+async fn a_wall_clock_step_does_not_change_how_long_a_session_was_live() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops(l, "k", Duration::from_millis(400)).await;
+    let mut health = start(&w, destination(dport, "k"));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for want in 1..=2u32 {
+        state_is(&mut health, |s| *s == PushState::Live).await;
+        // The clock jumps an hour ahead while it is live.
+        push::fault::CLOCK_STEP_MS.with(|c| c.set(c.get() + 3_600_000));
+        match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
+            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, want, "the count goes on"),
+            s => panic!("{s:?}"),
+        }
+    }
+}
+
 /// ffmpeg on this machine, for the cut-from-stream tests (skipped where there's none).
 fn ffmpeg() -> Option<std::path::PathBuf> {
     ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
@@ -731,3 +1223,821 @@ async fn only_enhanced_broadcasting_gets_the_other_qualities() {
     // The other platform never sees track 1: next is the main picture.
     assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }
+
+/// The sender's send buffer toward a slow test platform: about macOS's loopback default, and what
+/// a real link starts with. Left to itself Linux makes it about 2.5 MB over loopback, so a
+/// stalled platform's writes only block seconds of stream later.
+pub(crate) const SLOW_LINK_SEND_BUFFER: usize = 128 * 1024;
+
+/// Listener with a small TCP receive buffer (and the sender's send buffer to it pinned) so
+/// pausing or throttling reads exerts real TCP backpressure on `push::session`'s writes within
+/// a few frames, on every OS.
+async fn small_buf_listener() -> TcpListener {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    let _ = sock.set_recv_buffer_size(16 * 1024);
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = sock.listen(16).unwrap();
+    push::fault::set_send_buffer(l.local_addr().unwrap().port(), SLOW_LINK_SEND_BUFFER);
+    l
+}
+
+/// A fake platform whose reads can be paused via `open` (true = read freely, false = stall)
+/// and optionally throttled after publishing (`read_cap` bytes per `read_delay`).
+async fn controlled_platform(
+    listener: TcpListener,
+    key: &'static str,
+    open: watch::Receiver<bool>,
+    throttle: Option<(usize, Duration)>,
+) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            let mut open = open.clone();
+            tokio::spawn(async move {
+                let _ = serve_controlled(&mut sock, key, &tx, &mut open, throttle).await;
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+async fn serve_controlled(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    open: &mut watch::Receiver<bool>,
+    throttle: Option<(usize, Duration)>,
+) -> Option<()> {
+    let rest = conn::handshake(sock, PeerType::Server).await.ok()?;
+    let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
+    let mut queue: Vec<ServerSessionResult> = first;
+    queue.extend(s.handle_input(&rest).ok()?);
+    let mut buf = vec![0u8; 65536];
+    let mut published = false;
+    loop {
+        while !queue.is_empty() {
+            for r in std::mem::take(&mut queue) {
+                match r {
+                    ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await.ok()?,
+                    ServerSessionResult::RaisedEvent(ev) => match ev {
+                        ServerSessionEvent::ConnectionRequested { request_id, .. } => {
+                            queue.extend(s.accept_request(request_id).ok()?)
+                        }
+                        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                            if stream_key == key {
+                                published = true;
+                                let _ = tx.send(Got::Publish(stream_key));
+                                queue.extend(s.accept_request(request_id).ok()?);
+                            } else {
+                                return None;
+                            }
+                        }
+                        ServerSessionEvent::StreamMetadataChanged { .. } => {
+                            let _ = tx.send(Got::Meta);
+                        }
+                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Got::Video(timestamp.value, data));
+                        }
+                        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Got::Audio(timestamp.value, data));
+                        }
+                        _ => {}
+                    },
+                    ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                }
+            }
+        }
+        if published {
+            if !*open.borrow() {
+                open.wait_for(|v| *v).await.ok()?;
+            }
+            if let Some((_, delay)) = throttle {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        let max_read = if published { throttle.map_or(buf.len(), |(cap, _)| cap.min(buf.len())) } else { buf.len() };
+        let n = sock.read(&mut buf[..max_read]).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        queue.extend(s.handle_input(&buf[..n]).ok()?);
+    }
+}
+
+/// Realistic-size FLV video frame (`size` bytes) so a stalled receiver fills the TCP send buffer
+/// within a few frames instead of absorbing an entire test stream in kernel buffers.
+fn sized_video(key: bool, seq: u8, size: usize) -> Bytes {
+    let mut v = vec![seq; size];
+    v[0] = if key { 0x17 } else { 0x27 };
+    v[1] = 0x01;
+    v[2] = 0;
+    v[3] = 0;
+    v[4] = 0;
+    Bytes::from(v)
+}
+
+fn big_video(key: bool, seq: u8) -> Bytes {
+    sized_video(key, seq, 64 * 1024)
+}
+
+/// Realistic-size Twitch Enhanced Broadcasting extra video frame (track 1).
+fn big_eb_video(key: bool, seq: u8) -> Bytes {
+    let mut v = vec![seq; 32 * 1024];
+    let prefix = if key { EB_KEY } else { EB_INTER };
+    v[..prefix.len()].copy_from_slice(prefix);
+    Bytes::from(v)
+}
+
+#[tokio::test]
+async fn a_slow_destination_drops_inter_video_keeps_audio_and_resumes_at_a_keyframe() {
+    let w = world().await;
+    w.hub.start();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.video_frame_rate = Some(20.0);
+    w.hub.metadata(m);
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    let mut slow = controlled_platform(ls, "slow", open_rx, None).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    // Drain connect + headers on both destinations.
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Meta);
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    // First keyframe + audio: both receive it cleanly.
+    w.hub.video(0, big_video(true, 0));
+    w.hub.audio(10, Bytes::from_static(AAC));
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Video(0, _)));
+        assert_eq!(next(rx).await, Got::Audio(10, Bytes::from_static(AAC)));
+    }
+
+    // Stall the slow destination's TCP reads, then feed 2.5 s of stream (well under BACKLOG=1024
+    // so RecvError::Lagged never fires): GOP 1 inter frames (50..=1950), GOP 2 keyframe at 2000
+    // + inter frames (2050..=2450), and interleaved audio every 50 ms.
+    // Let fast drain each frame as it's published (like real-time pacing) so fast stays caught up
+    // while slow stalls on TCP backpressure.
+    open_tx.send_replace(false);
+    let mut expected_video_ts = vec![0u32];
+    let mut expected_audio_ts = vec![10u32];
+    for step in 1..=49u32 {
+        let ts = step * 50;
+        let is_key = ts == 2000;
+        expected_video_ts.push(ts);
+        expected_audio_ts.push(ts + 10);
+        w.hub.video(ts, big_video(is_key, step as u8));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+        assert!(matches!(next(&mut fast).await, Got::Video(t, _) if t == ts));
+        assert_eq!(next(&mut fast).await, Got::Audio(ts + 10, Bytes::from_static(AAC)));
+    }
+    assert_eq!(hf.borrow().dropped, 0, "a fast destination drops nothing");
+
+    // Give the slow sender a moment to fill its kernel send buffer and block in write_all.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Unblock the slow destination and end the stream cleanly so we can inspect everything it sent.
+    open_tx.send_replace(true);
+    w.hub.end();
+
+    let mut slow_videos: Vec<(u32, bool)> = vec![(0, true)];
+    let mut slow_audios = vec![10u32];
+    loop {
+        match next(&mut slow).await {
+            Got::Video(ts, data) => slow_videos.push((ts, crate::flv::video_is_keyframe(&data))),
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected slow packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+
+    let slow_dropped = hs.borrow().dropped;
+    assert!(slow_dropped > 0, "slow destination must drop stale non-keyframe video (got dropped={slow_dropped})");
+    assert_eq!(
+        slow_videos.len() as u64 + slow_dropped,
+        expected_video_ts.len() as u64,
+        "every dropped video frame is accounted for in Health.dropped"
+    );
+    assert_eq!(slow_audios, expected_audio_ts, "audio is never dropped by the video-drop path");
+    // Every gap in the slow destination's video stream must resume on a keyframe (no orphan P-frames).
+    let mut saw_gap = false;
+    for pair in slow_videos.windows(2) {
+        let ((prev_ts, _), (cur_ts, cur_key)) = (pair[0], pair[1]);
+        if cur_ts > prev_ts + 50 {
+            saw_gap = true;
+            assert!(cur_key, "resumed at non-keyframe ts={cur_ts} after gap from ts={prev_ts}");
+        }
+    }
+    assert!(saw_gap, "slow destination should have skipped stale inter frames up to keyframe 2000");
+    assert!(slow_videos.iter().any(|&(ts, key)| ts == 2000 && key), "resumed at keyframe 2000");
+    assert!(!slow_videos.iter().any(|&(ts, _)| ts == 1950), "tail inter frame before keyframe 2000 was dropped");
+    assert_eq!(slow_videos.last().map(|&(ts, _)| ts), Some(2450), "caught up and sent frames after keyframe");
+}
+
+#[tokio::test]
+async fn a_continuously_slow_destination_keeps_latency_bounded_and_audio_intact() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (_open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    // Slow platform reads at ~2.1 MB/s (32 KB every 15 ms) against ~6.4 MB/s stream (128 KB every
+    // 20 ms); 128 KB frames keep the OS loopback send buffer to ~2 frames so measured lag reflects
+    // the hub backlog rather than loopback bufferbloat.
+    let mut slow = controlled_platform(ls, "slow", open_rx, Some((32 * 1024, Duration::from_millis(15)))).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    // 6 seconds of stream time (120 video + 120 audio = 240 packets << BACKLOG=1024),
+    // keyframes every 1000 ms (0, 1000, ..., 5000), paced at 20 ms wall time per 50 ms frame.
+    let hub = w.hub.clone();
+    let pub_task = tokio::spawn(async move {
+        let mut expected_audio = Vec::with_capacity(120);
+        for step in 0..120u32 {
+            let ts = step * 50;
+            let is_key = ts % 1000 == 0;
+            hub.video(ts, sized_video(is_key, step as u8, 128 * 1024));
+            hub.audio(ts + 10, Bytes::from_static(AAC));
+            expected_audio.push(ts + 10);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub.end();
+        expected_audio
+    });
+
+    // Collect what the slow destination receives while measuring how far behind the live stream edge
+    // each received video frame is.
+    let mut slow_videos: Vec<(u32, bool)> = Vec::new();
+    let mut slow_audios: Vec<u32> = Vec::new();
+    let mut max_lag_ms = 0u32;
+    loop {
+        match timeout(Duration::from_secs(10), slow.recv()).await.expect("slow pkt in time").expect("slow open") {
+            Got::Video(ts, data) => {
+                let live_ts = w.hub.newest_video_ts().unwrap_or(ts);
+                max_lag_ms = max_lag_ms.max(live_ts.saturating_sub(ts));
+                slow_videos.push((ts, crate::flv::video_is_keyframe(&data)));
+            }
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected slow packet: {other:?}"),
+        }
+    }
+    let expected_audio = pub_task.await.unwrap();
+
+    // Drain fast destination too and verify it lost nothing.
+    let mut fast_video_count = 0usize;
+    let mut fast_audios = Vec::new();
+    loop {
+        match next(&mut fast).await {
+            Got::Video(_, _) => fast_video_count += 1,
+            Got::Audio(ts, _) => fast_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected fast packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+
+    assert_eq!(fast_video_count, 120);
+    assert_eq!(fast_audios, expected_audio);
+    assert_eq!(hf.borrow().dropped, 0);
+
+    let slow_dropped = hs.borrow().dropped;
+    assert!(slow_dropped > 0, "continuously slow destination must drop non-keyframe video");
+    assert_eq!(slow_audios, expected_audio, "audio must never be dropped");
+    // Without bounded dropping, the 1/3-speed receiver falls >4000 ms behind over a 6000 ms stream.
+    assert!(max_lag_ms < 2_200, "slow destination latency grew unbounded: max_lag_ms={max_lag_ms}");
+    for pair in slow_videos.windows(2) {
+        let ((prev_ts, _), (cur_ts, cur_key)) = (pair[0], pair[1]);
+        if cur_ts > prev_ts + 50 {
+            assert!(cur_key, "resumed at non-keyframe ts={cur_ts} after gap from ts={prev_ts}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn enhanced_broadcasting_drops_extra_tracks_to_their_own_keyframes() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.video(0, Bytes::from_static(EB_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let ls = small_buf_listener().await;
+    let ps = ls.local_addr().unwrap().port();
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut twitch = controlled_platform(ls, "t", open_rx, None).await;
+    let mut ht = start(&w, Destination { id: "twitch".into(), extra_video: true, ..destination(ps, "t") });
+    state_is(&mut ht, |s| *s == PushState::Live).await;
+
+    assert!(matches!(next(&mut twitch).await, Got::Publish(_)));
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+    assert_eq!(next(&mut twitch).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(EB_HEADER)));
+
+    // Initial keyframes on both tracks + audio.
+    w.hub.video(0, big_video(true, 0));
+    w.hub.video(0, big_eb_video(true, 0));
+    w.hub.audio(10, Bytes::from_static(AAC));
+    assert!(matches!(next(&mut twitch).await, Got::Video(0, _)));
+    assert!(matches!(next(&mut twitch).await, Got::Video(0, _)));
+    assert_eq!(next(&mut twitch).await, Got::Audio(10, Bytes::from_static(AAC)));
+
+    // Stall Twitch, then push 2.5 s of main + extra track video + audio.
+    // Stagger keyframes: main track keyframe at 2000, extra track keyframe at 2100.
+    open_tx.send_replace(false);
+    let mut expected_audio = vec![10u32];
+    for step in 1..=49u32 {
+        let ts = step * 50;
+        w.hub.video(ts, big_video(ts == 2000, step as u8));
+        w.hub.video(ts, big_eb_video(ts == 2100, step as u8));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+        expected_audio.push(ts + 10);
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    open_tx.send_replace(true);
+    w.hub.end();
+
+    let mut main_videos: Vec<(u32, bool)> = vec![(0, true)];
+    let mut extra_videos: Vec<(u32, bool)> = vec![(0, true)];
+    let mut audios = vec![10u32];
+    loop {
+        match next(&mut twitch).await {
+            Got::Video(ts, data) => {
+                let is_key = crate::flv::video_is_keyframe(&data);
+                if crate::flv::video_extra_track(&data).is_some() {
+                    extra_videos.push((ts, is_key));
+                } else {
+                    main_videos.push((ts, is_key));
+                }
+            }
+            Got::Audio(ts, _) => audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    state_is(&mut ht, |s| *s == PushState::Waiting).await;
+
+    assert!(ht.borrow().dropped > 0);
+    assert_eq!(audios, expected_audio, "audio is never dropped");
+    // Main resumes at keyframe 2000; extra track stays dropped through 2000 & 2050 and resumes at 2100.
+    assert!(
+        !extra_videos.iter().any(|&(ts, _)| ts == 2000 || ts == 2050),
+        "extra track must not send orphan inter frames after main keyframe"
+    );
+    assert!(extra_videos.iter().any(|&(ts, key)| ts == 2100 && key), "extra track resumed at its own keyframe 2100");
+    for (name, track) in [("main", &main_videos), ("extra", &extra_videos)] {
+        let mut saw_gap = false;
+        for pair in track.windows(2) {
+            if pair[1].0 > pair[0].0 + 50 {
+                saw_gap = true;
+                assert!(pair[1].1, "{name} resumed at non-keyframe ts={} after {}", pair[1].0, pair[0].0);
+            }
+        }
+        assert!(saw_gap, "{name} should have dropped stale inter frames");
+    }
+}
+
+#[tokio::test]
+async fn a_late_destination_joining_mid_gop_counts_zero_drops() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+    w.hub.video(0, Bytes::from_static(KEY));
+
+    let l = free_listener().await;
+    let port = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let mut health = start(&w, destination(port, "k"));
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+    assert_eq!(next(&mut got).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+
+    // 1.5 s of inter frames and audio arrive before the first keyframe this destination sees:
+    // skipped because it hasn't started yet, NOT counted as drops.
+    for step in 1..=30u32 {
+        let ts = step * 50;
+        w.hub.video(ts, Bytes::from_static(INTER));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+    }
+    w.hub.video(1600, Bytes::from_static(KEY));
+    w.hub.audio(1610, Bytes::from_static(AAC));
+    w.hub.video(1650, Bytes::from_static(INTER));
+
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
+    assert_eq!(next(&mut got).await, Got::Audio(10, Bytes::from_static(AAC)));
+    assert_eq!(next(&mut got).await, Got::Video(50, Bytes::from_static(INTER)));
+    assert_eq!(health.borrow().dropped, 0, "pre-keyframe startup skips must not count as drops");
+}
+
+#[tokio::test]
+async fn kick_gives_up_after_repeated_rapid_drops_and_says_why() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform_that_drops(l, "k", Duration::from_millis(50)).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(40), max_attempts: 4 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { attempts, reason, detail, refused } => {
+            assert_eq!(attempts, 4);
+            assert!(refused, "Kick rapid drops count as refused");
+            assert!(reason.contains("Kick refused"), "{reason}");
+            let detail = detail.expect("Kick refusal explains why");
+            assert!(detail.contains("Allow multistreaming"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+    // Drain any queued events from the 4 attempts, then verify no further retries happen.
+    while got.try_recv().is_ok() {}
+    assert!(
+        timeout(Duration::from_millis(250), got.recv()).await.is_err(),
+        "a failed destination must stop retrying for the rest of this stream"
+    );
+}
+
+async fn platform_that_drops_on_video(listener: TcpListener, key: &'static str) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (itx, mut irx) = mpsc::unbounded_channel();
+                let serve = serve_platform(&mut sock, key, &itx);
+                let drop_on_video = async {
+                    while let Some(g) = irx.recv().await {
+                        let is_video = matches!(g, Got::Video(_, _));
+                        let _ = tx.send(g);
+                        if is_video {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = serve => {}
+                    _ = drop_on_video => {}
+                }
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+#[tokio::test]
+async fn kick_over_1080p_rapid_close_does_not_blame_multistreaming() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops_on_video(l, "k").await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(2560);
+    m.video_height = Some(1440);
+    m.video_frame_rate = Some(60.0);
+    m.video_bitrate_kbps = Some(18_000);
+    let r = obs.c.publish_metadata(&m).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    obs.video(0, AVC_HEADER).await;
+    obs.video(0, KEY).await;
+
+    match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
+        PushState::Reconnecting { reason, .. } => {
+            assert!(!reason.contains("Allow multistreaming"), "misdiagnosed 1440p close: {reason}");
+            assert!(reason.contains("1080p"), "should explain Kick 1080p cap: {reason}");
+        }
+        s => panic!("expected Reconnecting, got {s:?}"),
+    }
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused);
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            assert!(reason.contains("1080p"), "reason should mention 1080p: {reason}");
+            let detail = detail.expect("Kick limit failure explains why");
+            assert!(!detail.contains("Allow multistreaming"), "misdiagnosed detail: {detail}");
+            assert!(detail.contains("1080p") && detail.contains("2560"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_refused_stream_key_gives_up_after_bounded_attempts() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform(l, "right").await;
+    let dest = Destination {
+        id: "twitch".into(),
+        retry: push::Retry {
+            first: Duration::from_millis(20),
+            max: Duration::from_millis(40),
+            max_attempts: push::DEFAULT_MAX_ATTEMPTS,
+        },
+        ..destination(dport, "wrong")
+    };
+    let mut health = start(&w, dest);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { attempts, reason, detail, refused } => {
+            assert_eq!(attempts, push::REFUSED_MAX_ATTEMPTS);
+            assert!(refused);
+            assert!(reason.contains("key"), "{reason}");
+            assert!(detail.as_deref().is_some_and(|d| d.contains("refused the stream key")), "{detail:?}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_destination_far_behind_skips_older_keyframes_and_stale_audio() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    let mut slow = controlled_platform(ls, "slow", open_rx, None).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    w.hub.video(0, big_video(true, 0));
+    w.hub.audio(10, Bytes::from_static(AAC));
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Video(0, _)));
+        assert_eq!(next(rx).await, Got::Audio(10, Bytes::from_static(AAC)));
+    }
+
+    // Stall slow, then send 4.25 s across 10 GOPs (keyframes every 400 ms at 400..=4000).
+    open_tx.send_replace(false);
+    let mut total_video = 1u64;
+    let mut total_audio = 1u64;
+    for step in 1..=85u32 {
+        let ts = step * 50;
+        let is_key = ts.is_multiple_of(400);
+        w.hub.video(ts, big_video(is_key, step as u8));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+        total_video += 1;
+        total_audio += 1;
+        assert!(matches!(next(&mut fast).await, Got::Video(t, _) if t == ts));
+        assert_eq!(next(&mut fast).await, Got::Audio(ts + 10, Bytes::from_static(AAC)));
+    }
+    assert_eq!(hf.borrow().dropped, 0);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    open_tx.send_replace(true);
+    w.hub.end();
+
+    let mut slow_videos = vec![(0u32, true)];
+    let mut slow_audios = vec![10u32];
+    loop {
+        match next(&mut slow).await {
+            Got::Video(ts, data) => slow_videos.push((ts, crate::flv::video_is_keyframe(&data))),
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+
+    // Slow destination jumped directly to the newest keyframe (4000), skipping intermediate GOPs
+    // and dropping the stale audio belonging to those skipped GOPs.
+    let dropped = hs.borrow().dropped;
+    assert_eq!(
+        slow_videos.len() as u64 + slow_audios.len() as u64 + dropped,
+        total_video + total_audio,
+        "every dropped video + skipped audio is accounted for in Health.dropped"
+    );
+    assert!(slow_videos.iter().any(|&(ts, key)| ts == 4000 && key), "resumed at newest keyframe 4000");
+    assert!(
+        !slow_videos.iter().any(|&(ts, key)| (1200..4000).contains(&ts) && key),
+        "intermediate keyframes before 4000 were skipped: {slow_videos:?}"
+    );
+    assert!(
+        slow_audios.contains(&4010) && !slow_audios.iter().any(|&ts| (1200..4000).contains(&ts)),
+        "stale audio in skipped GOPs dropped and resumed with newest keyframe: {slow_audios:?}"
+    );
+    for pair in slow_videos.windows(2) {
+        if pair[1].0 > pair[0].0 + 50 {
+            assert!(pair[1].1, "no orphan P-frame after gap: {:?} -> {:?}", pair[0], pair[1]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_link_slower_than_keyframes_alone_skips_to_newest_keyframe() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (_open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    // Slow platform drains only 16 KB per 100 ms (160 KB/s), while keyframes alone are 128 KB every
+    // 400 ms stream time (320 KB/s stream -> 640 KB/s wall rate at 2x pacing): keyframes alone
+    // exceed the slow link speed, so without keyframe skipping it drifts farther behind forever.
+    let mut slow = controlled_platform(ls, "slow", open_rx, Some((16 * 1024, Duration::from_millis(100)))).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    let hub = w.hub.clone();
+    let pub_task = tokio::spawn(async move {
+        // 120 frames = 6.0 s stream time (keyframes every 400 ms: 0, 400, ..., 5600), 25 ms wall step.
+        for step in 0..120u32 {
+            let ts = step * 50;
+            let is_key = ts.is_multiple_of(400);
+            let bytes = if is_key { 128 * 1024 } else { 32 * 1024 };
+            hub.video(ts, sized_video(is_key, step as u8, bytes));
+            hub.audio(ts + 10, Bytes::from_static(AAC));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        hub.end();
+    });
+
+    let mut slow_videos = Vec::new();
+    let mut slow_audios = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(12), slow.recv()).await.expect("slow pkt").expect("slow open") {
+            Got::Video(ts, data) => slow_videos.push((ts, crate::flv::video_is_keyframe(&data))),
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    pub_task.await.unwrap();
+
+    let mut fast_count = 0usize;
+    loop {
+        match next(&mut fast).await {
+            Got::Video(_, _) => fast_count += 1,
+            Got::Audio(_, _) => {}
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+    assert_eq!(fast_count, 120);
+    assert_eq!(hf.borrow().dropped, 0);
+
+    // Slow platform jumped across intermediate keyframes cleanly, reached the tail of the stream
+    // quickly instead of falling behind forever, never emitted orphan inter frames, and dropped
+    // skipped audio in lockstep with skipped GOPs.
+    let key_ts: Vec<u32> = slow_videos.iter().filter(|&&(_, k)| k).map(|&(t, _)| t).collect();
+    assert!(key_ts.len() < 15, "must have skipped intermediate keyframes when slower than keyframes: {key_ts:?}");
+    assert!(
+        key_ts.last().copied().unwrap_or(0) >= 4800,
+        "jumped near the live tail instead of stalling far behind: {key_ts:?}"
+    );
+    assert!(slow_audios.len() < 120, "skipped-GOP audio dropped with video: sent {}", slow_audios.len());
+    for pair in slow_videos.windows(2) {
+        if pair[1].0 > pair[0].0 + 50 {
+            assert!(pair[1].1, "no orphan inter frame after gap: {:?} -> {:?}", pair[0], pair[1]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn kick_single_dest_compliant_rapid_close_does_not_blame_multistreaming() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops(l, "k", Duration::from_millis(50)).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(40), max_attempts: 3 },
+        ..destination(dport, "k")
+    };
+    let (htx, mut health) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
+    let (_other_tx, other_rx) = watch::channel(false);
+    tokio::spawn(push::run_with_siblings(dest, w.hub.clone(), htx, w.stop.subscribe(), Some(other_rx)));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused, "Kick rapid drops remain refused");
+            assert!(!reason.contains("multistreaming"), "{reason}");
+            let detail = detail.expect("Kick refusal detail");
+            assert!(!detail.contains("Allow multistreaming"), "must not blame multistreaming alone: {detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stop_cancels_in_flight_blocked_send_promptly() {
+    let w = world().await;
+    let l = small_buf_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut got = controlled_platform(l, "k", open_rx, None).await;
+    let (htx, mut health) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let handle = tokio::spawn(push::run(destination(dport, "k"), w.hub.clone(), htx, stop_rx));
+
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+    w.hub.video(0, Bytes::from_static(KEY));
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    state_is(&mut health, |s| *s == PushState::Live).await;
+
+    // Pause server reads and pump large video packets so TCP write blocks inside `p.send`.
+    let _ = open_tx.send(false);
+    for i in 1..=64u32 {
+        let ts = i * 33;
+        w.hub.video(ts, sized_video(i.is_multiple_of(15), i as u8, 256 * 1024));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let _ = stop_tx.send(true);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("stop must cancel an in-flight blocked send well before WRITE_DEADLINE")
+        .expect("push task must join cleanly");
+    assert_eq!(health.borrow().state, PushState::Stopped);
+}
+mod platforms;

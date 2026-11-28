@@ -7,6 +7,7 @@
 //! The headless app has no updater: nothing attaches one, so `can_install` stays false and
 //! every request that needs the shell answers 409 `no_updater` with where to download.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -143,8 +144,51 @@ fn no_updater(store: bool) -> EngineError {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateBlockReason {
+    Live,
+    Recording,
+    Replay,
+}
+
+impl UpdateBlockReason {
+    fn install_message(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Live => (
+                "You're live, so the update waits until the stream ends.",
+                "Update after your stream, or turn off Never update while I'm live in Settings › Updates.",
+            ),
+            Self::Recording => (
+                "You're recording, so the update waits until the recording stops.",
+                "Update after your recording finishes, or turn off Never update while I'm live in Settings › Updates.",
+            ),
+            Self::Replay => (
+                "The replay buffer is on, so the update waits until it stops.",
+                "Turn off the replay buffer first, or turn off Never update while I'm live in Settings › Updates.",
+            ),
+        }
+    }
+
+    fn restart_message(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Live => (
+                "You're live, so Ferrocast won't restart until the stream ends.",
+                "Restart after your stream. The update is ready and waits.",
+            ),
+            Self::Recording => (
+                "You're recording, so Ferrocast won't restart until the recording stops.",
+                "Restart after your recording finishes. The update is ready and waits.",
+            ),
+            Self::Replay => (
+                "The replay buffer is on, so Ferrocast won't restart until it stops.",
+                "Turn off the replay buffer first. The update is ready and waits.",
+            ),
+        }
+    }
+}
+
 /// Whether an install may start now, and of what.
-fn claimable(s: &UpdateState, blocked: bool) -> Result<AvailableUpdate, EngineError> {
+fn claimable(s: &UpdateState, blocked: Option<UpdateBlockReason>) -> Result<AvailableUpdate, EngineError> {
     let Some(update) = s.available.clone() else {
         return Err(EngineError::Missing {
             code: "no_update",
@@ -174,13 +218,9 @@ fn claimable(s: &UpdateState, blocked: bool) -> Result<AvailableUpdate, EngineEr
         }
         InstallPhase::Idle | InstallPhase::Failed => {}
     }
-    if blocked {
-        return Err(refused(
-            409,
-            "live",
-            "You're live, so the update waits until the stream ends.",
-            "Update after your stream, or turn off Never update while I'm live in Settings › Updates.",
-        ));
+    if let Some(reason) = blocked {
+        let (msg, hint) = reason.install_message();
+        return Err(refused(409, "live", msg, hint));
     }
     Ok(update)
 }
@@ -192,7 +232,7 @@ impl Engine {
         r
     }
 
-    fn send_update_frame(&self) {
+    pub(crate) fn send_update_frame(&self) {
         self.send_live(LiveFrame::new("update", &self.update_view()));
     }
 
@@ -220,7 +260,10 @@ impl Engine {
 
     /// The desktop shell has an updater: the dashboard may offer checks and installs.
     pub fn attach_updater(&self) {
-        self.with_update(|s| s.updater = true);
+        self.with_update(|s| {
+            self.studio().update_committing.store(false, Ordering::Release);
+            s.updater = true;
+        });
     }
 
     /// The Microsoft Store installed this copy: it updates it, so Ferrocast offers no checks
@@ -298,6 +341,7 @@ impl Engine {
     /// Installed: it runs after a restart, which waits for the streamer (never automatic).
     pub fn update_ready(&self, version: &str) {
         self.with_update(|s| {
+            self.studio().update_committing.store(false, Ordering::Release);
             s.install.phase = InstallPhase::Ready;
             s.install.version = Some(version.into());
             s.install.error = None;
@@ -305,18 +349,19 @@ impl Engine {
         self.notice(
             "update",
             NoticeLevel::Info,
-            &format!("Ferrocast {version} is ready. Restart Ferrocast when it suits you to finish the update."),
+            &format!("Ferrocast {version} is ready: restart to finish the update."),
         );
     }
 
     /// The shell couldn't download or install: say why on the dashboard.
     pub fn update_install_failed(&self, problem: UpdateProblem) {
-        let line = format!("The update wasn't installed: {} {}", problem.message, problem.hint);
+        let detail = format!("{} {}", problem.message, problem.hint);
         self.with_update(|s| {
+            self.studio().update_committing.store(false, Ordering::Release);
             s.install.phase = InstallPhase::Failed;
             s.install.error = Some(problem);
         });
-        self.notice("update", NoticeLevel::Warn, &line);
+        self.notice_detail("update", NoticeLevel::Warn, "The update wasn't installed", &detail);
     }
 
     /// Older name for a failed install with a plain reason.
@@ -350,9 +395,29 @@ impl Engine {
         self.status()["live"].as_object().is_some_and(|m| m.values().any(|v| v == true))
     }
 
-    /// An update must wait: the streamer is live and chose "never update while live".
+    fn update_block_reason(&self) -> Option<UpdateBlockReason> {
+        if !self.settings().never_update_while_live {
+            return None;
+        }
+        if self.is_live() {
+            return Some(UpdateBlockReason::Live);
+        }
+        if let Ok(host) = self.studio_host() {
+            let cap = host.local_capture_block();
+            if cap.recording {
+                return Some(UpdateBlockReason::Recording);
+            }
+            if cap.replay {
+                return Some(UpdateBlockReason::Replay);
+            }
+        }
+        None
+    }
+
+    /// An update must wait: live on air, recording locally, or the replay buffer is on while
+    /// "never update while I'm live" is on.
     pub fn update_blocked(&self) -> bool {
-        self.is_live() && self.settings().never_update_while_live
+        self.update_block_reason().is_some()
     }
 
     /// "Check for updates": asks the shell and waits up to `wait` for its answer.
@@ -374,7 +439,7 @@ impl Engine {
     /// The dashboard asks to install the update the shell found. A backup is taken first
     /// (R-34); without one the update doesn't start.
     pub async fn request_update_install(&self) -> Result<AvailableUpdate, EngineError> {
-        let blocked = self.update_blocked();
+        let blocked = self.update_block_reason();
         // Checked and claimed in one step, so two quick clicks can't start two installs.
         let (update, before) = {
             let mut s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
@@ -396,33 +461,54 @@ impl Engine {
         Ok(update)
     }
 
-    /// "Restart to finish": only after an install, and never while live (R-60).
+    /// "Restart to finish": only after an install, and never while live, recording, or buffering replays (R-60).
     pub fn request_update_restart(&self) -> Result<String, EngineError> {
-        let (updater, store, install) = {
+        {
             let s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
-            (s.updater, s.store, s.install.clone())
-        };
-        if !updater {
-            return Err(no_updater(store));
+            if !s.updater {
+                return Err(no_updater(s.store));
+            }
+            if s.install.phase != InstallPhase::Ready {
+                return Err(refused(
+                    409,
+                    "not_ready",
+                    "There's no installed update waiting for a restart.",
+                    "Install the update first (Update now), then restart.",
+                ));
+            }
         }
-        if install.phase != InstallPhase::Ready {
-            return Err(refused(
-                409,
-                "not_ready",
-                "There's no installed update waiting for a restart.",
-                "Install the update first (Update now), then restart.",
-            ));
-        }
-        if self.update_blocked() {
-            return Err(refused(
+        let _gate = self.studio().output_gate.try_lock().map_err(|_| {
+            refused(
                 409,
                 "live",
-                "You're live, so Ferrocast won't restart until the stream ends.",
-                "Restart after your stream. The update is ready and waits.",
-            ));
+                "Recording or streaming is starting, so Ferrocast won't restart yet.",
+                "Try again once it finishes starting.",
+            )
+        })?;
+        if let Some(reason) = self.update_block_reason() {
+            let (msg, hint) = reason.restart_message();
+            return Err(refused(409, "live", msg, hint));
         }
+        // Re-check Ready and publish `update_committing` inside one update-state transition so a
+        // racing `update_install_failed` cannot leave `update_committing` stuck `true`.
+        let version = {
+            let s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
+            if !s.updater {
+                return Err(no_updater(s.store));
+            }
+            if s.install.phase != InstallPhase::Ready {
+                return Err(refused(
+                    409,
+                    "not_ready",
+                    "There's no installed update waiting for a restart.",
+                    "Install the update first (Update now), then restart.",
+                ));
+            }
+            self.studio().update_committing.store(true, Ordering::Release);
+            s.install.version.clone().unwrap_or_default()
+        };
         self.inner.restart_update.notify_one();
-        Ok(install.version.unwrap_or_default())
+        Ok(version)
     }
 }
 

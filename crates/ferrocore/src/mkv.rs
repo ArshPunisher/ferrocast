@@ -17,6 +17,10 @@ const AUDIO: u8 = 2;
 const CLUSTER_MS: i64 = 30_000;
 /// Sound alone starts a new cluster this often (ms).
 const AUDIO_ONLY_CLUSTER_MS: i64 = 5_000;
+/// Room inside Info for the duration: its element (11 bytes) and a Void for what is left (3).
+const DURATION_ROOM: usize = 14;
+/// What a finish that failed hands back (shared with MP4's).
+pub use crate::mp4::FinishFailed;
 
 /// An element's size in Matroska's variable-length form (8 bytes when it's big, else fewest).
 fn size(n: u64) -> Vec<u8> {
@@ -56,6 +60,13 @@ fn string(id: u32, s: &str) -> Vec<u8> {
     element(id, s.as_bytes())
 }
 
+#[derive(Debug)]
+struct Cluster {
+    at: i64,
+    cue: i64,
+    blocks: Vec<(u8, i64, bool, Vec<u8>)>,
+}
+
 /// Writes an MKV to `out` as packets come.
 #[derive(Debug)]
 pub struct MkvWriter<W: Write> {
@@ -63,8 +74,10 @@ pub struct MkvWriter<W: Write> {
     has_video: bool,
     /// The first time (µs) in the file: it starts at 0 from there.
     start_us: Option<i64>,
-    /// The cluster being gathered: its time (ms) and its blocks.
-    cluster: Option<(i64, Vec<u8>)>,
+    /// The cluster being gathered.
+    cluster: Option<Cluster>,
+    /// Start time (ms) of the last flushed cluster, so clusters never move backwards.
+    last_cluster_at: i64,
     written: u64,
     /// How many sound tracks.
     tracks: usize,
@@ -74,6 +87,14 @@ pub struct MkvWriter<W: Write> {
     chapters: Vec<(i64, String)>,
     /// The latest time written (µs from the file's start): where a mark goes.
     last_us: i64,
+    /// Where the segment's data starts (what positions in the index count from), and its size field.
+    segment_at: u64,
+    /// Where Info and Tracks start, and the room inside Info kept for the duration.
+    info_at: u64,
+    tracks_at: u64,
+    duration_room: u64,
+    /// Each cluster written: its time (ms) and where it starts in the file (for the index).
+    cues: Vec<(i64, u64)>,
 }
 
 /// A Void element exactly `len` bytes long (at least 2), or None.
@@ -137,8 +158,17 @@ impl<W: Write> MkvWriter<W> {
             .concat(),
         );
         let app = format!("Ferrocast {}", env!("CARGO_PKG_VERSION"));
-        let info =
-            element(0x1549_A966, &[uint(0x2AD7B1, 1_000_000), string(0x4D80, &app), string(0x5741, &app)].concat());
+        // A Void inside Info, where the duration goes when the file is finished.
+        let info = element(
+            0x1549_A966,
+            &[
+                uint(0x2AD7B1, 1_000_000),
+                string(0x4D80, &app),
+                string(0x5741, &app),
+                void(DURATION_ROOM).unwrap_or_default(),
+            ]
+            .concat(),
+        );
         let mut tracks = Vec::new();
         if let Some(v) = &video {
             let codec = if v.codec == VideoCodec::Hevc { "V_MPEGH/ISO/HEVC" } else { "V_MPEG4/ISO/AVC" };
@@ -167,6 +197,8 @@ impl<W: Write> MkvWriter<W> {
                     uint(0x88, u64::from(i == 0)),
                     uint(0x9C, 0),
                     string(0x86, "A_AAC"),
+                    // The track's name, when it has one (TrackEntry's Name).
+                    if a.name.is_empty() { Vec::new() } else { string(0x536E, &a.name) },
                     element(0x63A2, &a.config),
                     element(0xE1, &[float(0xB5, f64::from(a.sample_rate)), uint(0x9F, u64::from(a.channels))].concat()),
                 ]
@@ -176,7 +208,11 @@ impl<W: Write> MkvWriter<W> {
         let mut head = ebml;
         // The segment's size stays unknown: the file can end anywhere and still play.
         head.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let segment_at = head.len() as u64;
+        let info_at = segment_at;
+        let duration_room = info_at + info.len() as u64 - DURATION_ROOM as u64;
         head.extend(info);
+        let tracks_at = head.len() as u64;
         head.extend(element(0x1654_AE6B, &tracks));
         let room_at = head.len() as u64;
         head.extend(void(crate::mp4::ROOM).unwrap_or_default());
@@ -187,11 +223,17 @@ impl<W: Write> MkvWriter<W> {
             has_video: video.is_some(),
             start_us: None,
             cluster: None,
+            last_cluster_at: 0,
             written: head.len() as u64,
             tracks: audio.len(),
             room_at,
             chapters: Vec::new(),
             last_us: 0,
+            segment_at,
+            info_at,
+            tracks_at,
+            duration_room,
+            cues: Vec::new(),
         })
     }
 
@@ -214,8 +256,9 @@ impl<W: Write> MkvWriter<W> {
         }
         let start = *self.start_us.get_or_insert(p.pts_us.min(p.dts_us));
         self.last_us = self.last_us.max(p.pts_us - start);
-        let ms = (p.pts_us - start) / 1000;
-        self.block(VIDEO, ms, p.key, &p.data, p.key)
+        let pts_ms = (p.pts_us - start) / 1000;
+        let dts_ms = (p.dts_us - start) / 1000;
+        self.block(VIDEO, pts_ms, p.key, &p.data, p.key, dts_ms, pts_ms)
     }
 
     /// An AAC frame for the first sound track.
@@ -239,34 +282,56 @@ impl<W: Write> MkvWriter<W> {
         }
         self.last_us = self.last_us.max(p.pts_us - start);
         let ms = (p.pts_us - start) / 1000;
-        let new = !self.has_video
-            && track == 0
-            && self.cluster.as_ref().is_none_or(|(at, _)| ms - at >= AUDIO_ONLY_CLUSTER_MS);
-        self.block(AUDIO + track as u8, ms, true, &p.data, new)
+        let new =
+            !self.has_video && track == 0 && self.cluster.as_ref().is_none_or(|c| ms - c.at >= AUDIO_ONLY_CLUSTER_MS);
+        self.block(AUDIO + track as u8, ms, true, &p.data, new, ms, ms)
     }
 
-    fn block(&mut self, track: u8, ms: i64, key: bool, data: &[u8], new_cluster: bool) -> io::Result<()> {
-        let far = self.cluster.as_ref().is_some_and(|(at, _)| (ms - at).abs() >= CLUSTER_MS);
+    #[allow(clippy::too_many_arguments)]
+    fn block(
+        &mut self,
+        track: u8,
+        ms: i64,
+        key: bool,
+        data: &[u8],
+        new_cluster: bool,
+        cluster_at: i64,
+        cue_ms: i64,
+    ) -> io::Result<()> {
+        let far = self.cluster.as_ref().is_some_and(|c| (ms - c.at).abs() >= CLUSTER_MS);
         if new_cluster || far || self.cluster.is_none() {
             self.flush_cluster()?;
-            self.cluster = Some((ms.max(0), Vec::new()));
+            self.cluster =
+                Some(Cluster { at: cluster_at.max(self.last_cluster_at), cue: cue_ms.max(0), blocks: Vec::new() });
         }
-        let Some((at, blocks)) = self.cluster.as_mut() else { return Ok(()) };
-        let rel = i16::try_from(ms - *at).unwrap_or(if ms < *at { i16::MIN } else { i16::MAX });
-        let mut body = vec![0x80 | track];
-        body.extend_from_slice(&rel.to_be_bytes());
-        body.push(if key { 0x80 } else { 0 });
-        body.extend_from_slice(data);
-        blocks.extend(element(0xA3, &body));
+        let Some(c) = self.cluster.as_mut() else { return Ok(()) };
+        if ms < c.at {
+            c.at = ms.max(self.last_cluster_at);
+        }
+        c.blocks.push((track, ms, key, data.to_vec()));
         Ok(())
     }
 
     fn flush_cluster(&mut self) -> io::Result<()> {
-        if let Some((at, blocks)) = self.cluster.take() {
-            let c = element(0x1F43_B675, &[uint(0xE7, at.max(0) as u64), blocks].concat());
-            self.out.write_all(&c)?;
+        if let Some(c) = self.cluster.take() {
+            let at = c.at.max(0);
+            let mut blocks = Vec::new();
+            for (track, ms, key, data) in c.blocks {
+                let rel = i16::try_from(ms - at).unwrap_or(if ms < at { i16::MIN } else { i16::MAX });
+                let mut body = Vec::with_capacity(4 + data.len());
+                body.push(0x80 | track);
+                body.extend_from_slice(&rel.to_be_bytes());
+                body.push(if key { 0x80 } else { 0 });
+                body.extend_from_slice(&data);
+                blocks.extend(element(0xA3, &body));
+            }
+            let elem = element(0x1F43_B675, &[uint(0xE7, at as u64), blocks].concat());
+            self.out.write_all(&elem)?;
             self.out.flush()?;
-            self.written += c.len() as u64;
+            // Where it starts, for the index a finished file has.
+            self.cues.push((c.cue.max(0), self.written));
+            self.last_cluster_at = at;
+            self.written += elem.len() as u64;
         }
         Ok(())
     }
@@ -274,6 +339,12 @@ impl<W: Write> MkvWriter<W> {
     /// Bytes written to the output so far (the cluster being gathered isn't).
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Gives the output up without writing the cluster being gathered (a disk that can't take
+    /// it): the output, and where the last whole cluster ends (see `Mp4Writer::abandon`).
+    pub fn abandon(self) -> (W, u64) {
+        (self.out, self.written)
     }
 
     /// Writes out the last cluster and hands the output back.
@@ -285,25 +356,119 @@ impl<W: Write> MkvWriter<W> {
 }
 
 impl<W: Write + Seek> MkvWriter<W> {
-    /// As `finish`, with the chapter marks written into the room after the tracks; marks that
-    /// don't fit are left out.
+    /// As `finalize`, with the error flattened (the writer is dropped: nothing is cut back).
     pub fn finish_with_chapters(self) -> io::Result<W> {
-        let (at, chapters) = (self.room_at, self.chapters.clone());
-        let mut out = self.finish()?;
-        for n in (1..=chapters.len()).rev() {
-            let c = chapters_element(&chapters[..n]);
-            let Some(rest) = crate::mp4::ROOM.checked_sub(c.len()) else { continue };
+        self.finalize().map_err(|f| f.error)
+    }
+
+    /// Writes out the last cluster and makes the file a finished Matroska: the duration in Info,
+    /// an index of the clusters (Cues) at the end, a SeekHead that says where Info, Tracks, the
+    /// chapters and the index are, the chapters, and the segment's size. A player then shows the
+    /// length and seeks without reading the file through. If any step fails the header is put back
+    /// as it was (the file plays as the open-ended one it was), and the failure hands back the
+    /// output and where the last whole cluster ends, to cut back to.
+    pub fn finalize(mut self) -> Result<W, FinishFailed<W>> {
+        macro_rules! fail {
+            ($self:ident, $e:expr) => {{
+                let whole = $self.written;
+                return Err(FinishFailed { error: $e, out: $self.out, whole });
+            }};
+        }
+        if let Err(e) = self.flush_cluster().and_then(|()| self.out.flush()) {
+            fail!(self, e);
+        }
+        if self.cues.is_empty() {
+            return Ok(self.out);
+        }
+        let track = if self.has_video { VIDEO } else { AUDIO };
+        let points: Vec<u8> = self
+            .cues
+            .iter()
+            .flat_map(|(ms, at)| {
+                element(
+                    0xBB,
+                    &[
+                        uint(0xB3, *ms as u64),
+                        element(0xB7, &[uint(0xF7, u64::from(track)), uint(0xF1, at - self.segment_at)].concat()),
+                    ]
+                    .concat(),
+                )
+            })
+            .collect();
+        let cues = element(0x1C53_BB6B, &points);
+        let end = self.written;
+        let chapters = self.chapters.clone();
+        // The room after Tracks: the SeekHead (a fixed size for the same entries), then the
+        // chapters that fit, then a Void for what is left.
+        let seek = |positions: [u64; 4], chapters: bool| -> Vec<u8> {
+            let entry = |id: &[u8], at: u64| {
+                element(0x4DBB, &[element(0x53AB, id), element(0x53AC, &at.to_be_bytes())].concat())
+            };
+            let mut list =
+                [entry(&[0x15, 0x49, 0xA9, 0x66], positions[0]), entry(&[0x16, 0x54, 0xAE, 0x6B], positions[1])]
+                    .concat();
+            if chapters {
+                list.extend(entry(&[0x10, 0x43, 0xA7, 0x70], positions[2]));
+            }
+            list.extend(entry(&[0x1C, 0x53, 0xBB, 0x6B], positions[3]));
+            element(0x114D_9B74, &list)
+        };
+        let mut room = None;
+        for n in (0..=chapters.len()).rev() {
+            let c = if n == 0 { Vec::new() } else { chapters_element(&chapters[..n]) };
+            let seek_len = seek([0; 4], n > 0).len();
+            let Some(rest) = crate::mp4::ROOM.checked_sub(seek_len + c.len()) else { continue };
             let rest = if rest == 0 { Some(Vec::new()) } else { void(rest) };
             if let Some(rest) = rest {
-                out.seek(SeekFrom::Start(at))?;
-                out.write_all(&c)?;
-                out.write_all(&rest)?;
-                out.seek(SeekFrom::End(0))?;
-                out.flush()?;
+                let chapters_at = self.room_at + seek_len as u64;
+                let rel = |at: u64| at - self.segment_at;
+                let head = seek([rel(self.info_at), rel(self.tracks_at), rel(chapters_at), rel(end)], n > 0);
+                room = Some([head, c, rest].concat());
                 break;
             }
         }
-        Ok(out)
+        let Some(room) = room else {
+            fail!(self, io::Error::other("no room for the index"));
+        };
+        let original_room = void(crate::mp4::ROOM).unwrap_or_default();
+        let duration_ms = (self.last_us.max(0) as f64) / 1000.0;
+        let duration = [float(0x4489, duration_ms), void(DURATION_ROOM - 11).unwrap_or_default()].concat();
+        let void_duration = void(DURATION_ROOM).unwrap_or_default();
+        // 1. The index at the end. Failing here leaves the open-ended file with a piece of index
+        //    past its last cluster, which the caller cuts off.
+        let wrote =
+            self.out.seek(SeekFrom::Start(end)).and_then(|_| self.out.write_all(&cues)).and_then(|()| self.out.flush());
+        if let Err(e) = wrote {
+            fail!(self, e);
+        }
+        // 2. The header: duration, SeekHead and chapters, then the segment's size. Put back if one fails.
+        let size = end + cues.len() as u64 - self.segment_at;
+        let patch = (|| -> io::Result<()> {
+            self.out.seek(SeekFrom::Start(self.duration_room))?;
+            self.out.write_all(&duration)?;
+            self.out.seek(SeekFrom::Start(self.room_at))?;
+            self.out.write_all(&room)?;
+            // The segment's size, in 8 bytes (the length marker, then 7).
+            self.out.seek(SeekFrom::Start(self.segment_at - 8))?;
+            let mut field = vec![0x01];
+            field.extend_from_slice(&size.to_be_bytes()[1..]);
+            self.out.write_all(&field)?;
+            self.out.seek(SeekFrom::End(0))?;
+            self.out.flush()
+        })();
+        if let Err(e) = patch {
+            let _ = (|| -> io::Result<()> {
+                self.out.seek(SeekFrom::Start(self.duration_room))?;
+                self.out.write_all(&void_duration)?;
+                self.out.seek(SeekFrom::Start(self.room_at))?;
+                self.out.write_all(&original_room)?;
+                self.out.seek(SeekFrom::Start(self.segment_at - 8))?;
+                self.out.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?;
+                self.out.flush()
+            })();
+            fail!(self, e);
+        }
+        Ok(self.out)
     }
 }
 
@@ -321,5 +486,190 @@ mod tests {
         assert_eq!(element(0x1A45_DFA3, &[1, 2])[..5], [0x1A, 0x45, 0xDF, 0xA3, 0x82]);
         assert_eq!(uint(0xD7, 1), [0xD7, 0x81, 0x01]);
         assert_eq!(uint(0xE7, 0), [0xE7, 0x81, 0x00]);
+    }
+
+    /// A named audio track has a Name in its TrackEntry; an unnamed one has none.
+    #[test]
+    fn audio_tracks_carry_the_names_they_were_given() {
+        use crate::mp4::{AudioTrack, VideoTrack};
+        use crate::video::VideoCodec;
+        let v = VideoTrack {
+            codec: VideoCodec::H264,
+            width: 64,
+            height: 64,
+            config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+        };
+        let a = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            config: vec![0x11, 0x90],
+            bitrate_kbps: 160,
+            name: String::new(),
+        };
+        let named = AudioTrack { name: "Game".into(), ..a.clone() };
+        let w = MkvWriter::with_tracks(std::io::Cursor::new(Vec::new()), Some(v), vec![named, a])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+        // Name (0x536E), its size (4), its text.
+        let name = [0x53, 0x6E, 0x84, b'G', b'a', b'm', b'e'];
+        assert_eq!(bytes.windows(name.len()).filter(|w| **w == name).count(), 1, "one named track");
+        assert_eq!(bytes.windows(2).filter(|w| **w == [0x53, 0x6E]).count(), 1, "the other has no Name");
+    }
+
+    /// Every (track, time in ms) block of a file's clusters, in file order.
+    fn blocks(b: &[u8]) -> Vec<(u8, i64, bool)> {
+        fn id(b: &[u8], at: &mut usize) -> u32 {
+            let n = b[*at].leading_zeros() as usize + 1;
+            let v = b[*at..*at + n].iter().fold(0u32, |a, x| a << 8 | u32::from(*x));
+            *at += n;
+            v
+        }
+        fn len(b: &[u8], at: &mut usize) -> Option<usize> {
+            let n = b[*at].leading_zeros() as usize + 1;
+            let mut v = u64::from(b[*at]) & ((1u64 << (8 - n)) - 1);
+            let all = v == (1u64 << (8 - n)) - 1;
+            for x in &b[*at + 1..*at + n] {
+                v = v << 8 | u64::from(*x);
+            }
+            *at += n;
+            let unknown = all && b[*at - n + 1..*at].iter().all(|x| *x == 0xFF);
+            (!unknown).then_some(v as usize)
+        }
+        let (mut out, mut at, mut base) = (Vec::new(), 0usize, 0i64);
+        while at < b.len() {
+            let tag = id(b, &mut at);
+            let size = len(b, &mut at);
+            match tag {
+                // Segment and Cluster: look inside.
+                0x1853_8067 | 0x1F43_B675 => {}
+                0xE7 => {
+                    base = b[at..at + size.unwrap_or(0)].iter().fold(0i64, |a, x| a << 8 | i64::from(*x));
+                    at += size.unwrap_or(0);
+                }
+                0xA3 => {
+                    let n = size.unwrap_or(0);
+                    let rel = i64::from(i16::from_be_bytes([b[at + 1], b[at + 2]]));
+                    out.push((b[at] & 0x7F, base + rel, b[at + 3] & 0x80 != 0));
+                    at += n;
+                }
+                _ => at += size.unwrap_or(b.len() - at),
+            }
+        }
+        out
+    }
+
+    /// B-frames: each block is at its picture's own display time (not its decode time), in decode
+    /// order inside a cluster, and the sound is on the same clock.
+    #[test]
+    fn b_frame_blocks_are_timed_by_display_with_the_sound_on_the_same_clock() {
+        use crate::audio::AudioPacket;
+        use crate::mp4::{AudioTrack, VideoTrack};
+        use crate::video::{VideoCodec, VideoPacket};
+        let v = VideoTrack {
+            codec: VideoCodec::H264,
+            width: 64,
+            height: 64,
+            config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+        };
+        let a = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            config: vec![0x11, 0x90],
+            bitrate_kbps: 160,
+            name: String::new(),
+        };
+        let mut w =
+            MkvWriter::new(std::io::Cursor::new(Vec::new()), Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        let f = 33_333i64;
+        // Decode order 0, then groups of (P, B, B) with decode times three frames early.
+        let mut order = vec![0i64];
+        let mut g = 1;
+        while order.len() < 90 {
+            order.extend([g + 2, g, g + 1]);
+            g += 3;
+        }
+        order.truncate(90);
+        let mut next_audio = 0i64;
+        let mut want = Vec::new();
+        for (k, shown) in order.iter().enumerate() {
+            let dts = (k as i64 - 1) * f;
+            while next_audio <= dts {
+                w.audio(&AudioPacket { pts_us: next_audio, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+                next_audio += 21_333;
+            }
+            let p = VideoPacket { pts_us: shown * f, dts_us: dts, key: k % 30 == 0, data: vec![1; 100] };
+            want.push(shown * f - (-f)); // relative to the first decode time (-f)
+            w.video(&p).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+        let got = blocks(&bytes);
+        let video: Vec<&(u8, i64, bool)> = got.iter().filter(|b| b.0 == VIDEO).collect();
+        assert_eq!(video.len(), 90);
+        for (b, w) in video.iter().zip(&want) {
+            assert!((b.1 - w / 1000).abs() <= 1, "block at {} ms, picture at {} ms", b.1, w / 1000);
+        }
+        assert!(video.windows(2).any(|w| w[1].1 < w[0].1), "decode order: some later block is earlier in time");
+        assert_eq!(video.iter().filter(|b| b.2).count(), 3, "keyframes");
+        // Sound from pts 0 sits where the first picture (pts 0) is: one frame after the file's start.
+        let first_audio = got.iter().find(|b| b.0 == AUDIO).map_or(-1, |b| b.1);
+        assert!((first_audio - f / 1000).abs() <= 1, "sound starts at {first_audio} ms");
+    }
+
+    #[test]
+    fn clusters_never_write_negative_audio_offsets_at_keyframe_boundaries() {
+        use crate::audio::AudioPacket;
+        use crate::mp4::{AudioTrack, VideoTrack};
+        use crate::video::{VideoCodec, VideoPacket};
+        let v = VideoTrack {
+            codec: VideoCodec::H264,
+            width: 64,
+            height: 64,
+            config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+        };
+        let a = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            config: vec![0x11, 0x90],
+            bitrate_kbps: 160,
+            name: String::new(),
+        };
+        let mut w =
+            MkvWriter::new(std::io::Cursor::new(Vec::new()), Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        w.video(&VideoPacket { pts_us: 0, dts_us: -100_000, key: true, data: vec![1; 50] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.audio(&AudioPacket { pts_us: 0, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+        // Keyframe with B-frame reordering: pts=2000ms, dts=1900ms, followed by trailing audio at 1950ms.
+        w.video(&VideoPacket { pts_us: 2_000_000, dts_us: 1_900_000, key: true, data: vec![1; 50] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.audio(&AudioPacket { pts_us: 1_950_000, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+
+        // Parse raw SimpleBlock relative i16 timestamps inside each cluster.
+        let mut at = 0usize;
+        let mut rels = Vec::new();
+        while at < bytes.len() {
+            let n = bytes[at].leading_zeros() as usize + 1;
+            let tag = bytes[at..at + n].iter().fold(0u32, |a, x| a << 8 | u32::from(*x));
+            at += n;
+            let ln = bytes[at].leading_zeros() as usize + 1;
+            let mut size = u64::from(bytes[at]) & ((1u64 << (8 - ln)) - 1);
+            let all = size == (1u64 << (8 - ln)) - 1;
+            for x in &bytes[at + 1..at + ln] {
+                size = size << 8 | u64::from(*x);
+            }
+            let unknown = all && bytes[at + 1..at + ln].iter().all(|x| *x == 0xFF);
+            at += ln;
+            match tag {
+                0x1853_8067 | 0x1F43_B675 => {}
+                0xA3 if !unknown => {
+                    let rel = i16::from_be_bytes([bytes[at + 1], bytes[at + 2]]);
+                    rels.push((bytes[at] & 0x7F, rel));
+                    at += size as usize;
+                }
+                _ if !unknown => at += size as usize,
+                _ => break,
+            }
+        }
+        assert!(rels.iter().all(|(_, r)| *r >= 0), "negative cluster block offset found: {rels:?}");
     }
 }

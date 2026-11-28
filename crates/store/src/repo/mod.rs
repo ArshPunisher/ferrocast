@@ -1,18 +1,22 @@
 //! Repositories: one module per kind of data. Each takes `&Store` so callers never touch
 //! SQL, and every write stamps its own time.
 
+pub mod api_keys;
 pub mod autoreplies;
 pub mod bot;
 pub mod designs;
 pub mod events;
 pub mod giveaways;
 pub mod goals;
+pub mod labels;
 pub mod loyalty;
 pub mod media;
 pub mod overlays;
 pub mod recap;
 pub mod rules;
 pub mod settings;
+pub mod store_catalog;
+pub mod stream_health;
 pub mod studio;
 pub mod viewers;
 

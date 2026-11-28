@@ -16,8 +16,13 @@ pub async fn current(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.poll()))
 }
 
-/// `{ question, options: string[2..5], duration_s: 10..1800 }`. Read by hand so every
-/// wrong type gets a message that names its field.
+/// Per-platform native vs `!vote` poll capabilities and limits for connected chat platforms.
+pub async fn capabilities(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.poll_capabilities().await))
+}
+
+/// `{ question, options: string[2..5], duration_s: 10..1800 | null, chat_fallback?: bool }`. Read by
+/// hand so every wrong type gets a message that names its field.
 pub async fn start(State(app): State<AppState>, Body(b): Body<Value>) -> ApiResult<impl IntoResponse> {
     if !b.is_object() {
         return Err(ApiError::invalid("Send the poll as an object: { question, options, duration_s }."));
@@ -34,15 +39,22 @@ pub async fn start(State(app): State<AppState>, Body(b): Body<Value>) -> ApiResu
             .ok_or_else(|| ApiError::invalid("options: every answer must be text."))?,
         _ => return Err(ApiError::invalid("options: must be a list of 2 to 5 answers.")),
     };
-    let duration_s = match &b["duration_s"] {
-        Value::Null => 60,
-        Value::Number(n) => n
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| ApiError::invalid("duration_s: polls run for 10 seconds to 30 minutes."))?,
-        _ => return Err(ApiError::invalid("duration_s: must be a whole number of seconds.")),
+    let duration_s = match b.get("duration_s") {
+        None => Some(ferrocast_core::poll::DEFAULT_DURATION_S),
+        Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| ApiError::invalid("duration_s: polls run for 10 seconds to 30 minutes."))?,
+        ),
+        Some(_) => return Err(ApiError::invalid("duration_s: must be a whole number of seconds or null.")),
     };
-    let view = app.engine.start_poll(PollSpec { question, options, duration_s }).await?;
+    let chat_fallback = match b.get("chat_fallback") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return Err(ApiError::invalid("chat_fallback: must be true or false.")),
+    };
+    let view = app.engine.start_poll(PollSpec { question, options, duration_s, chat_fallback }).await?;
     Ok((StatusCode::CREATED, Json(json!(view))))
 }
 
@@ -51,6 +63,6 @@ pub async fn end(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 }
 
 pub async fn clear(State(app): State<AppState>) -> ApiResult<StatusCode> {
-    app.engine.clear_poll()?;
+    app.engine.clear_poll().await?;
     Ok(StatusCode::NO_CONTENT)
 }

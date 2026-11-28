@@ -19,10 +19,14 @@
 pub mod autoreplies;
 pub mod away;
 pub mod chatbot;
+pub mod clipboard;
+pub mod encoder_bench;
 pub(crate) mod game_scenes;
 pub(crate) mod live_watch;
 pub mod moments;
 pub mod obs_tools;
+pub mod push_hold;
+pub(crate) mod record_watch;
 pub(crate) mod rig;
 pub(crate) mod rules;
 pub mod show;
@@ -56,8 +60,18 @@ pub(crate) const STREAM_INFO_KEY: &str = "stream_info";
 /// How often watch time is credited (minutes for everyone who chatted meanwhile).
 const WATCH_TICK: Duration = Duration::from_secs(300);
 
+/// Who currently holds BRB on air, so automatic releases (ads, away, black camera) never
+/// pull the streamer off a manual BRB or another active hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BrbHold {
+    Manual,
+    AdBreak,
+    Away,
+    BlackCam,
+}
+
 /// Studio's runtime state, one per engine.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Studio {
     pub counters: Mutex<BTreeMap<String, i64>>,
     pub counter_defs: RwLock<Vec<CounterDef>>,
@@ -72,36 +86,144 @@ pub(crate) struct Studio {
     pub watching: Mutex<HashSet<(Platform, String)>>,
     pub lane: Mutex<VecDeque<moments::LaneItem>>,
     pub spike: Mutex<SpikeMeter>,
-    pub show: Mutex<Option<show::ShowRun>>,
+    /// Single locked state machine for the Show, countdown, and delayed stream stop.
+    pub machine: Mutex<show::BroadcastMachine>,
+    ///
+    /// Lock order, wherever more than one is taken: `import_busy`, then `auto_config_op`, then
+    /// `library_lock`, then `golive().group_ops`, then `output_lock`, then `output_gate`
+    /// (innermost), and `group_ops` before `config_lock`.
+    /// Nothing waits for an outer lock while holding an inner one, and a start that a running
+    /// start would only queue behind is refused from the `machine` state first
+    /// (`Engine::refuse_if_show_busy`), before any of the locks is awaited.
+    /// Serializes stream start/stop, delayed stop, and Studio stop so no click order races.
+    pub output_lock: tokio::sync::Mutex<()>,
+    /// Mutual exclusion gate between starting any output and claiming a benchmark run (C2).
+    pub output_gate: tokio::sync::Mutex<()>,
+    /// Serializes collection/profile shelf mutations and imports against switches and settings saves.
+    pub library_lock: tokio::sync::Mutex<()>,
+    /// Set once `request_update_restart` admits restart under `output_gate` so late recordings cannot start before exit.
+    pub update_committing: std::sync::atomic::AtomicBool,
+    /// Serializes `auto_config_benchmark` / `cancel` / `apply` / `undo` state transitions (C2/H7).
+    pub auto_config_op: tokio::sync::Mutex<()>,
+    /// Monotonic origin for Show timers (`away`, `live_watch`) so wall-clock jumps never fire them.
+    pub mono_origin: std::time::Instant,
+    /// Last monotonic sample timestamp seen by `live_watch_tick` (for wake-jump detection).
+    pub last_watch_mono: Mutex<Option<i64>>,
     /// Wakes the countdown when a show starts, is skipped or cancelled.
     pub show_wake: Notify,
     /// The last OBS reading and what it means.
     pub health: Mutex<Option<(HealthSample, Health)>>,
     /// The scene to go back to after BRB.
     pub brb_from: Mutex<Option<String>>,
+    /// Active BRB holds (Manual, AdBreak, Away, BlackCam).
+    pub brb_holds: Mutex<HashSet<BrbHold>>,
     /// One health watcher per engine.
     pub health_watching: std::sync::atomic::AtomicBool,
     /// The live watch (a silent mic, a black or frozen camera, a destination down) and its
     /// one loop.
     pub live_watch: Mutex<ferrocast_core::show::LiveWatch>,
+    /// What was said about the recording now (a stop, low room), so each is said once.
+    pub record_watch: Mutex<record_watch::RecordWatch>,
+    /// Web page sources already said to have stopped drawing (said once, and again when they
+    /// draw).
+    pub stalled_noted: Mutex<HashSet<String>>,
+    /// What was said about broken sidechain loops, so each loop is reported once.
+    pub sidechain_watch: Mutex<record_watch::SidechainWatch>,
     pub live_watching: std::sync::atomic::AtomicBool,
     /// Cameras black now that put the show on BRB by itself (it comes back when none is).
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
     /// The stream's health now (None while it isn't live) and its memory.
     pub live_health: Mutex<(ferrocast_core::health::HealthMeter, Option<ferrocast_core::health::Health>)>,
-    /// Auto quality's state for the stream now.
+    /// Rate-limited logger for render vs encode vs network frame misses while live.
+    pub miss_watch: Mutex<live_watch::MissWatch>,
+    /// Rate-limited logger for falling-behind outputs and upload capacity checks while live.
+    pub output_lag_watch: Mutex<live_watch::OutputLagWatch>,
+    /// Auto quality's summary state across the stream (and fallback when single-group/OBS).
     pub auto_quality: Mutex<ferrocast_core::auto_quality::AutoQuality>,
+    /// Independent auto-quality controllers keyed by active encode group ID so one lagging
+    /// group steps down without dragging unrelated groups' bitrates down.
+    pub group_auto_quality:
+        Mutex<std::collections::HashMap<crate::golive::GroupId, ferrocast_core::auto_quality::AutoQuality>>,
     /// The scene on air while the Studio streams (a change is a chapter marker).
     pub scene_now: Mutex<Option<String>>,
     /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
     pub autoreplies: autoreplies::AutoReplies,
     /// Event rules running now (by their place in the list).
     pub rules_busy: Mutex<HashSet<usize>>,
+    /// Items and filters held shown, hidden, on or off by a key held down (never saved).
+    pub holds: Mutex<push_hold::Holds>,
+    /// The Studio's copy and paste of sources and filters: kept while another collection is
+    /// opened, gone when the app quits.
+    pub clipboard: Mutex<Option<clipboard::Clip>>,
+    /// The clips library's state: its folder override (tests) and the background jobs.
+    pub clips: crate::clips::ClipsState,
+    /// Encoder stress benchmark and setting rollback state machine.
+    pub auto_config: Mutex<encoder_bench::AutoConfigSlot>,
+    /// Persisted hardware/software encoder throughput ceiling (`settings["studio_bench"]`).
+    pub studio_bench: RwLock<Option<crate::golive_plan::PersistedStudioBench>>,
+    /// Pre-apply encoder settings queued on startup after an unclean exit, applied when `StudioHost` attaches.
+    pub pending_startup_restore: Mutex<Option<encoder_bench::PendingApply>>,
+}
+
+impl Default for Studio {
+    fn default() -> Self {
+        Self {
+            counters: Mutex::default(),
+            counter_defs: RwLock::default(),
+            modules: RwLock::default(),
+            scenes: RwLock::default(),
+            moments: RwLock::default(),
+            show_cfg: RwLock::default(),
+            duels: Mutex::default(),
+            cooldowns: Mutex::default(),
+            watching: Mutex::default(),
+            lane: Mutex::default(),
+            spike: Mutex::default(),
+            machine: Mutex::default(),
+            output_lock: tokio::sync::Mutex::new(()),
+            output_gate: tokio::sync::Mutex::new(()),
+            library_lock: tokio::sync::Mutex::new(()),
+            update_committing: std::sync::atomic::AtomicBool::new(false),
+            auto_config_op: tokio::sync::Mutex::new(()),
+            mono_origin: std::time::Instant::now(),
+            last_watch_mono: Mutex::default(),
+            show_wake: Notify::new(),
+            health: Mutex::default(),
+            brb_from: Mutex::default(),
+            brb_holds: Mutex::default(),
+            health_watching: std::sync::atomic::AtomicBool::default(),
+            live_watch: Mutex::default(),
+            record_watch: Mutex::default(),
+            stalled_noted: Mutex::default(),
+            sidechain_watch: Mutex::default(),
+            live_watching: std::sync::atomic::AtomicBool::default(),
+            auto_brb: Mutex::default(),
+            live_health: Mutex::default(),
+            miss_watch: Mutex::default(),
+            output_lag_watch: Mutex::default(),
+            auto_quality: Mutex::default(),
+            group_auto_quality: Mutex::default(),
+            scene_now: Mutex::default(),
+            autoreplies: autoreplies::AutoReplies::default(),
+            rules_busy: Mutex::default(),
+            holds: Mutex::default(),
+            clipboard: Mutex::default(),
+            clips: crate::clips::ClipsState::default(),
+            auto_config: Mutex::default(),
+            studio_bench: RwLock::default(),
+            pending_startup_restore: Mutex::default(),
+        }
+    }
 }
 
 impl Engine {
     pub(crate) fn studio(&self) -> &Studio {
         &self.inner.studio
+    }
+
+    /// Monotonic milliseconds since this engine started (immune to wall-clock / NTP jumps).
+    pub(crate) fn mono_ms(&self) -> i64 {
+        i64::try_from(self.studio().mono_origin.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
 
     /// Loads Studio's settings and counter values. A setting that no longer parses keeps
@@ -116,13 +238,22 @@ impl Engine {
                     get_or_default::<ScenesConfig>(s, SCENES_KEY),
                     get_or_default::<MomentsConfig>(s, MOMENTS_KEY),
                     get_or_default::<ShowConfig>(s, SHOW_KEY),
+                    repo::settings::get::<crate::golive_plan::PersistedStudioBench>(
+                        s,
+                        crate::golive_plan::STUDIO_BENCH_KEY,
+                    ),
                     repo::studio::counter_values(s),
                 ))
             })
             .await;
-        let Ok((defs, modules, scenes, moments, show, values)) = loaded else { return };
+        let Ok((defs, modules, scenes, moments, show, bench, values)) = loaded else { return };
         let st = self.studio();
         let ok = |what: &str, e: &ferrocast_store::StoreError| tracing::error!(error = %e, what, "a Studio setting couldn't be read");
+        if let Ok(b) = bench {
+            *st.studio_bench.write().unwrap_or_else(|p| p.into_inner()) = b;
+        } else if let Err(e) = bench {
+            ok("studio_bench", &e);
+        }
         match defs {
             Ok(v) => *st.counter_defs.write().unwrap_or_else(|p| p.into_inner()) = v,
             Err(e) => ok("counters", &e),

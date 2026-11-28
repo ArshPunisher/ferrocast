@@ -19,10 +19,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use ferrocast_core::event::{Event, EventKind, Millis, Origin};
+use ferrocast_core::event::{Event, EventKind, Millis, Origin, Platform};
 use ferrocast_core::giveaway::{Giveaway, GiveawaySpec};
 use ferrocast_core::overlay::WidgetKind;
-use ferrocast_core::poll::{self, Poll, PollSpec};
+use ferrocast_core::poll::{self, PlatformPollCapability, Poll, PollCapabilityMode, PollSpec, PollsCapabilities};
 use serde_json::{Value, json};
 
 use super::bus::{Audience, Bus, platform_key};
@@ -35,6 +35,7 @@ const FLUSH: Duration = Duration::from_millis(250);
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/c/api/v1/polls", post(start_poll))
+        .route("/c/api/v1/polls/capabilities", get(poll_capabilities))
         .route("/c/api/v1/polls/current", get(current_poll).delete(clear_poll))
         .route("/c/api/v1/polls/current/end", post(end_poll))
         .route("/c/api/v1/giveaways", post(start_giveaway))
@@ -147,6 +148,28 @@ pub(crate) fn on_event(_st: &AppState, bus: &Arc<Bus>, ev: &Event) {
 
 // ── Polls ────────────────────────────────────────────────────────────────────────────
 
+/// `GET /c/api/v1/polls/capabilities` → `PollsCapabilities` (cloud mode runs `!vote` in chat).
+async fn poll_capabilities(
+    State(st): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let a = web_account(&st, &headers, &method, true)?;
+    let status = super::web::status_json(&st, &a.account.id)?;
+    let mut platforms = Vec::new();
+    for (key, platform) in [("twitch", Platform::Twitch), ("youtube", Platform::Youtube), ("kick", Platform::Kick)] {
+        if status["connectors"][key]["state"].as_str() == Some("connected") {
+            platforms.push(PlatformPollCapability {
+                platform,
+                mode: PollCapabilityMode::ChatFallback,
+                reason: Some("platform_unsupported".into()),
+                limits: poll::DEFAULT_LIMITS,
+            });
+        }
+    }
+    Ok(json(json!(PollsCapabilities { platforms })))
+}
+
 /// `GET /c/api/v1/polls/current` → `PollView | null`.
 async fn current_poll(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
     let a = web_account(&st, &headers, &method, true)?;
@@ -165,15 +188,22 @@ fn poll_spec(b: &Value) -> Result<PollSpec, ApiError> {
             .ok_or_else(|| invalid("options: every answer must be text."))?,
         _ => return Err(invalid("options: must be a list of 2 to 5 answers.")),
     };
-    let duration_s = match &b["duration_s"] {
-        Value::Null => 60,
-        Value::Number(n) => n
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| invalid("duration_s: polls run for 10 seconds to 30 minutes."))?,
-        _ => return Err(invalid("duration_s: must be a whole number of seconds.")),
+    let duration_s = match b.get("duration_s") {
+        None => Some(ferrocast_core::poll::DEFAULT_DURATION_S),
+        Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| invalid("duration_s: polls run for 10 seconds to 30 minutes."))?,
+        ),
+        Some(_) => return Err(invalid("duration_s: must be a whole number of seconds or null.")),
     };
-    PollSpec { question, options, duration_s }.cleaned().map_err(invalid)
+    let chat_fallback = match b.get("chat_fallback") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return Err(invalid("chat_fallback: must be true or false.")),
+    };
+    PollSpec { question, options, duration_s, chat_fallback }.cleaned().map_err(invalid)
 }
 
 /// `POST /c/api/v1/polls` → 201 `PollView`, announced in chat. 409 while another is open.
@@ -185,6 +215,9 @@ async fn start_poll(
 ) -> Result<Response, ApiError> {
     let a = web_account(&st, &headers, &method, true)?;
     let spec = poll_spec(&body(&headers, &b)?)?;
+    if !spec.chat_fallback {
+        return Err(invalid("Cloud polls run in chat via !vote and require chat fallback to be enabled."));
+    }
     let bus = bus_of(&st, &a.account.id)?;
     let now = Millis(now_ms());
     let poll = {
@@ -198,13 +231,15 @@ async fn start_poll(
     };
     push_poll(&bus);
     announce(&st, &a.account.id, poll.announcement());
-    // Closes on time, unless it was ended or replaced first.
-    let (w, st2, account, id) = (Arc::downgrade(&bus), st.clone(), a.account.id.clone(), poll.id.clone());
-    let wait = u64::try_from((poll.ends_at.0 - now_ms()).max(0)).unwrap_or(0);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(wait)).await;
-        let _ = finish_poll(&st2, &account, &w, Some(&id));
-    });
+    // Closes on time when timed, unless it was ended or replaced first.
+    if let Some(ends_at) = poll.ends_at {
+        let (w, st2, account, id) = (Arc::downgrade(&bus), st.clone(), a.account.id.clone(), poll.id.clone());
+        let wait = u64::try_from((ends_at.0 - now_ms()).max(0)).unwrap_or(0);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            let _ = finish_poll(&st2, &account, &w, Some(&id));
+        });
+    }
     Ok(created(json!(poll.view())))
 }
 

@@ -1200,9 +1200,9 @@ checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "time",
  "version_check",
@@ -2016,6 +2016,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fdab65db9274e0168143841eb8f864a0a21f8b1b8d2ba6812bbe6024346e99e"
 
 [[package]]
+name = "easyfft"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "767e39eef2ad8a3b6f1d733be3ec70364d21d437d06d4f18ea76ce08df20b75f"
+dependencies = [
+ "array-init",
+ "generic_singleton",
+ "num-complex",
+ "realfft",
+ "rustfft",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2201,14 +2214,14 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-camshare"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "windows 0.61.3",
 ]
 
 [[package]]
 name = "ferrocast-connector"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "async-trait",
  "ferrocast-core",
@@ -2219,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-core"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "regex",
  "regex-syntax",
@@ -2231,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-desktop"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2241,6 +2254,7 @@ dependencies = [
  "ferrocast-engine",
  "ferrocast-guest",
  "ferrocast-server",
+ "ferrocast-store",
  "ferrocast-studio",
  "ferrocast-vsthost",
  "ferrocore",
@@ -2253,6 +2267,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
+ "tauri-plugin-deep-link",
  "tauri-plugin-dialog",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
@@ -2270,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-engine"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "age",
  "async-trait",
@@ -2279,6 +2294,7 @@ dependencies = [
  "fastrand",
  "ferrocast-connector",
  "ferrocast-core",
+ "ferrocast-facebook",
  "ferrocast-golive",
  "ferrocast-kick",
  "ferrocast-obs",
@@ -2301,7 +2317,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "subtle",
  "sys-locale",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2314,8 +2332,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrocast-facebook"
+version = "3.8.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "ferrocast-connector",
+ "ferrocast-core",
+ "getrandom 0.4.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "ferrocast-golive"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "aes 0.8.4",
  "bytes",
@@ -2348,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-guest"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2359,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-headless"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "dirs 6.0.0",
  "ferrocast-engine",
@@ -2370,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-kick"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2386,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-obs"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "ferrocast-core",
  "ferrocast-testkit",
@@ -2403,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-relay"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "axum",
@@ -2414,6 +2451,7 @@ dependencies = [
  "ferrocast-testkit",
  "ferrocast-twitch",
  "ferrocast-youtube",
+ "flate2",
  "futures-util",
  "getrandom 0.4.3",
  "hmac 0.12.1",
@@ -2439,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-secrets"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "keyring",
  "serde_json",
@@ -2449,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-server"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2481,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-setup"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "lzma-rust2",
  "serde",
@@ -2497,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-store"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "ferrocast-core",
  "getrandom 0.4.3",
@@ -2514,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-studio"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "base64 0.23.1",
  "block2",
@@ -2559,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-testkit"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2571,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-twitch"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "async-trait",
  "ferrocast-connector",
@@ -2590,14 +2628,14 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-vst-testgain"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "vst3",
 ]
 
 [[package]]
 name = "ferrocast-vsthost"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "base64 0.22.1",
  "dispatch2",
@@ -2616,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-wincam"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "ferrocast-camshare",
  "windows 0.61.3",
@@ -2625,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-youtube"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2652,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocore"
-version = "3.4.0"
+version = "3.8.1"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -2665,6 +2703,7 @@ dependencies = [
  "image",
  "libc",
  "naga",
+ "nnnoiseless",
  "objc2",
  "objc2-av-foundation",
  "objc2-core-foundation",
@@ -2898,9 +2937,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3120,6 +3159,16 @@ dependencies = [
  "typenum",
  "version_check",
  "zeroize",
+]
+
+[[package]]
+name = "generic_singleton"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab6e923c8e978e57cf63e2e200ca967d1d20f0ea2662b28f6d4e11c44aa6ab16"
+dependencies = [
+ "anymap3",
+ "parking_lot",
 ]
 
 [[package]]
@@ -5040,6 +5089,16 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nnnoiseless"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "805d5964d1e7a0006a7fdced7dae75084d66d18b35f1dfe81bd76929b1f8da0c"
+dependencies = [
+ "easyfft",
+ "once_cell",
 ]
 
 [[package]]
@@ -8615,6 +8674,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-deep-link"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab551d9bec27bb79d1c7fe5ed38c5cfd1cebb86efa745acc65f5853f345f6e56"
+dependencies = [
+ "dunce",
+ "plist",
+ "rust-ini",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "tauri-utils",
+ "thiserror 2.0.21",
+ "tracing",
+ "url",
+ "windows-registry",
+ "windows-result 0.4.1",
+]
+
+[[package]]
 name = "tauri-plugin-dialog"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9996,9 +10076,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -10205,9 +10285,9 @@ dependencies = [
 
 [[package]]
 name = "wasmi"
-version = "2.0.1"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b871e9b007ab46d593be9f544b6509bbd29387de68991695b0fb2b5dc2f488c8"
+checksum = "36dcb6cbd722c1575daf8c3063dd7ba1883fcd35b51fcbd377ae4f3371ac4dba"
 dependencies = [
  "spin",
  "wasmi_collections",
@@ -10218,27 +10298,27 @@ dependencies = [
 
 [[package]]
 name = "wasmi_collections"
-version = "2.0.1"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ede48be8c298db065fbe07d8e39f53a556b414c202ed1f5b61a1809fd0e9e4"
+checksum = "b62dc4c1a17f3294aa2b23ac39979e3b38f3ee6afe5673eea76b76902d11103b"
 dependencies = [
  "string-interner 0.19.0",
 ]
 
 [[package]]
 name = "wasmi_core"
-version = "2.0.1"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "471c9cf3627972b1c0b80a098129968208679ca915b75839092cc5178c981834"
+checksum = "c19f6f7fcf32b9e12cebc8fec606fefac71af3d386bae1472e35d620b5471754"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "wasmi_ir"
-version = "2.0.1"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa8bd0931f475e2e8e4f83b3e6a7aff65a4a793bea82a4dd918cdd6b8fedf0b"
+checksum = "14f9c115dfd2397700880a64d14161db3a4da0a11059fac39c6a7935eb8f6b36"
 dependencies = [
  "wasmi_core",
 ]

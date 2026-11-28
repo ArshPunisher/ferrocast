@@ -9,27 +9,39 @@
 
 mod accounts;
 mod actions;
+pub mod api_keys;
 mod backups;
+pub mod clips;
 mod cloud_backup;
 mod cloud_bot;
 mod cloud_sync;
 #[cfg(test)]
 mod cloud_sync_tests;
+mod crash_report;
+#[cfg(test)]
+mod crash_report_tests;
 #[cfg(test)]
 mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod automation;
+mod chat_tts;
 pub mod designs;
+pub mod diagnostics;
 mod discord;
 mod dispatcher;
 mod error;
 mod ferro_account;
 pub mod ffmpeg_get;
+pub mod fonts;
 mod giveaways;
 pub mod golive;
+pub mod golive_plan;
 mod guests;
 mod history;
 pub mod import;
+mod labels;
+pub mod links;
+pub use links::LinksView;
 mod loyalty;
 pub mod music;
 mod obs;
@@ -43,27 +55,33 @@ mod polls;
 mod pro;
 pub mod speech_model;
 pub use pro::{ProStatus, ProView};
+pub mod obsws;
 mod recap;
 mod relay;
 mod remote;
+pub mod safe_mode;
 pub mod smart;
 pub use remote::{
     IN_FLIGHT as REMOTE_IN_FLIGHT, MAX_RESPONSE as REMOTE_MAX_RESPONSE, RemoteHandler, RemoteRequest, RemoteResponse,
     TunnelView,
 };
+pub use safe_mode::{SafeModeStatus, StartOptions};
 mod snapshot;
 pub mod speech;
 mod starter;
+pub mod store_catalog;
 pub mod studio;
 pub mod studio_host;
 mod timers;
 mod updates;
+mod widgets;
 pub use updates::{
     AvailableUpdate, CHECK_WAIT, CURRENT_VERSION, DOWNLOAD_URL, InstallPhase, InstallState, UpdateProblem, UpdateView,
     update_channel,
 };
 mod tip_pro;
 pub use tip_pro::TIP_IMAGES;
+mod viewers;
 mod weekly_email;
 mod welcome;
 
@@ -72,7 +90,7 @@ pub mod state;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ferrocast_connector::{Connector, EventSink, SINK_CAPACITY};
@@ -116,6 +134,7 @@ pub struct Engine {
 
 #[derive(Debug)]
 struct Inner {
+    data_dir: std::path::PathBuf,
     store: Arc<Store>,
     state: RwLock<State>,
     connectors: RwLock<HashMap<Platform, Arc<dyn Connector>>>,
@@ -137,6 +156,9 @@ struct Inner {
     apps: accounts::PlatformApps,
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
     youtube_wake: Mutex<Option<Arc<Notify>>>,
+    viewer_wake: tokio::sync::watch::Sender<u64>,
+    viewer_task: Mutex<Option<tokio::task::AbortHandle>>,
+    live_epoch: [AtomicU64; 3],
     /// The Ferrocast account sign-in in progress (or its last problem).
     account_flow: Mutex<ferro_account::Flow>,
     relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -144,7 +166,9 @@ struct Inner {
     activity: Mutex<ferrocast_core::loyalty::Activity>,
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
     poll: Mutex<polls::PollSlot>,
+    poll_op: tokio::sync::Mutex<()>,
     giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
+    highlight: Mutex<widgets::HighlightSlot>,
     /// When the last welcome went out (they're spaced out during raids).
     last_welcome: Mutex<Option<ferrocast_core::event::Millis>>,
     discord_posts: Mutex<discord::LastPosts>,
@@ -163,8 +187,10 @@ struct Inner {
     restart_update: Notify,
     /// The import preview that can be applied, and one import step at a time.
     import: Mutex<import::Slot>,
+    overlay_import: import::overlay::OverlayPreviewSlot,
     import_busy: tokio::sync::Mutex<()>,
     streamelements_api: RwLock<String>,
+    google_fonts_api: RwLock<String>,
     /// Wakes the OBS connection task when its settings change.
     obs_wake: Notify,
     /// Where OBS's own settings are looked for.
@@ -187,6 +213,7 @@ struct Inner {
     cloud_tts: speech::CloudTts,
     /// Pro dashboard from anywhere: the tunnel to the relay and the server's handler.
     remote: remote::Remote,
+    obsws: obsws::Runtime,
     /// Pro 24/7 cloud bot: the pushed config's version and hashes, counters seen.
     cloud_bot: cloud_bot::CloudBot,
     /// Cloud sync and "Use cloud overlays" (docs/CLOUD.md §1.1): the switches and URLs.
@@ -203,6 +230,28 @@ struct Inner {
     automations: Mutex<automation::Automations>,
     /// Logic plugins that are on, loaded and ready to be told about events.
     plugin_logic: Mutex<plugins::Running>,
+    /// Unclean-exit detection and Safe Mode state.
+    safe_mode: Mutex<safe_mode::SafeModeState>,
+    /// Local session/monthly/all-time label counts and hype/combo trains.
+    labels: Mutex<labels::LabelRuntime>,
+    /// Current stream health tracker persisted to the last-5 streams store.
+    stream_health: Mutex<diagnostics::ActiveStreamHealth>,
+    /// Serializes support diagnostics bundle creation so concurrent requests don't spike I/O/CPU.
+    diagnostics_busy: tokio::sync::Mutex<()>,
+    /// One crash-report step at a time (build, preview, send, discard) and the once-per-run start.
+    crash_report_op: tokio::sync::Mutex<()>,
+    crash_report_started: AtomicBool,
+    /// Short-lived cache of slow OS/GPU/audio hardware enumeration for repeated diagnostics calls.
+    hardware_probe_cache: diagnostics::HardwareProbeCache,
+    /// Avoids repeating `/channels` handle discovery when a legacy YouTube account has no `@handle`.
+    youtube_handle_checked: AtomicBool,
+    /// Last `next_stream_at` timestamp broadcast to overlays, so schedule ticks detect pass-through.
+    last_pushed_next_stream_at: Mutex<Option<Option<i64>>>,
+    chat_tts: chat_tts::ChatTtsSlot,
+    /// Serializes chat TTS policy/pause/mute transitions with admission and approval dispatch.
+    tts_op: tokio::sync::Mutex<()>,
+    /// Moderated `(platform, user_id)` pairs whose pending TTS cleanup failed and awaits retry.
+    blocked_pending_tts_users: Mutex<HashSet<(Platform, String)>>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -218,12 +267,21 @@ impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
     pub async fn start(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_mode(data_dir, false).await
+    }
+
+    /// Starts the desktop engine with unclean-exit detection and optional `--safe-mode` lock.
+    pub async fn start_with_mode(data_dir: &Path, safe_mode_flag: bool) -> Result<Engine, EngineError> {
         let engine = Self::start_with(
             data_dir,
             Arc::from(ferrocast_secrets::best_available(data_dir)),
             PlatformApps::from_env(),
         )
         .await?;
+        engine.init_safe_mode(data_dir, safe_mode_flag);
+        engine.mark_unclean_stream_health().await;
+        // After a crash: the report for a yes (or sent on its own when the person said always).
+        engine.spawn_crash_report_startup();
         // OBS's own settings file in its usual place (`start_with` leaves this empty so
         // tests never read the developer's real OBS).
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
@@ -232,7 +290,7 @@ impl Engine {
         engine.watch_live();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         engine.share_ffmpeg();
-        // Installed plugins' effects that are on (OBS-COMPETE.md §4).
+        // Installed plugins' effects that are on (skipped in Safe Mode).
         engine.load_plugins();
         Ok(engine)
     }
@@ -244,6 +302,12 @@ impl Engine {
         secrets: Arc<dyn ferrocast_secrets::Secrets>,
     ) -> Result<Engine, EngineError> {
         Self::start_with(data_dir, secrets, PlatformApps::default()).await
+    }
+
+    /// Like [`Engine::start_with_secrets`] with an in-memory secret store (for tests outside
+    /// `ferrocast-engine` that shouldn't touch the OS keychain or start background watchers).
+    pub async fn start_with_memory_secrets(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_secrets(data_dir, Arc::new(ferrocast_secrets::MemorySecrets::default())).await
     }
 
     /// Full control over secrets and platform apps (tests point the apps at fakes).
@@ -263,6 +327,7 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
         let store = Arc::new(store);
+        ferrocore::fonts::set_extra_fonts_dir(data_dir.join("fonts"));
 
         let loaded = {
             let s = store.clone();
@@ -280,6 +345,7 @@ impl Engine {
         let start_seq = u64::try_from(now().0).unwrap_or(0).saturating_mul(1000);
         let engine = Engine {
             inner: Arc::new(Inner {
+                data_dir: data_dir.to_path_buf(),
                 store,
                 state: RwLock::new(state),
                 connectors: RwLock::new(HashMap::new()),
@@ -300,12 +366,17 @@ impl Engine {
                 apps,
                 adapters: Mutex::new(HashMap::new()),
                 youtube_wake: Mutex::new(None),
+                viewer_wake: tokio::sync::watch::Sender::new(0),
+                viewer_task: Mutex::new(None),
+                live_epoch: std::array::from_fn(|_| AtomicU64::new(0)),
                 account_flow: Mutex::new(Default::default()),
                 relay_link: Mutex::new(None),
                 activity: Mutex::new(Default::default()),
                 points_cooldown: Mutex::new(Default::default()),
                 poll: Mutex::new(Default::default()),
+                poll_op: tokio::sync::Mutex::new(()),
                 giveaway: tokio::sync::Mutex::new(Default::default()),
+                highlight: Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),
                 discord_posts: Mutex::new(Default::default()),
                 discord_pro: Mutex::new(Default::default()),
@@ -317,8 +388,10 @@ impl Engine {
                 check_update: Notify::new(),
                 restart_update: Notify::new(),
                 import: Mutex::new(None),
+                overlay_import: Mutex::new(Vec::new()),
                 import_busy: tokio::sync::Mutex::new(()),
                 streamelements_api: RwLock::new(import::streamelements::DEFAULT_API.into()),
+                google_fonts_api: RwLock::new(fonts::DEFAULT_GOOGLE_FONTS_API.into()),
                 obs_wake: Notify::new(),
                 // Tests never read (or connect to) the developer's real OBS: `start` sets the real places.
                 obs_paths: RwLock::new(Vec::new()),
@@ -331,6 +404,7 @@ impl Engine {
                 cloud_backup: Default::default(),
                 cloud_tts: Default::default(),
                 remote: Default::default(),
+                obsws: Default::default(),
                 cloud_bot: Default::default(),
                 cloud_sync: Mutex::new(Default::default()),
                 smart: Mutex::new(Default::default()),
@@ -339,13 +413,29 @@ impl Engine {
                 studio_host: Default::default(),
                 automations: Mutex::new(Default::default()),
                 plugin_logic: Mutex::new(Default::default()),
+                safe_mode: Mutex::new(Default::default()),
+                labels: Mutex::new(Default::default()),
+                stream_health: Mutex::new(Default::default()),
+                diagnostics_busy: tokio::sync::Mutex::new(()),
+                crash_report_op: tokio::sync::Mutex::new(()),
+                crash_report_started: AtomicBool::new(false),
+                hardware_probe_cache: Default::default(),
+                youtube_handle_checked: AtomicBool::new(false),
+                last_pushed_next_stream_at: Mutex::new(None),
+                chat_tts: Default::default(),
+                tts_op: tokio::sync::Mutex::new(()),
+                blocked_pending_tts_users: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
         tokio::spawn(backups::run(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
+        let vh = tokio::spawn(viewers::run(engine.clone()));
+        *engine.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(vh.abort_handle());
         tokio::spawn(dispatcher::run(engine.clone()));
+        tokio::spawn(chat_tts::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        tokio::spawn(schedule::run(engine.clone()));
         tokio::spawn(automation::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
@@ -367,17 +457,25 @@ impl Engine {
         tokio::spawn(cloud_bot::run(engine.clone()));
         engine.load_smart().await;
         tokio::spawn(smart::run(engine.clone()));
+        engine.hydrate_labels().await;
+        tokio::spawn(labels::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
         engine.guests_at_start();
         tokio::spawn(cloud_sync::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
+        engine.recover_pending_auto_config_on_startup();
         Ok(engine)
     }
 
     /// Where adapters send events.
     pub fn sink(&self) -> EventSink {
         self.inner.sink.clone()
+    }
+
+    /// Data directory configured when starting this engine.
+    pub fn data_dir(&self) -> &Path {
+        &self.inner.data_dir
     }
 
     /// Submits an event (used by the API for tests and by in-process sources).
@@ -406,19 +504,60 @@ impl Engine {
     pub fn register_connector(&self, c: Arc<dyn Connector>) {
         let platform = c.platform();
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).insert(platform, c);
+        self.bump_live_epoch(platform);
+        self.wake_viewer_poller();
     }
 
     pub fn unregister_connector(&self, platform: Platform) {
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).remove(&platform);
-        let view = {
+        self.bump_live_epoch(platform);
+        let (view, cleared) = {
             let mut st = self.state_mut();
             st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
             st.live.remove(&platform);
-            st.viewers.remove(&platform);
-            st.connectors.clone()
+            let cleared = st.viewers.remove(&platform).map(|_| viewers::overlay_clear_payload(&st.viewers, platform));
+            (st.connectors.clone(), cleared)
         };
+        if let Some(viewers) = cleared {
+            self.send_overlay(OverlayFrame::new(
+                frames::Audience::All,
+                self.next_seq(),
+                "state",
+                &serde_json::json!({ "viewers": viewers }),
+            ));
+        }
         // Open dashboards drop the account at once instead of after a reload.
         self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": view })));
+        self.wake_viewer_poller();
+    }
+
+    pub(crate) fn wake_viewer_poller(&self) {
+        self.inner.viewer_wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    pub(crate) fn bump_live_epoch(&self, platform: Platform) {
+        let idx = match platform {
+            Platform::Twitch => 0,
+            Platform::Youtube => 1,
+            Platform::Kick => 2,
+            _ => return,
+        };
+        self.inner.live_epoch[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn live_epochs(&self) -> [u64; 3] {
+        [
+            self.inner.live_epoch[0].load(Ordering::Relaxed),
+            self.inner.live_epoch[1].load(Ordering::Relaxed),
+            self.inner.live_epoch[2].load(Ordering::Relaxed),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_viewer_poller(&self) {
+        if let Some(h) = self.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            h.abort();
+        }
     }
 
     /// Held while saving any setting (see `Inner::config`).
@@ -449,6 +588,15 @@ impl Engine {
 
     pub fn store(&self) -> Arc<Store> {
         self.inner.store.clone()
+    }
+
+    /// Flushes persistent engine state (SQLite WAL) cleanly during application quit, before
+    /// deleting clean-exit markers.
+    pub fn shutdown(&self) {
+        self.restore_pending_auto_config_on_shutdown();
+        if let Err(err) = self.inner.store.checkpoint() {
+            tracing::warn!(%err, "SQLite WAL checkpoint failed during engine shutdown");
+        }
     }
 
     pub(crate) fn state(&self) -> std::sync::RwLockReadGuard<'_, State> {
@@ -507,6 +655,7 @@ impl Engine {
             return;
         }
         self.remember_hidden(platform, id);
+        self.clear_highlight_if_message(platform, id);
         let engine = self.clone();
         let sid = id.to_string();
         tokio::spawn(async move {
@@ -518,6 +667,7 @@ impl Engine {
 
     /// Hides a person's recent chat (banned or messages cleared).
     pub(crate) fn hide_user(&self, platform: Platform, actor_id: &str) {
+        self.clear_highlight_if_user_id(platform, actor_id);
         let engine = self.clone();
         let aid = actor_id.to_string();
         let since = now().0 - 24 * 3_600_000;
@@ -580,6 +730,7 @@ impl Engine {
         self.refresh_active_design().await;
         // Auto-replies live outside `State`; an import or restore brings new ones.
         self.load_autoreplies().await;
+        self.push_overlay_links_locked().await;
         Ok(())
     }
 
@@ -593,6 +744,12 @@ impl Engine {
         let current = serde_json::to_value(self.settings()).map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut merged = current.clone();
         for (k, v) in patch {
+            // The consent to send crash reports changes only by a save that is about nothing
+            // else: a stale settings form (another tab, a tablet on the LAN) saves every field
+            // it loaded, and must not put back a choice the person has since changed.
+            if k == "crash_reports" && patch.len() > 1 {
+                continue;
+            }
             let Some(slot) = merged.get_mut(k) else { continue }; // unknown keys are ignored
             let mut one = current.clone();
             one[k.as_str()] = v.clone();
@@ -623,7 +780,8 @@ impl Engine {
     }
 }
 
-/// Deletes old chat from the log at start and every six hours (alerts and tips are kept).
+/// Deletes old chat, stale ephemeral TTS audio, and expired daily transcripts at start and every
+/// six hours (alerts, tips, and user-uploaded media are kept).
 async fn prune(engine: Engine) {
     loop {
         let days = engine.settings().keep_chat_days.max(1);
@@ -631,6 +789,35 @@ async fn prune(engine: Engine) {
             Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old chat"),
             Ok(_) => {}
             Err(err) => tracing::warn!(%err, "couldn't prune old chat"),
+        }
+        // Clean up orphaned ephemeral TTS files older than 1 hour, preserving any alert still in
+        // the queue and any cached voice previews.
+        let mut keep_ids = engine.cloud_tts().preview_ids();
+        keep_ids.extend(engine.chat_tts_media_ids());
+        {
+            let q = engine.inner.queue.lock().await;
+            if let Some(id) = q.playing().and_then(|p| p.alert.tts_audio.as_ref()) {
+                keep_ids.push(id.clone());
+            }
+            for w in q.waiting() {
+                if let Some(id) = w.alert.tts_audio.as_ref() {
+                    keep_ids.push(id.clone());
+                }
+            }
+        }
+        let cutoff = now().0 - 3_600_000;
+        match engine.db(move |s| repo::media::prune_speech(s, cutoff, &keep_ids)).await {
+            Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old tts audio"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "couldn't prune old tts audio"),
+        }
+        if let Some(dir) = engine.transcript_dir() {
+            let now_ms = now().0;
+            if let Ok(n) = tokio::task::spawn_blocking(move || crate::studio::transcript::prune(&dir, now_ms)).await
+                && n > 0
+            {
+                tracing::info!(removed = n, "pruned old transcripts");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
     }
@@ -651,6 +838,7 @@ pub fn platform_key(p: Platform) -> &'static str {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
         Platform::Kick => "kick",
+        Platform::Facebook => "facebook",
         Platform::Tips => "tips",
         Platform::Ferrocast => "ferrocast",
     }
@@ -674,12 +862,17 @@ fn load_state(store: &Store) -> Result<(State, AlertQueue), StoreError> {
         welcome: get_or_default(store, "welcome")?,
         ..State::default()
     };
-    for key in ["twitch", "youtube", "kick", "obs", "relay"] {
+    for key in ["twitch", "youtube", "kick", "facebook", "obs", "relay"] {
         st.connectors.insert(key.into(), ConnectorView::off());
     }
     let queue = repo::rules::load_queue(store)?.unwrap_or_default();
     Ok((st, queue))
 }
 
+#[cfg(test)]
+mod facebook_tests;
+pub mod schedule;
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod tests;

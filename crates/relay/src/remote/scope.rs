@@ -83,10 +83,12 @@ pub const OWNER_DENIED: &[Rule] = &[
     // there or start and stop it.
     ("*", "/studio/engine"),
     ("*", "/studio/engine/**"),
-    // Accounts and sign-ins, and pairing more browsers.
+    // Accounts and sign-ins, and pairing more browsers or managing local API keys.
     ("*", "/accounts"),
     ("*", "/accounts/**"),
     ("*", "/session/**"),
+    ("*", "/api-keys"),
+    ("*", "/api-keys/**"),
     // Pro and billing (including pairing more phones and the cloud backups' key).
     ("*", "/pro"),
     ("*", "/pro/**"),
@@ -121,8 +123,26 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("*", "/golive/destinations/*"),
+    // The Studio's lighter stream, Twitch Enhanced Broadcasting, and per-destination quality
+    // changes reshape the encodes: PC only (`*` is one segment, so the rule above does not reach these).
+    ("*", "/golive/destinations/*/light"),
+    ("*", "/golive/destinations/*/enhanced"),
+    ("*", "/golive/destinations/*/quality"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
+    // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
+    ("*", "/diagnostics"),
+    ("*", "/diagnostics/**"),
+    // Community Theme Store packages and installs stay on the PC only.
+    ("*", "/store"),
+    ("*", "/store/**"),
+    // Clips are files on the PC: browsing, editing, deleting and sending them to YouTube stay here.
+    ("*", "/clips"),
+    ("*", "/clips/**"),
+    // Planning a stream spends YouTube quota and makes broadcasts on the platforms (the OpenAPI
+    // spec says x-pc-only): the PC only.
+    ("*", "/schedule"),
+    ("*", "/schedule/**"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:
@@ -195,6 +215,8 @@ const FIXED: &[&str] = &[
     "/queue/pause",
     "/queue/resume",
     "/queue/skip",
+    "/queue/mute",
+    "/queue/unmute",
     "/obs/scene",
     "/mod/ban",
     "/mod/unban",
@@ -354,6 +376,11 @@ mod tests {
         }
         for (m, p) in [
             ("POST", "/chat/send"),
+            // Putting a viewer's words on stream is the owner's call, not a mod's.
+            ("GET", "/chat/highlight"),
+            ("POST", "/chat/highlight"),
+            ("DELETE", "/chat/highlight"),
+            ("GET", "/credits"),
             ("GET", "/settings"),
             ("PUT", "/mod/filters"),
             ("PUT", "/mod/panic/config"),
@@ -365,6 +392,19 @@ mod tests {
             ("POST", "/mod/held/a/b/drop"),
             ("GET", "/events"),
             ("GET", "/live"),
+            ("GET", "/diagnostics"),
+            ("GET", "/diagnostics/preview"),
+            ("POST", "/diagnostics/report"),
+            ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -397,6 +437,9 @@ mod tests {
             ("GET", "/accounts"),
             ("POST", "/accounts/twitch/connect"),
             ("DELETE", "/accounts/kick"),
+            ("PUT", "/golive/destinations/twitch/light"),
+            ("PUT", "/golive/destinations/twitch/enhanced"),
+            ("DELETE", "/golive/destinations/c_1"),
             ("POST", "/session/pair-code"),
             ("POST", "/session/pair"),
             ("GET", "/pro"),
@@ -425,6 +468,19 @@ mod tests {
             ("POST", "/updates/restart"),
             ("GET", "/live"),
             ("PATCH", "/settings"),
+            ("GET", "/diagnostics"),
+            ("GET", "/diagnostics/preview"),
+            ("POST", "/diagnostics/report"),
+            ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }
@@ -496,5 +552,14 @@ mod tests {
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"notice","data":{"key":"account:twitch"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"queue","data":{}}"#));
         assert!(!live_frame_allowed(Role::Mod, "not json"));
+    }
+
+    #[test]
+    fn mute_is_an_owner_route_named_in_the_audit_and_never_a_mods() {
+        assert!(allowed(Role::Owner, "POST", "/queue/mute"));
+        assert!(allowed(Role::Owner, "POST", "/queue/unmute"));
+        assert!(!allowed(Role::Mod, "POST", "/queue/mute"));
+        assert_eq!(action("POST", "/queue/mute", false), "POST /queue/mute");
+        assert_eq!(action("POST", "/queue/unmute", false), "POST /queue/unmute");
     }
 }

@@ -36,6 +36,9 @@ pub struct SceneInfo {
     pub preview: bool,
     /// Its own way in, instead of the Studio's (OBS's "Transition Override").
     pub transition: Option<TransitionInfo>,
+    /// Named transition override applied to this scene (`Any -> scene`), if set via a named rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_name: Option<String>,
 }
 
 /// A source in a scene, top first. A group lists its own items.
@@ -46,6 +49,8 @@ pub struct ItemInfo {
     pub name: String,
     pub kind: String,
     pub visible: bool,
+    /// Where it is shown: "both" (the default), "stream" or "recording".
+    pub show: String,
     pub locked: bool,
     /// It makes sound (shows in the mixer).
     pub audio: bool,
@@ -70,6 +75,9 @@ pub struct ItemInfo {
     pub top_field_first: bool,
     /// A video, playlist or slideshow with play controls.
     pub media: bool,
+    /// True when this scene item carries its own video filter list (`"This picture only"`)
+    /// rather than sharing the source's filters (`"Everywhere this source is used"`).
+    pub own_filters: bool,
 }
 
 /// `enum obs_deinterlace_mode`, in order.
@@ -201,6 +209,12 @@ pub enum ItemEdit {
     ScaleBilinear,
     ScaleLanczos,
     ScaleArea,
+    /// Where it is shown: on the stream and in the recording (the default), only on the stream
+    /// (a chat box a clean recording leaves out), or only in the recording (a camera the stream
+    /// doesn't carry). On a group, it covers the children.
+    StreamAndRecording,
+    StreamOnly,
+    RecordingOnly,
 }
 
 /// Something to do with a Web page source.
@@ -248,6 +262,18 @@ pub struct AudioInfo {
     pub tracks: Vec<u8>,
     /// Making sound now (OBS's "active": a playing file, an open device).
     pub active: bool,
+    /// Push-to-talk: muted unless its key is held (and `push_to_talk_ms` after it is let go).
+    pub push_to_talk: bool,
+    pub push_to_talk_ms: u32,
+    /// Push-to-mute: muted while its key is held (and `push_to_mute_ms` after).
+    pub push_to_mute: bool,
+    pub push_to_mute_ms: u32,
+    /// Judged as a microphone by the live watch ("This is a mic"): the owner's switch, else by
+    /// its kind (a capture card's, an app's or the desktop's sound is not one).
+    pub mic: bool,
+    /// Whether it is on air in this scene: its item and every scene item above it are shown. A
+    /// hidden one makes no sound (nothing is mixed), so it is never judged dead or quiet.
+    pub shown: bool,
 }
 
 /// A source and the scenes it's in.
@@ -262,12 +288,16 @@ pub struct SourceUse {
     pub capture: Option<u64>,
 }
 
-/// A filter on a source, in order.
+/// A filter on a source or scene item, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilterInfo {
     pub name: String,
     pub kind: String,
     pub enabled: bool,
+    /// `"item"` when edited for this picture only, `"source"` when shared (all audio filters
+    /// are `"source"`). Omitted on plain source-level filter listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// A sound's level now, dBFS (-100 is silence).
@@ -278,6 +308,10 @@ pub struct LevelInfo {
     /// The highest the sound came in at, before its filters and fader (a gate's threshold
     /// is set against it).
     pub input_peak: [f32; 2],
+    /// Muted by a push-to-talk or push-to-mute key right now (the meter shows it dim).
+    pub gated: bool,
+    /// Real speech detected on this source (RNNoise VAD / gate / sustained voice energy).
+    pub speech: bool,
 }
 
 /// How the picture goes from one scene to the next.
@@ -286,6 +320,48 @@ pub struct TransitionInfo {
     /// `fade_transition`, `cut_transition`, `swipe_transition`…
     pub kind: String,
     pub ms: u32,
+}
+
+/// A saved transition configuration (name, kind, duration, OBS settings, and whether it is the default).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamedTransition {
+    pub name: String,
+    pub kind: String,
+    pub ms: u32,
+    pub settings: serde_json::Value,
+    pub default: bool,
+}
+
+impl Default for NamedTransition {
+    fn default() -> Self {
+        Self {
+            name: "Fade".into(),
+            kind: "fade_transition".into(),
+            ms: 300,
+            settings: serde_json::json!({}),
+            default: false,
+        }
+    }
+}
+
+/// A rule in the from-scene / to-scene transition matrix.
+/// `from == None` matches Any -> `to`; `to == None` matches `from` -> Any.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransitionMatrixRule {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub transition: String,
+}
+
+/// The transition chosen for a specific switch (`from` -> `to`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedTransition {
+    pub name: String,
+    pub kind: String,
+    pub ms: u32,
+    pub settings: serde_json::Value,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -335,6 +411,14 @@ pub fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, St
             .map_err(|e| StudioError::Failed(format!("\"{scene}\"'s picture couldn't be made ({e})")))?;
         Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&out)))
     }
+}
+
+/// RGBA pixels as a compact JPEG `data:` URL (source picker thumbnails).
+pub fn jpeg_data_url(px: &[u8], w: u32, h: u32, premultiplied: bool, label: &str) -> Result<String, StudioError> {
+    use base64::Engine as _;
+    let bytes = ferrocore::Picture::encode_jpeg_rgba(px, w, h, premultiplied, 78)
+        .map_err(|e| StudioError::Failed(format!("\"{label}\"'s picture couldn't be made ({e})")))?;
+    Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
 }
 
 /// Live captions running on one sound; dropping it stops them.
@@ -419,7 +503,8 @@ pub fn ask_captions_access() {
 }
 
 /// A capture on air that shows nothing (`capture_problems`): `problem` is `permission`
-/// (macOS's Screen Recording is off for this app), `no_picture` or `black`.
+/// (macOS's Screen Recording is off for this app), `waiting` (waiting for an interrupted or
+/// disconnected camera to return), `no_picture` or `black`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CaptureProblem {
     pub source: String,

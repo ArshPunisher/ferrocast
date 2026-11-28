@@ -737,13 +737,7 @@ async fn the_countdown_reaches_zero_by_itself() {
     let run = e.start_show(true).await.unwrap();
     assert_eq!(run.phase, super::show::Phase::Countdown);
     // Pull the end in so the test doesn't wait 10 s: the loop wakes on the change.
-    {
-        let mut s = e.studio().show.lock().unwrap();
-        if let Some(r) = s.as_mut() {
-            r.countdown_ends_at = Some(crate::now().0 + 50);
-        }
-    }
-    e.studio().show_wake.notify_one();
+    e.set_countdown_remaining_for_test(Duration::from_millis(50));
     eventually(|| obs.lock().unwrap().current == "Gameplay").await;
     eventually(|| e.show_run().is_some_and(|r| r.phase == super::show::Phase::Live)).await;
     let c = e.start_show(true).await;
@@ -771,7 +765,7 @@ async fn with_obs_closed_the_preflight_says_so_and_steps_fail_cleanly() {
     let run = e.start_show(true).await.unwrap();
     let scene = run.steps.iter().find(|s| s.id == "starting_scene").unwrap();
     assert_eq!(scene.status, "failed");
-    assert!(scene.detail.contains("The Studio isn't started"), "{}", scene.detail);
+    assert!(scene.detail.contains("Studio isn't started"), "{}", scene.detail);
     assert_eq!(run.steps.iter().find(|s| s.id == "discord").unwrap().status, "skipped");
     assert!(e.patch_show_config(json!({ "countdown_s": 5 }).as_object().unwrap()).await.is_err());
     assert!(e.patch_show_config(json!({ "preset_id": "ghost" }).as_object().unwrap()).await.is_err());
@@ -854,6 +848,8 @@ async fn health_turns_obs_numbers_into_warnings_and_the_watcher_runs() {
     let obs = with_obs(&e).await;
     let first = e.check_obs_health().await.unwrap();
     assert!(first.warnings.is_empty());
+    let mut viewer_wake = e.inner.viewer_wake.subscribe();
+    let _ = viewer_wake.borrow_and_update();
     {
         let mut s = obs.lock().unwrap();
         s.streaming = true;
@@ -862,6 +858,7 @@ async fn health_turns_obs_numbers_into_warnings_and_the_watcher_runs() {
         s.cpu = 95.0;
     }
     let h = e.check_obs_health().await.unwrap();
+    assert!(viewer_wake.has_changed().unwrap_or(false), "OBS streaming start must wake viewer poller");
     let ids: Vec<&str> = h.warnings.iter().map(|w| w.id.as_str()).collect();
     assert!(ids.contains(&"dropped") && ids.contains(&"cpu"), "{ids:?}");
     assert_eq!(e.obs_health().unwrap().dropped_pct, 10.0);
@@ -1013,7 +1010,8 @@ async fn the_streams_health_is_scored_while_live() {
     e.health_tick().await;
     let h = e.studio_stats().await.unwrap()["health"].clone();
     assert_eq!((h["score"].as_u64(), h["verdict"].as_str()), (Some(80), Some("good")));
-    assert!(h["reason"].as_str().unwrap().contains("late"));
+    let reason = h["reason"].as_str().unwrap();
+    assert!(reason.contains("busy") || reason.contains("keep up"), "{reason}");
 }
 
 #[tokio::test]
@@ -1181,6 +1179,44 @@ async fn the_show_can_start_and_stop_streaming_in_obs() {
 }
 
 #[tokio::test]
+async fn ending_the_show_now_skips_the_stop_delay() {
+    let (e, _d) = engine().await;
+    let obs = with_obs(&e).await;
+    let tw = Fake::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let cfg = json!({ "start_stream": true, "stop_stream": true, "stop_delay_s": 1, "discord": false });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    let step =
+        |r: &crate::studio::show::ShowRun| r.steps.iter().find(|s| s.id == "stop_stream").map(|s| s.status.clone());
+    // On a show running: the ending is done and the stream stops with it.
+    e.start_show(true).await.unwrap();
+    let ended = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&ended).as_deref(), Some("done"));
+    assert!(!obs.lock().unwrap().streaming);
+    // On a show already ending: only the stop comes forward; the thank-you isn't said twice.
+    e.start_show(true).await.unwrap();
+    let ending = e.end_show().await.unwrap();
+    assert_eq!(step(&ending).as_deref(), Some("waiting"));
+    let said = tw.said().len();
+    let stopped = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&stopped).as_deref(), Some("done"));
+    assert_eq!(stopped.id, ending.id, "the same show");
+    assert!(!obs.lock().unwrap().streaming);
+    assert_eq!(tw.said().len(), said, "one thank-you");
+    // The delayed stop of the stopped show doesn't touch a stream started since.
+    e.start_show(true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(obs.lock().unwrap().streaming, "the old show's waiting stop did nothing");
+    // The show not stopping streams by itself: now still stops it (the streamer pressed Stop).
+    e.patch_show_config(json!({ "stop_stream": false }).as_object().unwrap()).await.unwrap();
+    let ended = e.end_show().await.unwrap();
+    assert!(step(&ended).is_none() && obs.lock().unwrap().streaming, "by default it stays on");
+    let ended = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&ended).as_deref(), Some("done"));
+    assert!(!obs.lock().unwrap().streaming);
+}
+
+#[tokio::test]
 async fn at_zero_runs_only_the_actions_that_are_on() {
     let (e, _d) = engine().await;
     let obs = with_obs(&e).await;
@@ -1230,10 +1266,16 @@ struct FakeStudio {
     current: Mutex<String>,
     muted: Mutex<bool>,
     streaming: Mutex<bool>,
+    /// The Studio isn't running (it crashed).
+    studio_down: Mutex<bool>,
+    /// The next stream starts fail (the ingest refuses).
+    stream_fails: Mutex<bool>,
     /// The camera shown in its scene.
     cam_shown: Mutex<bool>,
     /// What the mic hears (dBFS), and whether the camera's picture is black.
     mic_db: Mutex<f32>,
+    /// What the mic hears before its mute and fader (default: `mic_db`).
+    mic_input: Mutex<Option<f32>>,
     cam_black: Mutex<bool>,
     /// How many pictures each `focus` call got.
     focus_batches: Mutex<Vec<usize>>,
@@ -1242,17 +1284,137 @@ struct FakeStudio {
     lagged: Mutex<u64>,
     /// A scene with nothing in it (its source count is given only when this is set).
     empty_scene: Mutex<Option<String>>,
+    /// Per-scene item list overrides for deep emptiness tests.
+    scene_items: Mutex<std::collections::HashMap<String, Value>>,
+    /// What the recording's stats say now (null: no recording).
+    record_now: Mutex<serde_json::Value>,
+    /// Broken sidechain loops reported in `stats()`.
+    sidechain_cycles: Mutex<Vec<serde_json::Value>>,
+    /// A second, unmuted mic ("Desk") speaking at -15.
+    two_mics: Mutex<bool>,
+    /// How many acts the engine has made on the Studio's thread.
+    act_calls: Mutex<usize>,
+}
+
+impl FakeStudio {
+    /// What the meters say now.
+    fn levels_json(&self) -> Value {
+        let db = *self.mic_db.lock().unwrap();
+        let input = self.mic_input.lock().unwrap().unwrap_or(db);
+        let mut v = json!({ "Mic": { "peak": [db, db], "magnitude": [db, db], "input_peak": [input, input] } });
+        if *self.two_mics.lock().unwrap() {
+            v["Desk"] = json!({ "peak": [-15.0, -15.0], "magnitude": [-15.0, -15.0], "input_peak": [-15.0, -15.0] });
+        }
+        v
+    }
+
+    /// The Studio's answer to one act (not counted: the engine's calls are, in `act`).
+    fn fake_act<'a>(
+        &'a self,
+        act: crate::studio_host::StudioAct,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::studio_host::StudioAct as A;
+            let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
+            Ok(match act {
+                A::Scenes => match self.empty_scene.lock().unwrap().clone() {
+                    None => json!({
+                        "current": lock(&self.current),
+                        "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
+                    }),
+                    Some(empty) => {
+                        let scenes: Vec<Value> = ["Starting", "Live", "BRB"]
+                            .iter()
+                            .map(|n| json!({ "name": n, "items": if *n == empty { 0 } else { 2 } }))
+                            .collect();
+                        json!({ "current": lock(&self.current), "scenes": scenes })
+                    }
+                },
+                A::SetCurrent { scene } => {
+                    self.acts.lock().unwrap().push(format!("scene {scene}"));
+                    *self.current.lock().unwrap() = scene;
+                    Value::Null
+                }
+                A::Audio { .. } => {
+                    let mut rows = vec![
+                        json!({ "name": "Mic", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": *self.muted.lock().unwrap() }),
+                        json!({ "name": "Desktop", "kind": "coreaudio_output_capture", "channel": 1, "muted": false }),
+                    ];
+                    if *self.two_mics.lock().unwrap() {
+                        rows.push(
+                        json!({ "name": "Desk", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": false }),
+                    );
+                    }
+                    Value::Array(rows)
+                }
+                A::SetAudio { name, change } => {
+                    if let Some(m) = change.muted {
+                        self.acts.lock().unwrap().push(format!("mute {name} {m}"));
+                        *self.muted.lock().unwrap() = m;
+                    }
+                    Value::Null
+                }
+                A::Items { scene } => {
+                    if let Some(v) = self.scene_items.lock().unwrap().get(&scene) {
+                        v.clone()
+                    } else if self.empty_scene.lock().unwrap().as_deref() == Some(scene.as_str()) {
+                        json!([])
+                    } else if scene == "Live" {
+                        json!([{ "id": 7, "name": "Camera", "kind": "av_capture_input", "visible": *self.cam_shown.lock().unwrap() }])
+                    } else {
+                        json!([{ "id": 1, "name": "Bg", "kind": "image_source", "visible": true }])
+                    }
+                }
+                A::Levels { .. } => self.levels_json(),
+                A::Look { .. } => {
+                    let black = *self.cam_black.lock().unwrap();
+                    json!({ "Camera": { "luma": if black { 2 } else { 120 }, "spread": if black { 1 } else { 40 }, "sig": 1 } })
+                }
+                A::EditItem { scene, id, edit } => {
+                    self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
+                    if id == 7 {
+                        match edit {
+                            crate::studio_host::ItemEdit::Show => *self.cam_shown.lock().unwrap() = true,
+                            crate::studio_host::ItemEdit::Hide => *self.cam_shown.lock().unwrap() = false,
+                            _ => {}
+                        }
+                    }
+                    Value::Null
+                }
+                A::WatchSnapshot => {
+                    // As the real one: the scenes, the on-air scene's sounds and its items (and the
+                    // scenes inside it), read together: one call from the engine's side.
+                    let scenes = self.fake_act(A::Scenes).await?;
+                    let current = scenes["current"].as_str().unwrap_or_default().to_string();
+                    let audio = self.fake_act(A::Audio { scene: current.clone() }).await?;
+                    let items = self.fake_act(A::Items { scene: current.clone() }).await?;
+                    json!({ "scenes": scenes, "audio": audio, "items": { current: items } })
+                }
+                other => return Err(format!("not faked: {other:?}")),
+            })
+        })
+    }
 }
 
 #[async_trait]
 impl crate::studio_host::StudioHost for FakeStudio {
+    async fn record_stats(&self) -> Result<serde_json::Value, String> {
+        Ok(self.record_now.lock().unwrap().clone())
+    }
     async fn status(&self) -> crate::studio_host::StudioStatus {
-        crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        crate::studio_host::StudioStatus {
+            available: true,
+            running: !*self.studio_down.lock().unwrap(),
+            ..Default::default()
+        }
     }
     async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
         Ok(self.status().await)
     }
     async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        if *self.studio_down.lock().unwrap() {
+            return Ok(self.status().await);
+        }
         Err("no".into())
     }
     async fn kinds(&self) -> Result<Value, String> {
@@ -1273,52 +1435,17 @@ impl crate::studio_host::StudioHost for FakeStudio {
         Ok(vec![Some(0.8); pictures.len()])
     }
 
-    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
-        use crate::studio_host::StudioAct as A;
-        let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
-        Ok(match act {
-            A::Scenes => match self.empty_scene.lock().unwrap().clone() {
-                None => json!({
-                    "current": lock(&self.current),
-                    "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
-                }),
-                Some(empty) => {
-                    let scenes: Vec<Value> = ["Starting", "Live", "BRB"]
-                        .iter()
-                        .map(|n| json!({ "name": n, "items": if *n == empty { 0 } else { 2 } }))
-                        .collect();
-                    json!({ "current": lock(&self.current), "scenes": scenes })
-                }
-            },
-            A::SetCurrent { scene } => {
-                self.acts.lock().unwrap().push(format!("scene {scene}"));
-                *self.current.lock().unwrap() = scene;
-                Value::Null
-            }
-            A::Audio { .. } => json!([{ "name": "Mic", "muted": *self.muted.lock().unwrap() }]),
-            A::SetAudio { name, change } => {
-                if let Some(m) = change.muted {
-                    self.acts.lock().unwrap().push(format!("mute {name} {m}"));
-                    *self.muted.lock().unwrap() = m;
-                }
-                Value::Null
-            }
-            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": *self.cam_shown.lock().unwrap() }]),
-            A::Levels { .. } => {
-                let db = *self.mic_db.lock().unwrap();
-                json!({ "Mic": { "peak": [db, db], "magnitude": [db, db] } })
-            }
-            A::Look { .. } => {
-                let black = *self.cam_black.lock().unwrap();
-                json!({ "Camera": { "luma": if black { 2 } else { 120 }, "spread": if black { 1 } else { 40 }, "sig": 1 } })
-            }
-            A::EditItem { scene, id, edit } => {
-                self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
-                Value::Null
-            }
-            other => return Err(format!("not faked: {other:?}")),
-        })
+    /// The meters are read without the Studio's queue, as the real one's are.
+    fn levels_now(&self, _names: &[String], _fast: bool) -> Option<Value> {
+        Some(self.levels_json())
     }
+
+    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
+        // Each call the engine makes to the Studio's thread (tests count them per tick).
+        *self.act_calls.lock().unwrap() += 1;
+        self.fake_act(act).await
+    }
+
     async fn settings(&self) -> crate::studio_host::StudioSettings {
         Default::default()
     }
@@ -1332,12 +1459,19 @@ impl crate::studio_host::StudioHost for FakeStudio {
             *f
         };
         let lagged = *self.lagged.lock().unwrap();
-        Ok(json!({
+        let cycles = self.sidechain_cycles.lock().unwrap().clone();
+        let mut out = json!({
             "disk_free_mb": 500_000.0,
             "replay": null,
             "engine": { "frames": frames, "lagged": lagged, "encoded": frames, "skipped": 0, "cpu": 20.0 },
             "stream": { "frames": frames, "dropped": 0, "reconnecting": false },
-        }))
+        });
+        if !cycles.is_empty()
+            && let Some(o) = out.as_object_mut()
+        {
+            o.insert("sidechain_cycles".into(), Value::Array(cycles));
+        }
+        Ok(out)
     }
     async fn record(&self, on: bool) -> Result<Value, String> {
         self.acts.lock().unwrap().push(format!("record {on}"));
@@ -1355,6 +1489,9 @@ impl crate::studio_host::StudioHost for FakeStudio {
         _key: String,
         _tracks: Vec<(u32, u32, u32)>,
     ) -> Result<Value, String> {
+        if *self.stream_fails.lock().unwrap() {
+            return Err("the server refused the key".into());
+        }
         self.acts.lock().unwrap().push("stream true".into());
         *self.streaming.lock().unwrap() = true;
         Ok(json!({ "active": true }))
@@ -1387,6 +1524,7 @@ async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
         ..Default::default()
     });
     e.set_studio_host(studio.clone());
+    e.set_test_ingest();
     e.patch_show_config(
         json!({
             "live_scene": "Live", "countdown_s": 0, "discord": false, "alerts_on": false, "bot_on": false,
@@ -1400,11 +1538,68 @@ async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
     let run = e.start_show(true).await.unwrap();
     let live = run.steps.iter().find(|s| s.id == "live_scene").unwrap_or_else(|| panic!("{:?}", run.steps));
     assert_eq!(live.status, "skipped", "{live:?}");
-    assert!(live.detail.contains("has nothing in it"), "{live:?}");
+    assert!(live.detail.contains("is empty"), "{live:?}");
     assert_eq!(*studio.current.lock().unwrap(), "Starting", "the scene on air stays");
     // The stream stops some other way (the Studio stopped): a new show may start.
     *studio.streaming.lock().unwrap() = false;
     assert!(e.start_show(true).await.is_ok(), "the old show was over");
+}
+
+/// M9-03: when `live_scene` isn't picked, the Show remembers whatever scene was on air when
+/// Go live was pressed (never guessing a name), and the empty check looks inside groups and
+/// hidden items.
+#[tokio::test]
+async fn show_picks_on_air_scene_and_checks_empty_deeply() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Desk Cam".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": null, "countdown_s": 10,
+            "discord": false, "alerts_on": false, "bot_on": false,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let run = e.start_show(true).await.unwrap();
+    assert_eq!(run.phase, super::show::Phase::Countdown);
+    assert_eq!(run.live_scene.as_deref(), Some("Desk Cam"), "captured the scene on air at Go live");
+    assert_eq!(*studio.current.lock().unwrap(), "Starting");
+    let live = e.skip_countdown().await.unwrap();
+    assert_eq!(live.phase, super::show::Phase::Live);
+    assert_eq!(*studio.current.lock().unwrap(), "Desk Cam", "returned to the on-air scene");
+    e.end_show().await.unwrap();
+
+    // Deep emptiness: a group with only hidden children is treated as empty and skipped.
+    studio.scene_items.lock().unwrap().insert(
+        "Live".into(),
+        json!([{
+            "id": 2, "name": "Group", "kind": "group", "group": true, "visible": true,
+            "children": [{ "id": 3, "name": "Cam", "kind": "av_capture_input", "visible": false }]
+        }]),
+    );
+    *studio.current.lock().unwrap() = "Starting".into();
+    e.patch_show_config(json!({ "live_scene": "Live", "countdown_s": 0 }).as_object().unwrap()).await.unwrap();
+    let run = e.start_show(true).await.unwrap();
+    let step = run.steps.iter().find(|s| s.id == "live_scene").unwrap();
+    assert_eq!(step.status, "skipped", "{step:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Starting", "group of hidden items stays off air");
+    e.end_show().await.unwrap();
+
+    // A visible group with a visible child is non-empty and switches cleanly.
+    studio.scene_items.lock().unwrap().insert(
+        "Live".into(),
+        json!([{
+            "id": 2, "name": "Group", "kind": "group", "group": true, "visible": true,
+            "children": [{ "id": 3, "name": "Cam", "kind": "av_capture_input", "visible": true }]
+        }]),
+    );
+    let run = e.start_show(true).await.unwrap();
+    let step = run.steps.iter().find(|s| s.id == "live_scene").unwrap();
+    assert_eq!(step.status, "done", "{step:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
 }
 
 #[tokio::test]
@@ -1542,7 +1737,7 @@ async fn the_preflight_hears_a_silent_mic_and_sees_a_black_camera() {
     let check = |pf: &crate::studio::show::Preflight, id: &str| pf.checks.iter().find(|c| c.id == id).cloned().unwrap();
     let mic = check(&pf, "mic:Mic");
     assert_eq!(mic.status, ferrocast_core::show::CheckStatus::Warn);
-    assert!(mic.detail.contains("no sound comes in"), "{mic:?}");
+    assert!(mic.detail.contains("silent"), "{mic:?}");
     let cam = check(&pf, "cam:Camera");
     assert_eq!(cam.status, ferrocast_core::show::CheckStatus::Fail);
     assert!(cam.detail.contains("black"), "{cam:?}");
@@ -1564,7 +1759,16 @@ async fn a_black_camera_puts_the_show_on_brb_and_back() {
     let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
     e.set_studio_host(studio.clone());
     e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
-    let alert = |cleared| LiveAlert { id: "camera:Cam:black".into(), level: "error", message: String::new(), cleared };
+    let alert = |cleared| LiveAlert {
+        id: "camera:Cam:black".into(),
+        level: "error",
+        message: String::new(),
+        detail: None,
+        cleared,
+        source: None,
+        action: None,
+        dismiss: None,
+    };
     e.brb_when_black(&[alert(false)]).await;
     assert_eq!(*studio.current.lock().unwrap(), "BRB");
     // Another alert while black changes nothing; the picture back returns.
@@ -1574,4 +1778,489 @@ async fn a_black_camera_puts_the_show_on_brb_and_back() {
     assert_eq!(*studio.current.lock().unwrap(), "Live");
     // Asked for without a BRB scene: refused.
     assert!(e.patch_scenes_config(json!({ "brb_scene": null }).as_object().unwrap()).await.is_err());
+}
+
+/// M9-10: manual BRB holds survive automatic releases (ad break, black camera) and hotkeys
+/// route through the locked broadcast state machine.
+#[tokio::test]
+async fn brb_holds_isolate_manual_from_auto_and_hotkeys_run_the_show() {
+    use ferrocast_core::show::LiveAlert;
+    let (e, _d) = engine().await;
+    e.start_golive(0).await;
+    let studio =
+        Arc::new(FakeStudio { current: Mutex::new("Live".into()), cam_shown: Mutex::new(true), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
+
+    // Streamer manually turns BRB on; a camera goes black and comes back — manual BRB stays!
+    e.set_brb(true).await.unwrap();
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    let alert = |cleared| LiveAlert {
+        id: "camera:Cam:black".into(),
+        level: "error",
+        message: String::new(),
+        detail: None,
+        cleared,
+        source: None,
+        action: None,
+        dismiss: None,
+    };
+    e.brb_when_black(&[alert(false)]).await;
+    e.brb_when_black(&[alert(true)]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB", "black-cam clear must not cancel manual BRB");
+    // Manual Back returns cleanly to "Live".
+    e.set_brb(false).await.unwrap();
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
+
+    // Hotkey go_live with a Show style runs the Show (starting scene + stream + countdown)
+    // without mutating saved ShowConfig.start_stream.
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": "Live", "countdown_s": 10,
+            "start_stream": false, "stop_stream": false, "stop_delay_s": 0,
+            "discord": false, "alerts_on": false, "bot_on": false, "recap_message": null,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    e.go_live().await.unwrap();
+    assert!(!e.show_config().start_stream, "saved ShowConfig was not silently rewritten");
+    assert_eq!(e.show_run().unwrap().phase, super::show::Phase::Countdown);
+    assert_eq!(*studio.current.lock().unwrap(), "Starting");
+    assert!(*studio.streaming.lock().unwrap(), "go_live started streaming");
+    // Pressing go_live during the countdown advances to Live without conflict.
+    e.go_live().await.unwrap();
+    assert_eq!(e.show_run().unwrap().phase, super::show::Phase::Live);
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
+    // Pressing end_live ends the Show and stops the stream.
+    e.end_live().await.unwrap();
+    assert_eq!(e.show_run().unwrap().phase, super::show::Phase::Ended);
+    assert!(!*studio.streaming.lock().unwrap());
+
+    // Plain "Just go live" style: go_live streams directly without starting a Show.
+    e.patch_show_config(
+        json!({
+            "starting_scene": null, "ending_scene": null, "countdown_s": 0,
+            "discord": false, "preset_id": null, "replay_buffer": false,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let prev_id = e.show_run().unwrap().id;
+    e.go_live().await.unwrap();
+    assert!(*studio.streaming.lock().unwrap());
+    assert_eq!(e.show_run().unwrap().id, prev_id, "plain go_live did not start a Show");
+    e.end_live().await.unwrap();
+    assert!(!*studio.streaming.lock().unwrap());
+}
+
+/// M7-01: a recording that stops by itself (a full disk, a drive taken away) is said once on the
+/// dashboard in one line with its detail, however many times the watch looks; low room is said
+/// once before it runs out.
+#[tokio::test]
+async fn a_recording_that_stops_is_said_once_and_low_room_before_it() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let mut live = e.subscribe_live();
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+    // Room running low while it runs: one warning, not one per look.
+    *studio.record_now.lock().unwrap() = json!({ "file": "/r/a.mp4", "active": true, "error": null,
+        "bytes": 600_000_000u64, "seconds": 60, "disk_free_mb": 1500 });
+    for _ in 0..10 {
+        e.record_watch_tick().await;
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-space"), Some("warn")));
+    assert!(n[0]["detail"].as_str().unwrap().contains("recording stops and keeps what it has"), "{n:?}");
+    // The disk fills: it stopped, with the reason. One notice over many looks.
+    *studio.record_now.lock().unwrap() = json!({ "file": "/r/a.mp4", "active": false,
+        "error": "The recording stopped: the disk is full.", "bytes": 1_500_000_000u64, "seconds": 90,
+        "disk_free_mb": 0, "error_detail": "Free some space or choose another drive, then record again." });
+    for _ in 0..30 {
+        e.record_watch_tick().await;
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-stopped"), Some("error")));
+    assert_eq!(n[0]["message"], "Recording stopped: the disk is full");
+    assert!(n[0]["detail"].as_str().unwrap().contains("Free some space"), "{n:?}");
+}
+
+/// A broken sidechain cycle reported by Studio stats is broadcast to the dashboard once with a
+/// concise line and `(i)` detail, stays silent on repeated polls, and forgets once cleared.
+#[tokio::test]
+async fn a_sidechain_cycle_is_noticed_once_through_studio_stats() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let mut live = e.subscribe_live();
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+
+    *studio.sidechain_cycles.lock().unwrap() = vec![json!({ "source": "Voice", "key": "Music" })];
+    for _ in 0..20 {
+        let _ = e.studio_stats().await.unwrap();
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "sidechain loop reported once across 20 polls: {n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("sidechain-cycle"), Some("warn")));
+    assert_eq!(n[0]["message"], "Sidechain loop between Voice and Music was broken");
+    assert!(n[0]["detail"].as_str().unwrap().contains("silence"), "{n:?}");
+
+    // Clearing the loop lets a future recurrence notify once again.
+    studio.sidechain_cycles.lock().unwrap().clear();
+    let _ = e.studio_stats().await.unwrap();
+    assert!(notices(&mut live).is_empty());
+
+    *studio.sidechain_cycles.lock().unwrap() = vec![json!({ "source": "Voice", "key": "Music" })];
+    let _ = e.studio_stats().await.unwrap();
+    assert_eq!(notices(&mut live).len(), 1);
+}
+
+/// 19 Nov: a muted mic, a quiet one and a scene with only a mic went unnoticed because the watch
+/// looked only at the Show's own mic list. Every mic on air is read now, the Show's list empty.
+#[tokio::test]
+async fn the_live_watch_reads_every_mic_on_air_and_the_scene_picture() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        muted: Mutex::new(true),
+        mic_db: Mutex::new(-100.0),
+        mic_input: Mutex::new(Some(-22.0)),
+        cam_shown: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    assert!(e.show_config().mic_sources.is_empty());
+    let sample = e.watch_sample(0, &e.show_config()).await;
+    // The mic is found (the desktop sound is not a mic), muted, hearing speech.
+    assert_eq!(sample.levels.len(), 1, "{:?}", sample.levels);
+    let m = &sample.levels[0];
+    assert!(m.name == "Mic" && m.muted && m.input_db == -22.0 && m.peak_db == -100.0, "{m:?}");
+    // "Live" has a camera shown; a scene with only a mic is "empty".
+    assert_eq!(sample.scene.as_ref().map(|s| s.empty), Some(false));
+    studio
+        .scene_items
+        .lock()
+        .unwrap()
+        .insert("Live".into(), json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]));
+    let sample = e.watch_sample(2000, &e.show_config()).await;
+    assert_eq!(sample.scene.as_ref().map(|s| s.empty), Some(true), "a mic alone is no picture");
+    // Speaking into it twice: one notice, naming the mic, with its one-tap fix.
+    let first = e.live_watch_tick().await;
+    assert!(first.iter().all(|a| a.id != "mic:muted:Mic"), "not on the first look: {first:?}");
+    let second = e.live_watch_tick().await;
+    let a = second.iter().find(|a| a.id == "mic:muted:Mic").unwrap_or_else(|| panic!("{second:?}"));
+    assert_eq!((a.action, a.source.as_deref()), (Some("unmute"), Some("Mic")));
+    assert!(e.live_watch_tick().await.iter().all(|a| a.id != "mic:muted:Mic"), "said once");
+}
+
+/// Before Go live: an on-air scene with only a mic, and a muted mic that isn't on the Show's list,
+/// are warned about (never blocked).
+#[tokio::test]
+async fn preflight_warns_about_a_black_scene_and_a_muted_mic() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        muted: Mutex::new(true),
+        mic_db: Mutex::new(-100.0),
+        ..Default::default()
+    });
+    studio
+        .scene_items
+        .lock()
+        .unwrap()
+        .insert("Live".into(), json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]));
+    e.set_studio_host(studio.clone());
+    let p = e.preflight().await;
+    let c = |id: &str| p.checks.iter().find(|c| c.id == id);
+    let pic = c("picture:Live").unwrap_or_else(|| panic!("{:?}", p.checks));
+    assert_eq!(pic.status, ferrocast_core::show::CheckStatus::Warn);
+    let mic = c("mic:Mic").unwrap_or_else(|| panic!("{:?}", p.checks));
+    assert_eq!(mic.fix.as_ref().map(|f| f.href.as_str()), Some("action:unmute:Mic"));
+    assert!(p.ready, "warnings never stop Go live");
+    // A camera in the scene and the mic on: both lines go.
+    *studio.muted.lock().unwrap() = false;
+    *studio.mic_db.lock().unwrap() = -30.0;
+    studio.scene_items.lock().unwrap().clear();
+    *studio.cam_shown.lock().unwrap() = true;
+    let p = e.preflight().await;
+    assert!(p.checks.iter().all(|c| c.id != "picture:Live" && c.id != "mic:Mic"), "{:?}", p.checks);
+}
+
+fn countdown_cfg() -> serde_json::Value {
+    json!({ "countdown_s": 30, "discord": false, "alerts_on": false, "bot_on": false })
+}
+
+/// 19 Nov, path 1: the stream wouldn't start but the show sat in Countdown, so the next Go live
+/// said "A show is already running". A show whose stream can't start never begins.
+#[tokio::test]
+async fn a_failed_stream_start_never_leaves_a_countdown_behind() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        stream_fails: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    let opts = || crate::studio::show::ShowStartOpts { force: true, stream: Some(true) };
+    for _ in 0..2 {
+        let err = e.start_show_with(opts()).await.expect_err("the stream can't start");
+        assert!(!err.to_string().contains("already running"), "{err}");
+        assert!(err.to_string().contains("refused"), "says why: {err}");
+        assert!(!e.is_show_active(), "no show is left running");
+    }
+    // The key works again: Go live starts cleanly.
+    *studio.stream_fails.lock().unwrap() = false;
+    assert!(e.start_show_with(opts()).await.is_ok());
+}
+
+/// Paths 2 and 4: the stream stopped (or the Studio went away) during the countdown; Go live
+/// again must start a new show, not say one is running.
+#[tokio::test]
+async fn a_stream_stopped_in_the_countdown_ends_that_show() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    let opts = || crate::studio::show::ShowStartOpts { force: true, stream: Some(true) };
+    e.start_show_with(opts()).await.unwrap();
+    assert!(e.is_show_active());
+    e.studio_stream_stop(false).await.unwrap();
+    assert!(!e.is_show_active(), "the countdown went with the stream");
+    assert!(e.start_show_with(opts()).await.is_ok(), "Go live again works");
+    // Same, when the stream stopped behind our back (the rig says it's off).
+    *studio.streaming.lock().unwrap() = false;
+    assert!(e.start_show_with(opts()).await.is_ok(), "a countdown with no stream is stale");
+}
+
+/// Path 3: a show started without the stream (Show tab) and then Go live from the desk.
+#[tokio::test]
+async fn go_live_from_a_show_that_runs_without_the_stream_starts_the_stream() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(
+        json!({ "discord": false, "alerts_on": false, "bot_on": false, "start_stream": false }).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(false) }).await.unwrap();
+    assert!(!*studio.streaming.lock().unwrap());
+    let r = e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(true) }).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert!(*studio.streaming.lock().unwrap(), "the stream is on");
+}
+
+/// Path 5: the Studio crashed (it isn't running any more) and is then stopped: the show still ends.
+#[tokio::test]
+async fn stopping_the_studio_ends_a_show_even_when_it_had_already_gone() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(true) }).await.unwrap();
+    assert!(e.is_show_active());
+    *studio.studio_down.lock().unwrap() = true;
+    e.studio_stop().await.unwrap();
+    assert!(!e.is_show_active(), "a show with no Studio under it is over");
+}
+
+/// REV21 R2.6 (1): a show running on OBS while the Studio is off is not the Studio's: turning
+/// the (already off) Studio off must leave it. (The stale-show clearing of 1c4b9bb is for a show
+/// that had the Studio under it.)
+#[tokio::test]
+async fn stopping_a_studio_that_is_off_leaves_a_show_running_on_obs() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    *studio.studio_down.lock().unwrap() = true;
+    e.set_studio_host(studio.clone());
+    let _obs = with_obs(&e).await;
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(false) }).await.unwrap();
+    assert!(e.is_show_active(), "a show runs on OBS");
+    e.studio_stop().await.unwrap();
+    assert!(e.is_show_active(), "the Studio was never under it");
+}
+
+/// REV21 R2.6 (2): the stream-stopped check and the cancel were two separate looks at the
+/// machine; a show that had gone Live (or begun again) in between was wiped. The cancel is
+/// conditional under one lock now.
+#[tokio::test]
+async fn a_stream_stop_never_ends_a_show_that_is_no_longer_counting_down() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(true) }).await.unwrap();
+    assert!(e.is_show_active());
+    // The show reaches Live between the stop's look and its cancel: the cancel must see that.
+    {
+        let mut m = e.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.phase = crate::studio::show::BroadcastPhase::Live;
+    }
+    e.end_show_whose_stream_stopped();
+    assert!(e.is_show_active(), "a live show stays (its own ending, or the next Go live, takes it)");
+    // And a countdown is still ended by it.
+    {
+        let mut m = e.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.phase = crate::studio::show::BroadcastPhase::Countdown;
+    }
+    e.end_show_whose_stream_stopped();
+    assert!(!e.is_show_active());
+}
+
+/// REV21 R2.6 (3): a show whose stream is started by "at zero" (not by Start show) must count as
+/// having streamed: when that stream later stops, the next Start show must not be refused with
+/// "A show is already running".
+#[tokio::test]
+async fn a_stream_started_at_zero_makes_the_show_stale_when_it_stops() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(
+        json!({ "countdown_s": 30, "discord": false, "alerts_on": false, "bot_on": false, "start_stream": false,
+                "at_zero": { "start_stream": true, "switch": false, "marker": false } })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let no_stream = || crate::studio::show::ShowStartOpts { force: true, stream: Some(false) };
+    e.start_show_with(no_stream()).await.unwrap();
+    e.go_live_now_for_test().await.unwrap();
+    assert!(*studio.streaming.lock().unwrap(), "the stream started at zero");
+    // The stream drops by itself.
+    *studio.streaming.lock().unwrap() = false;
+    let again = e.start_show_with(no_stream()).await;
+    assert!(again.is_ok(), "the next show starts: {again:?}");
+}
+
+/// REV21 / S61a #4: a wake (or a new stream) starts the watch over; a BRB that a black camera
+/// put on by itself must come off with it, and the page be told what was dropped.
+#[tokio::test]
+async fn a_reset_with_a_black_camera_raised_takes_brb_off_and_tells_the_page() {
+    use ferrocast_core::show::{LiveWatchConfig, WatchSample};
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
+    // The camera black for longer than its limit: raised, and BRB goes on by itself.
+    let cfg = LiveWatchConfig::default();
+    let sample = |at| WatchSample { at, cameras: vec![("Camera".into(), true, 1)], ..Default::default() };
+    let mut alerts = Vec::new();
+    for at in [0, 12_000] {
+        alerts.extend(e.studio().live_watch.lock().unwrap().tick(&cfg, &sample(at)));
+    }
+    assert!(alerts.iter().any(|a| a.id == "camera:Camera:black" && !a.cleared), "raised: {alerts:?}");
+    e.brb_when_black(&alerts).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    // A wake: everything starts over.
+    let told = e.reset_live_watch().await;
+    assert!(told.iter().any(|a| a.id == "camera:Camera:black" && a.cleared), "the page is told: {told:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Live", "BRB never stays stuck");
+    assert!(e.live_alerts().is_empty());
+    // Nothing more to tell, and no BRB to take off a second time.
+    assert!(e.reset_live_watch().await.is_empty());
+}
+
+/// REV21 R2.3, S61a #2: a muted mic that isn't the voice (another mic carries it) is no
+/// warning before Go live; with no other mic it still is.
+#[tokio::test]
+async fn preflight_does_not_warn_about_a_muted_mic_while_another_carries_the_voice() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        muted: Mutex::new(true),
+        mic_db: Mutex::new(-100.0),
+        mic_input: Mutex::new(Some(-30.0)),
+        two_mics: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    let mut checks = Vec::new();
+    e.preflight_picture_and_mics(&crate::studio::rig::Rig::Studio, &e.show_config(), Some("Live"), &mut checks).await;
+    assert!(checks.iter().all(|c| !c.id.starts_with("mic:")), "{checks:?}");
+    *studio.two_mics.lock().unwrap() = false;
+    let mut checks = Vec::new();
+    e.preflight_picture_and_mics(&crate::studio::rig::Rig::Studio, &e.show_config(), Some("Live"), &mut checks).await;
+    assert!(checks.iter().any(|c| c.id == "mic:Mic"), "alone it is warned about: {checks:?}");
+}
+
+/// REV21 R2.7: a live tick used to make a handful of separate reads on the Studio's thread
+/// (Scenes twice, Audio, Items per scene, Look); it makes two now: one snapshot (scenes, the
+/// on-air scene's sounds, the items to judge it) and the cameras' look.
+#[tokio::test]
+async fn a_live_tick_asks_the_studios_thread_at_most_twice() {
+    let (e, _d) = engine().await;
+    go_live(&e).await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        two_mics: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(json!({ "cam_sources": ["Camera"] }).as_object().unwrap()).await.unwrap();
+    // The pieces the loop runs on one snapshot.
+    let calls = || *studio.act_calls.lock().unwrap();
+    let snap = e.watch_snapshot().await;
+    e.scene_chapter_tick_with(snap.scenes.as_ref()).await;
+    let alerts = e.live_watch_tick_with(&snap).await;
+    assert_eq!(calls(), 2, "the snapshot and the cameras' look; alerts: {alerts:?}");
+    // And what the snapshot carries is what the separate reads gave: the scene is judged, the mics found.
+    let sample = e.watch_sample_with(0, &e.show_config(), &snap).await;
+    assert_eq!(sample.scene.as_ref().map(|s| (s.name.as_str(), s.empty)), Some(("Live", false)));
+    assert_eq!(sample.levels.len(), 2, "{:?}", sample.levels);
+    assert_eq!(sample.cameras.len(), 1);
+}
+
+/// The same through the loop itself: its first look at a streaming Studio makes two acts.
+#[tokio::test]
+async fn the_watch_loop_makes_two_acts_in_a_look() {
+    let (e, _d) = engine().await;
+    go_live(&e).await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        streaming: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(json!({ "cam_sources": ["Camera"] }).as_object().unwrap()).await.unwrap();
+    e.watch_live();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(*studio.act_calls.lock().unwrap(), 2, "one look = a snapshot and the cameras");
 }

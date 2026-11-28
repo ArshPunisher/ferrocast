@@ -32,6 +32,8 @@ getrandom = "0.4"
 subtle = "2"
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 hmac = "0.12"
+# Gunzips a crash report for the Control Center (admin text view), capped at 2 MB.
+flate2 = "1"
 url = "2"
 # Custom tip addresses (Pro F6): the Public Suffix List (ICANN and private entries, built in),
 # punycode to Unicode, and UTS #39 mixed-script and confusable checks.

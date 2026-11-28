@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*"]
 exclude = ["vendor/srt-protocol"]
 
 [workspace.package]
-version = "3.4.0"
+version = "3.8.1"
 edition = "2024"
 rust-version = "1.99"
 license = "GPL-3.0-or-later"
@@ -18,6 +18,7 @@ ferrocast-store = { path = "crates/store" }
 ferrocast-twitch = { path = "crates/twitch" }
 ferrocast-youtube = { path = "crates/youtube" }
 ferrocast-kick = { path = "crates/kick" }
+ferrocast-facebook = { path = "crates/facebook" }
 ferrocast-obs = { path = "crates/obs" }
 ferrocast-golive = { path = "crates/golive" }
 ferrocast-studio = { path = "crates/studio" }

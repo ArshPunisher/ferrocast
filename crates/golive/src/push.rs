@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rml_rtmp::handshake::PeerType;
@@ -23,24 +24,72 @@ use crate::conn::{self, READ_BUF};
 use crate::flv;
 use crate::hub::{Frame, Hub, Live, Subscription};
 use crate::links;
-use crate::target::Target;
+use crate::target::{IpFamily, Target};
 
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Each step after connecting (handshake, connect, publish) must answer within this.
 const STEP_DEADLINE: Duration = Duration::from_secs(10);
 /// A write that can't finish in this long means the destination stopped reading.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+/// How far behind live video (in stream milliseconds) a destination may fall before it drops
+/// non-keyframe video until the next keyframe, keeping audio and codec headers intact.
+///
+/// Matches OBS's `OPT_PFRAME_DROP_THRESHOLD` (`pframe_drop_threshold_usec = 900 ms` in
+/// `plugins/obs-outputs/rtmp-stream.c`, `check_to_drop_frames` / `drop_frames`). OBS also has a
+/// 700 ms `OPT_DROP_THRESHOLD` that drops only disposable non-reference B-frames using codec-level
+/// NAL/OBU priority before escalating to all non-keyframes at 900 ms. Because `golive` forwards
+/// FLV tags without re-parsing H.264/HEVC/AV1/VP9 bitstreams, it only distinguishes keyframes from
+/// inter frames; using OBS's 900 ms threshold keeps latency under a second without breaking a GOP
+/// prematurely at 700 ms on brief jitter (whether or not the stream uses B-frames).
+const DROP_THRESHOLD_MS: u32 = 900;
+/// Beyond `2×` [`DROP_THRESHOLD_MS`], if older keyframes sit ahead of the lagging stream, skip
+/// forward to the newest keyframe (dropping intermediate keyframes and their GOP audio) so a link
+/// slower than keyframes alone does not drift endlessly behind live (finding M3.4, beyond OBS).
+const KEY_SKIP_THRESHOLD_MS: u32 = DROP_THRESHOLD_MS * 2;
+/// Minimum packets still queued behind the current packet in the destination's receiver before
+/// time-based dropping starts (at least 5 buffered packets including the current one, matching
+/// OBS's `num_packets < 5` guard in `check_to_drop_frames`). Prevents a sparse timestamp gap or
+/// brief source pause from falsely dropping frames.
+const MIN_BACKLOG_PACKETS: usize = 4;
+/// Default consecutive failures before a destination gives up for the rest of the stream.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 6;
+/// Consecutive auth/key refusals before giving up (no point hammering a bad key).
+pub const REFUSED_MAX_ATTEMPTS: u32 = 3;
+/// How long a destination waits for a network that is down (a Wi-Fi drop, a router reboot) before
+/// giving up for this stream. OBS rides out outages of about this length.
+pub const NETWORK_PATIENCE: Duration = Duration::from_secs(10 * 60);
+/// The longest wait between tries while the network is down: it comes back and the stream follows
+/// within about this long.
+const NETWORK_RETRY_MAX: Duration = Duration::from_secs(8);
+
 /// How long a destination waits before trying again: the first wait, doubling up to the
-/// longest (Advanced mode can change both).
+/// longest (Advanced mode can change both), and how many failures in a row before giving up
+/// (`0`: keep trying forever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retry {
     pub first: Duration,
     pub max: Duration,
+    pub max_attempts: u32,
+}
+
+/// `Retry::max_attempts` of a destination that must not be retried at all (the streamer turned
+/// reconnecting off): it fails at the first failure and stays failed. (`0` is the opposite: no limit.)
+pub const NEVER_RETRY: u32 = u32::MAX;
+
+impl Retry {
+    /// No retry: the first failure is final.
+    pub fn never() -> Self {
+        Self { max_attempts: NEVER_RETRY, ..Self::default() }
+    }
+
+    pub fn is_never(&self) -> bool {
+        self.max_attempts == NEVER_RETRY
+    }
 }
 
 impl Default for Retry {
     fn default() -> Self {
-        Self { first: Duration::from_secs(1), max: Duration::from_secs(30) }
+        Self { first: Duration::from_secs(1), max: Duration::from_secs(30), max_attempts: DEFAULT_MAX_ATTEMPTS }
     }
 }
 /// How often health (bitrate) is updated while live.
@@ -58,6 +107,9 @@ pub struct Destination {
     /// Gets the stream's extra video tracks (Twitch Enhanced Broadcasting's other qualities);
     /// others get only the main picture.
     pub extra_video: bool,
+    /// A second server for the same key, tried after [`BACKUP_AFTER`] failures to connect to
+    /// `target` (YouTube's backup ingest), and `target` again once the backup has held.
+    pub backup: Option<Target>,
 }
 
 impl std::fmt::Debug for Destination {
@@ -79,6 +131,18 @@ pub enum PushState {
         attempt: u32,
         retry_in_ms: u64,
         reason: String,
+    },
+    /// Gave up for this stream after repeated failures or a platform refusal (contract C-1).
+    Failed {
+        attempts: u32,
+        /// One short line saying what happened.
+        reason: String,
+        /// Cause and what to do, shown behind an (i).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// True when the platform refused the stream (bad key, Kick multistreaming) rather than a network outage.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refused: bool,
     },
     Stopped,
     /// Upload protection paused it to keep the destinations above smooth (the engine sets
@@ -148,14 +212,45 @@ pub enum PushError {
     Stalled(String),
     #[error("The connection to {0} broke.")]
     Broken(String),
+    /// The server hung up when the stream key was sent (Twitch does this for a wrong key, and an
+    /// ingest node that is draining does it for anything). Which one is only known from whether
+    /// the key worked before in this stream.
+    #[error("{0} closed the connection when the stream started.")]
+    PublishDropped(String),
+    /// The connection the streamer chose isn't there (unplugged, renamed).
+    #[error("The connection {0} you chose isn't available.")]
+    NoConnection(String),
+    /// No way out to the internet (no route, no DNS, nothing answering): a Wi-Fi drop or a router
+    /// reboot. Not the platform's doing, so it isn't counted against the destination.
+    #[error("Your network is down: waiting for it to reach {0}.")]
+    NetworkDown(String),
 }
 
 impl PushError {
     /// The network failed (not the server saying no): another connection may do better.
     fn is_network(&self) -> bool {
-        matches!(self, Self::Unreachable(_) | Self::Slow(_) | Self::Closed(_) | Self::Stalled(_) | Self::Broken(_))
+        matches!(
+            self,
+            Self::Unreachable(_)
+                | Self::PublishDropped(_)
+                | Self::NetworkDown(_)
+                | Self::Slow(_)
+                | Self::Closed(_)
+                | Self::Stalled(_)
+                | Self::Broken(_)
+        )
+    }
+
+    /// The server could not be had at all (not a no to this stream or its key): another server
+    /// for the same key may answer.
+    fn is_connect_failure(&self) -> bool {
+        !matches!(self, Self::Refused(..) | Self::KeyRefused(_))
     }
 }
+
+/// How many tries in a row, before the stream is live, may fail on one server before the other is
+/// tried (when a destination has a backup).
+pub const BACKUP_AFTER: u32 = 3;
 
 /// Whether a destination may move to another connection: not one on this computer or network.
 fn may_move(t: &Target) -> bool {
@@ -179,8 +274,40 @@ pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub(crate) type Stream = Pin<Box<dyn Io>>;
 
+/// The runtime the Studio's own sender runs on. Two workers, not one: with a single worker any
+/// blocking call anywhere in what runs on it (a slow system call, a lock held a long time) parks
+/// everything it sends and every timer with nothing logged; with two the other keeps going.
+pub fn sender_runtime(name: &str) -> std::io::Result<tokio::runtime::Runtime> {
+    sender_runtime_with(name, SENDER_WORKERS)
+}
+
+/// [`sender_runtime`] with the workers given (the tests compare one with two).
+pub fn sender_runtime_with(name: &str, workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().thread_name(name).build()
+}
+
+/// Workers of the sender's runtime.
+const SENDER_WORKERS: usize = 2;
+
+/// The number of workers [`sender_runtime`] makes.
+#[must_use]
+pub fn sender_runtime_workers() -> usize {
+    SENDER_WORKERS
+}
+
 /// Runs one destination until `stop` turns true. Health is sent on `health`.
-pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, mut stop: watch::Receiver<bool>) {
+pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, stop: watch::Receiver<bool>) {
+    run_with_siblings(dest, hub, health, stop, None).await;
+}
+
+/// Runs one destination with sibling liveness context until `stop` turns true.
+pub async fn run_with_siblings(
+    dest: Destination,
+    hub: Arc<Hub>,
+    health: watch::Sender<Health>,
+    mut stop: watch::Receiver<bool>,
+    other_destinations_live: Option<watch::Receiver<bool>>,
+) {
     let mut live = hub.live();
     health.send_replace(Health::new(PushState::Waiting));
     // The last stream this destination finished with; it waits for a newer one.
@@ -195,14 +322,34 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         };
         let still_on = |l: &Live| l.on && l.stream == stream;
         let mut attempt = 0u32;
+        // Tries made while the network was down (not counted in `attempt`), and since when it is.
+        let mut net_tries = 0u32;
+        let mut down_since: Option<Instant> = None;
+        // This stream has been live on this destination: its key works.
+        let mut ever_live = false;
         // The connection used: the system's default until that fails, then the next one.
         let mut via: Option<links::Network> = None;
-        loop {
-            set_state(&health, PushState::Connecting);
-            let outcome = tokio::select! {
-                _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                r = session(&dest, &hub, &health, stream, via.as_ref()) => r,
+        // The server used: the destination's own, until it can't be reached `BACKUP_AFTER` times in
+        // a row, then its backup (and back, the same way); each stream starts on the own one.
+        let mut on_backup = false;
+        let mut connect_failures = 0u32;
+        'connect: loop {
+            let target = match (&dest.backup, on_backup) {
+                (Some(b), true) => b,
+                _ => &dest.target,
             };
+            // A retry doesn't blank "Reconnecting" (and why) for the length of the try: only a
+            // first connect, or one after a live session, shows Connecting.
+            if !matches!(health.borrow().state, PushState::Reconnecting { .. }) {
+                set_state(&health, PushState::Connecting);
+            }
+            let mut live_at: Option<Instant> = None;
+            let mut sent_info = SentStreamInfo::default();
+            // `stop` is watched inside the session: while connecting it gives up at once, and once
+            // live it closes the connection properly (not dropped mid-write).
+            let outcome =
+                session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at, &mut sent_info, stop.clone())
+                    .await;
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
                 Ok(Ended::StreamEnded) => break,
@@ -210,35 +357,212 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     if !still_on(&live.borrow()) {
                         break;
                     }
+                    sent_info.merge_hub_stats(hub.stats());
                     // A session that stayed live a while and then failed starts the count over: a
                     // platform that keeps dropping a long stream is retried at once, not after
                     // the longest wait. One that took the stream and closed it at once doesn't
                     // (19 Nov, live: Kick took it and closed it every 8 s for the whole stream,
                     // always "attempt 1", never waiting longer and never saying why).
-                    let (was_live, live_for_ms) = {
-                        let h = health.borrow();
-                        (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
+                    let (was_live, live_for_ms) = match live_at {
+                        Some(t) => (true, u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        None => (false, 0),
                     };
-                    if was_live && live_for_ms >= STAYED_LIVE_MS {
+                    // Kick taking the stream and closing it at once (no multistream) doesn't prove the
+                    // key or the address works; any other session that was live does, however short
+                    // (a drop half a second in, then a reconnect, is still a server that took the key).
+                    ever_live |= was_live && !(live_for_ms < STAYED_LIVE_MS && is_kick(&dest));
+                    // A hang-up at the publish: a wrong key before the key ever worked in this
+                    // stream (what it was always taken for), a server dropping the connection after.
+                    let err = match err {
+                        PushError::PublishDropped(h) if !ever_live => PushError::KeyRefused(h),
+                        e => e,
+                    };
+                    let key_refused = matches!(err, PushError::KeyRefused(_));
+                    let rapid_close = was_live && live_for_ms < STAYED_LIVE_MS;
+                    let stayed = was_live && live_for_ms >= STAYED_LIVE_MS;
+                    if stayed {
                         attempt = 0;
                     }
-                    attempt = attempt.saturating_add(1);
-                    let wait = backoff(attempt, &dest.retry);
-                    if err.is_network() && may_move(&dest.target) {
-                        via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
+                    // The server: after a backup that held, the destination's own again (it may
+                    // have come back); after enough failures to connect, the other one.
+                    let mut switched = false;
+                    if dest.backup.is_some() {
+                        if stayed && on_backup {
+                            on_backup = false;
+                            connect_failures = 0;
+                            switched = true;
+                        } else if !was_live && err.is_connect_failure() && !key_refused {
+                            connect_failures += 1;
+                            if connect_failures >= BACKUP_AFTER {
+                                on_backup = !on_backup;
+                                connect_failures = 0;
+                                switched = true;
+                            }
+                        } else {
+                            connect_failures = 0;
+                        }
                     }
-                    tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), "golive: destination failed, retrying");
-                    let reason = if was_live && live_for_ms < STAYED_LIVE_MS && dest.id.starts_with("kick") {
+                    // A network that is down isn't the destination failing: its tries are counted
+                    // apart and don't use up the ones an ordinary failure gets, and it is waited for
+                    // (up to NETWORK_PATIENCE) rather than given up on after a few seconds.
+                    // Also a server that took this stream earlier and now refuses connections at all
+                    // (an ingest restarting, one's own server rebooting): an outage to wait for. One
+                    // that never took it stays an ordinary failure (a wrong address says so fast).
+                    let net_down = matches!(err, PushError::NetworkDown(_))
+                        || (ever_live && matches!(err, PushError::Unreachable(_) | PushError::Slow(_)));
+                    if net_down {
+                        net_tries = net_tries.saturating_add(1);
+                        down_since.get_or_insert_with(Instant::now);
+                    } else {
+                        attempt = attempt.saturating_add(1);
+                        net_tries = 0;
+                        // The patience clock restarts only once a session really took the stream
+                        // again, not on one odd error between two "network down"s.
+                        if was_live {
+                            down_since = None;
+                        }
+                    }
+                    let kick_refused = rapid_close && is_kick(&dest);
+                    let server_refused = key_refused || matches!(err, PushError::Refused(..));
+                    let is_refused = kick_refused || server_refused;
+                    let never = dest.retry.is_never();
+                    let limit = if never {
+                        1
+                    } else if dest.retry.max_attempts == 0 {
+                        0
+                    } else if server_refused {
+                        dest.retry.max_attempts.min(REFUSED_MAX_ATTEMPTS)
+                    } else if kick_refused {
+                        // A platform closing the stream at once is a refusal that takes a few tries
+                        // to be sure of, not the 25 an outage gets from the Studio's settings.
+                        dest.retry.max_attempts.min(DEFAULT_MAX_ATTEMPTS)
+                    } else {
+                        dest.retry.max_attempts
+                    };
+                    let target = match (&dest.backup, on_backup) {
+                        (Some(b), true) => b,
+                        _ => &dest.target,
+                    };
+                    // Never hop network interfaces on a server refusal or rapid policy close:
+                    // the connection reached the server and the platform itself closed it.
+                    if err.is_network() && !key_refused && !rapid_close && may_move(target) && target.bind.is_none() {
+                        // The system's connection list is asked off the async workers (system calls).
+                        let cur = via.clone();
+                        via = tokio::task::spawn_blocking(move || {
+                            links::next_after(cur.as_ref(), &links::fallbacks(), links::default_ip())
+                        })
+                        .await
+                        .unwrap_or(None);
+                    }
+                    let give_up = if never {
+                        true
+                    } else if net_down {
+                        limit > 0 && down_since.is_some_and(|t| t.elapsed() >= NETWORK_PATIENCE)
+                    } else {
+                        limit > 0 && attempt >= limit
+                    };
+                    if give_up {
+                        let (short_reason, detail) = failure_text(
+                            &dest,
+                            &err,
+                            kick_refused,
+                            &sent_info,
+                            other_destinations_live.as_ref().map(|rx| *rx.borrow()),
+                        );
+                        tracing::warn!(
+                            dest = %dest.id,
+                            attempts = attempt.max(net_tries),
+                            refused = is_refused,
+                            on_backup,
+                            error = %err,
+                            "golive: destination failed, giving up for this stream"
+                        );
+                        set_state(
+                            &health,
+                            PushState::Failed {
+                                attempts: attempt.max(net_tries),
+                                reason: short_reason,
+                                detail,
+                                refused: is_refused,
+                            },
+                        );
+                        // A refusal (a bad key, Kick's multistream) stays parked: asking again won't
+                        // change the answer. Anything else (an outage that outlasted the tries, a
+                        // platform node down for minutes) is tried again slowly while the stream
+                        // goes on, so one platform's bad half hour doesn't end it for the whole stream.
+                        // Reconnecting turned off: the same, the first failure is final.
+                        if is_refused || never {
+                            tokio::select! {
+                                _ = stop.wait_for(|s| *s) => break 'streams,
+                                _ = live.wait_for(|l| !still_on(l)) => break,
+                            }
+                        }
+                        // One try per wait (1, 2, then 5 minutes), still Failed while it runs; only a
+                        // session that really goes live starts the ordinary loop again.
+                        let mut step = 0usize;
+                        loop {
+                            let wait = SLOW_RETRY[step.min(SLOW_RETRY.len() - 1)].mul_f64(0.8 + fastrand::f64() * 0.4);
+                            tokio::select! {
+                                _ = stop.wait_for(|s| *s) => break 'streams,
+                                _ = live.wait_for(|l| !still_on(l)) => break 'connect,
+                                _ = tokio::time::sleep(wait) => {}
+                            }
+                            let mut probe_live: Option<Instant> = None;
+                            let mut probe_info = SentStreamInfo::default();
+                            let probed = session(
+                                &dest,
+                                target,
+                                &hub,
+                                &health,
+                                stream,
+                                via.as_ref(),
+                                &mut probe_live,
+                                &mut probe_info,
+                                stop.clone(),
+                            )
+                            .await;
+                            match probed {
+                                Ok(Ended::Stopped) => break 'streams,
+                                Ok(Ended::StreamEnded) => break 'connect,
+                                Err(_) => {
+                                    if !still_on(&live.borrow()) {
+                                        break 'connect;
+                                    }
+                                    if probe_live.is_some() {
+                                        attempt = 0;
+                                        net_tries = 0;
+                                        down_since = None;
+                                        continue 'connect;
+                                    }
+                                    step += 1;
+                                }
+                            }
+                        }
+                    }
+                    let shown = if net_down { net_tries } else { attempt };
+                    let wait = if net_down {
+                        backoff(net_tries, &dest.retry).min(NETWORK_RETRY_MAX)
+                    } else {
+                        backoff(attempt, &dest.retry)
+                    };
+                    tracing::info!(dest = %dest.id, attempt = shown, error = %err, via = ?via.as_ref().map(|n| &n.name), on_backup, "golive: destination failed, retrying");
+                    let reason = if switched {
                         format!(
-                            "{err} Kick took the stream and closed it at once: streaming to other platforms too \
-                             needs \"Allow multistreaming\" in Kick's settings (Kick Partners), else turn Kick off."
+                            "{err} Trying {}.",
+                            if on_backup { "its backup server" } else { "its main server again" }
+                        )
+                    } else if kick_refused {
+                        kick_reconnecting_detail(
+                            &err,
+                            &sent_info,
+                            other_destinations_live.as_ref().map(|rx| *rx.borrow()),
                         )
                     } else {
                         err.to_string()
                     };
                     set_state(
                         &health,
-                        PushState::Reconnecting { attempt, retry_in_ms: wait.as_millis() as u64, reason },
+                        PushState::Reconnecting { attempt: shown, retry_in_ms: wait.as_millis() as u64, reason },
                     );
                     tokio::select! {
                         _ = stop.wait_for(|s| *s) => break 'streams,
@@ -265,8 +589,221 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
     });
 }
 
+/// How long a destination that gave up (not for a refusal) waits before each single try, for as long
+/// as the stream goes on: it stays Failed meanwhile.
+#[cfg(not(test))]
+const SLOW_RETRY: [Duration; 3] = [Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(300)];
+#[cfg(test)]
+const SLOW_RETRY: [Duration; 3] = [Duration::from_millis(150), Duration::from_millis(300), Duration::from_millis(600)];
+
 /// How long a session stays live before its failure starts the retry count over.
-const STAYED_LIVE_MS: u64 = 30_000;
+pub(crate) const STAYED_LIVE_MS: u64 = 30_000;
+
+/// Kick's built-in destination or a custom server pointed at Kick's IVS ingest.
+fn is_kick(dest: &Destination) -> bool {
+    let id = dest.id.to_ascii_lowercase();
+    let host = dest.target.host.to_ascii_lowercase();
+    id.starts_with("kick") || host.contains("kick") || host.starts_with("fa723fc1b171.")
+}
+
+/// Stream parameters sent to a destination, captured from metadata/headers and Hub stats to
+/// distinguish Kick limit rejects (over 1080p, 60 fps, 8,000 kbps, or non-H.264) from
+/// multistreaming disconnects.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SentStreamInfo {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f32>,
+    pub video_kbps: Option<u32>,
+    pub measured_kbps: u32,
+    pub codec: Option<flv::VideoCodec>,
+    pub keyframe_interval_ms: Option<u32>,
+}
+
+impl SentStreamInfo {
+    fn update_from_metadata(&mut self, m: &rml_rtmp::sessions::StreamMetadata) {
+        if let Some(w) = m.video_width {
+            self.width = Some(w);
+        }
+        if let Some(h) = m.video_height {
+            self.height = Some(h);
+        }
+        if let Some(fps) = m.video_frame_rate {
+            self.fps = Some(fps);
+        }
+        if let Some(kbps) = m.video_bitrate_kbps {
+            self.video_kbps = Some(kbps);
+        }
+        if self.codec.is_none() {
+            self.codec = match m.video_codec_id {
+                Some(7) => Some(flv::VideoCodec::H264),
+                Some(12) => Some(flv::VideoCodec::Hevc),
+                _ => None,
+            };
+        }
+    }
+
+    fn update_from_video_header(&mut self, data: &[u8]) {
+        if let Some(codec) = flv::video_codec(data) {
+            self.codec = Some(codec);
+        }
+        if let Some((w, h)) = flv::avcc_sps_dimensions(data) {
+            self.width = Some(w);
+            self.height = Some(h);
+        }
+    }
+
+    fn merge_hub_stats(&mut self, stats: crate::hub::StreamStats) {
+        if self.width.is_none() {
+            self.width = stats.width;
+        }
+        if self.height.is_none() {
+            self.height = stats.height;
+        }
+        if self.fps.is_none() {
+            self.fps = stats.fps;
+        }
+        if self.codec.is_none() {
+            self.codec = stats.video_codec;
+        }
+        if stats.kbps > 0 {
+            self.measured_kbps = stats.kbps;
+        }
+        if stats.keyframe_interval_ms.is_some() {
+            self.keyframe_interval_ms = stats.keyframe_interval_ms;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KickCloseKind {
+    OverLimit { reason: String, detail: String },
+    Multistreaming,
+    Closed,
+}
+
+fn codec_label(c: flv::VideoCodec) -> &'static str {
+    match c {
+        flv::VideoCodec::H264 => "H.264",
+        flv::VideoCodec::Hevc => "HEVC",
+        flv::VideoCodec::Av1 => "AV1",
+        flv::VideoCodec::Vp9 => "VP9",
+    }
+}
+
+/// Classifies why Kick closed a stream shortly after publish: checks Kick's ingest limits
+/// (`probe::KICK_LIMIT`) first so >1080p / >60fps / >8,000 kbps / non-H.264 streams are never
+/// misdiagnosed as `"Allow multistreaming"`.
+pub(crate) fn classify_kick_close(info: &SentStreamInfo, other_destinations_live: Option<bool>) -> KickCloseKind {
+    let lim = crate::probe::KICK_LIMIT;
+    let mut tags: Vec<&'static str> = Vec::new();
+    let mut got_parts: Vec<String> = Vec::new();
+
+    if let (Some(w), Some(h)) = (info.width, info.height)
+        && !lim.allows_resolution(w, h)
+    {
+        tags.push("over 1080p");
+        got_parts.push(format!("{w}×{h}"));
+    }
+    if let Some(fps) = info.fps
+        && fps > lim.max_fps as f32 + 0.5
+    {
+        tags.push("over 60 fps");
+        got_parts.push(format!("{fps:.0} fps"));
+    }
+    if let Some(codec) = info.codec
+        && !lim.allows_codec(codec)
+    {
+        tags.push("H.264 required");
+        got_parts.push(codec_label(codec).to_string());
+    }
+    let over_kbps = info.video_kbps.is_some_and(|k| k > lim.max_kbps) || info.measured_kbps > lim.max_kbps + 400;
+    if over_kbps {
+        tags.push("over 8,000 kbps");
+        let sent_kbps = info.video_kbps.filter(|&k| k > lim.max_kbps).unwrap_or(info.measured_kbps);
+        got_parts.push(crate::probe::kbps_text(sent_kbps));
+    }
+    if let Some(k_ms) = info.keyframe_interval_ms
+        && k_ms > lim.max_keyframe_secs * 1000 + 250
+    {
+        tags.push("keyframes over 2 s");
+        got_parts.push(format!("{:.1} s keyframes", f64::from(k_ms) / 1000.0));
+    }
+
+    if let Some(first_tag) = tags.first() {
+        let reason = format!("Kick closed the stream ({first_tag}).");
+        let detail = format!(
+            "Kick takes up to 1080p60 / {} H.264 ({} s keyframes); this stream sent {}. \
+             Lower resolution or bitrate to 1080p60 / {} H.264, or turn off Ignore service limits.",
+            crate::probe::kbps_text(lim.max_kbps),
+            lim.keyframe_secs,
+            got_parts.join(", "),
+            crate::probe::kbps_text(lim.max_kbps),
+        );
+        return KickCloseKind::OverLimit { reason, detail };
+    }
+
+    if other_destinations_live == Some(false) { KickCloseKind::Closed } else { KickCloseKind::Multistreaming }
+}
+
+fn kick_multistream_detail(err: &PushError) -> String {
+    format!(
+        "{err} Kick took the stream and closed it at once: streaming to other platforms too \
+         needs \"Allow multistreaming\" in Kick's settings (Kick Partners), else turn Kick off."
+    )
+}
+
+fn kick_reconnecting_detail(err: &PushError, info: &SentStreamInfo, other_destinations_live: Option<bool>) -> String {
+    match classify_kick_close(info, other_destinations_live) {
+        KickCloseKind::OverLimit { detail, .. } => format!("{err} {detail}"),
+        KickCloseKind::Multistreaming => kick_multistream_detail(err),
+        KickCloseKind::Closed => format!(
+            "{err} Kick took the stream and closed it right away. Check your stream key and account status on Kick."
+        ),
+    }
+}
+
+/// One short line and an optional `(i)` detail for terminal `PushState::Failed`.
+fn failure_text(
+    dest: &Destination,
+    err: &PushError,
+    kick_refused: bool,
+    info: &SentStreamInfo,
+    other_destinations_live: Option<bool>,
+) -> (String, Option<String>) {
+    if kick_refused {
+        return match classify_kick_close(info, other_destinations_live) {
+            KickCloseKind::OverLimit { reason, detail } => (reason, Some(detail)),
+            KickCloseKind::Multistreaming => ("Kick refused the stream.".into(), Some(kick_multistream_detail(err))),
+            KickCloseKind::Closed => (
+                "Kick closed the stream.".into(),
+                Some(
+                    "Kick took the stream and closed it right away. Check your stream key and account status on Kick."
+                        .into(),
+                ),
+            ),
+        };
+    }
+    match err {
+        PushError::NetworkDown(host) => (
+            "The network stayed down; stopped trying.".into(),
+            Some(format!(
+                "{host} couldn't be reached for {} minutes. Start the destination again once the internet is back.",
+                NETWORK_PATIENCE.as_secs() / 60
+            )),
+        ),
+        PushError::KeyRefused(_) => ("Stream key was refused.".into(), Some(err.to_string())),
+        PushError::Refused(_, _) => ("The platform refused the stream.".into(), Some(err.to_string())),
+        _ => {
+            let full = err.to_string();
+            if full.chars().count() <= 60 {
+                (full, None)
+            } else {
+                (format!("{} stopped taking the stream.", dest.target.host), Some(full))
+            }
+        }
+    }
+}
 
 /// 1, 2, 4, 8, 16, 30, 30… seconds by default, each ±20% so many destinations don't retry in
 /// step.
@@ -277,20 +814,181 @@ pub(crate) fn backoff(attempt: u32, retry: &Retry) -> Duration {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    #[cfg(test)]
+    let t = t.saturating_add_signed(fault::CLOCK_STEP_MS.with(std::cell::Cell::get));
+    t
+}
+
+/// What a failed TCP connect says. No route, no network or an interface that's down is the network
+/// being down (waited for, even before the stream was ever live). A name that can't be looked up, a
+/// refusal or a reset is a wrong address or that server not taking it: counted like any failure,
+/// and only waited for by a destination that was live before (it worked a moment ago).
+fn connect_error(e: &std::io::Error, host: &str) -> PushError {
+    use std::io::ErrorKind as K;
+    if matches!(e.kind(), K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown) {
+        return PushError::NetworkDown(host.to_string());
+    }
+    if e.kind() == K::TimedOut {
+        return PushError::Slow(host.to_string());
+    }
+    PushError::Unreachable(host.to_string())
+}
+
+/// Tests take the network away from one destination (by its port) and give it back.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::sync::Mutex;
+    static DOWN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    pub(crate) fn set(port: u16, down: bool) {
+        let mut d = DOWN.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if down {
+            d.push(port);
+        }
+    }
+    thread_local! {
+        /// The wall clock stepped by this many ms in this test (an NTP correction, a wake from sleep).
+        pub(crate) static CLOCK_STEP_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+    pub(crate) fn is_down(port: u16) -> bool {
+        DOWN.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
+    static SLOW: Mutex<Vec<(u16, u64)>> = Mutex::new(Vec::new());
+    /// Connecting to this port takes this long (ms) before it fails: a connect that hangs.
+    pub(crate) fn set_slow(port: u16, ms: u64) {
+        let mut d = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|(p, _)| *p != port);
+        if ms > 0 {
+            d.push((port, ms));
+        }
+    }
+    pub(crate) fn slow_ms(port: u16) -> u64 {
+        SLOW.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, m)| *m)
+    }
+    static CONNECTS: Mutex<Vec<(u16, u32)>> = Mutex::new(Vec::new());
+    /// Counts a connect attempt to this port.
+    pub(crate) fn count_connect(port: u16) {
+        let mut d = CONNECTS.lock().unwrap_or_else(|e| e.into_inner());
+        match d.iter_mut().find(|(p, _)| *p == port) {
+            Some((_, n)) => *n += 1,
+            None => d.push((port, 1)),
+        }
+    }
+    pub(crate) fn connects(port: u16) -> u32 {
+        CONNECTS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, n)| *n)
+    }
+    static NO_NAME: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// The destination's name can't be looked up (a typo, or no DNS).
+    pub(crate) fn set_no_name(port: u16, on: bool) {
+        let mut d = NO_NAME.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if on {
+            d.push(port);
+        }
+    }
+    pub(crate) fn no_name(port: u16) -> bool {
+        NO_NAME.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
+    static REFUSED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// Nothing listens there: the connect is refused at once. (A real refusal takes about 2 s on
+    /// Windows, which tries the SYN again before saying so; macOS and Linux answer at once.)
+    pub(crate) fn set_refused(port: u16, on: bool) {
+        let mut d = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if on {
+            d.push(port);
+        }
+    }
+    pub(crate) fn refused(port: u16) -> bool {
+        REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
+    static SEND_BUFFER: Mutex<Vec<(u16, usize)>> = Mutex::new(Vec::new());
+    /// Connections to this port get a send buffer of this size, as on a real link. Over loopback
+    /// Linux sizes it from the 64 KB loopback segment (about 2.5 MB at connect), so a platform
+    /// that reads slowly or not at all takes seconds of stream before its writes block; macOS
+    /// starts at about 144 KB. Pinned, a slow test platform pushes back the same on every OS.
+    pub(crate) fn set_send_buffer(port: u16, bytes: usize) {
+        let mut d = SEND_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|(p, _)| *p != port);
+        if bytes > 0 {
+            d.push((port, bytes));
+        }
+    }
+    pub(crate) fn send_buffer(port: u16) -> Option<usize> {
+        SEND_BUFFER.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map(|(_, b)| *b)
+    }
+}
+
+fn family_name(f: IpFamily) -> &'static str {
+    match f {
+        IpFamily::V4 => "IPv4",
+        IpFamily::V6 => "IPv6",
+        IpFamily::Auto => "IP",
+    }
+}
+
+/// A TCP connection to `host`, over one IP version only: the addresses of the other are never tried.
+pub(crate) async fn tcp_family(host: &str, port: u16, family: IpFamily) -> std::io::Result<TcpStream> {
+    let mut last = std::io::Error::other(format!("{host} has no {} address", family_name(family)));
+    for a in tokio::net::lookup_host((host, port)).await?.filter(|a| family.allows(&a.ip())) {
+        match TcpStream::connect(a).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
-    let tcp = match (via, t.pin) {
-        (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
-        (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
-        (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
+    #[cfg(test)]
+    fault::count_connect(t.port);
+    #[cfg(test)]
+    {
+        let ms = fault::slow_ms(t.port);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
     }
+    #[cfg(test)]
+    if fault::is_down(t.port) {
+        return Err(PushError::NetworkDown(host));
+    }
+    #[cfg(test)]
+    if fault::no_name(t.port) {
+        return Err(connect_error(&std::io::Error::other("failed to lookup address information"), &host));
+    }
+    #[cfg(test)]
+    if fault::refused(t.port) {
+        return Err(connect_error(&std::io::ErrorKind::ConnectionRefused.into(), &host));
+    }
+    // A connection the streamer chose is the only way out: it is looked up at every try (a
+    // replugged cable has a new address), and one that isn't there says so by name.
+    let chosen = match &t.bind {
+        Some(spec) => Some(links::find_network(spec).map_err(|_| PushError::NoConnection(spec.clone()))?),
+        None => None,
+    };
+    let via = chosen.as_ref().or(via);
+    let tcp = match (via, t.pin) {
+        (None, Some(addr)) if t.family.allows(&addr.ip()) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
+        (None, Some(_)) => Ok(Err(std::io::Error::other(format!("{host} has no {} address", family_name(t.family))))),
+        (None, None) if t.family == IpFamily::Auto => {
+            timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await
+        }
+        (None, None) => timeout(CONNECT_DEADLINE, tcp_family(&t.host, t.port, t.family)).await,
+        (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port, t.family)).await,
+    }
+    // Not answering at all looks the same whether the link or the server is down (or the address
+    // is wrong): an ordinary failure, waited for only by a destination that was live before.
     .map_err(|_| PushError::Slow(host.clone()))?
-    .map_err(|_| PushError::Unreachable(host.clone()))?;
+    .map_err(|e| connect_error(&e, &host))?;
     let _ = tcp.set_nodelay(true);
+    #[cfg(test)]
+    if let Some(bytes) = fault::send_buffer(t.port) {
+        socket2::SockRef::from(&tcp).set_send_buffer_size(bytes).expect("test send buffer");
+    }
     if !t.tls {
         return Ok(Box::pin(tcp));
     }
@@ -309,14 +1007,22 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
 }
 
 /// One connection: connect, publish, forward until the stream ends, `stop`, or an error.
+#[allow(clippy::too_many_arguments)]
 async fn session(
     dest: &Destination,
+    target: &Target,
     hub: &Hub,
     health: &watch::Sender<Health>,
     stream: u64,
     via: Option<&links::Network>,
+    live_at: &mut Option<Instant>,
+    sent_info: &mut SentStreamInfo,
+    mut stop: watch::Receiver<bool>,
 ) -> Result<Ended, PushError> {
-    let mut p = Publisher::open(&dest.target, &dest.key, via).await?;
+    let mut p = tokio::select! {
+        _ = async { let _ = stop.wait_for(|s| *s).await; } => return Ok(Ended::Stopped),
+        p = Publisher::open(target, &dest.key, via) => p?,
+    };
     // Its name asks the system (a quick command): off the async threads.
     let label = match via {
         Some(n) => {
@@ -329,81 +1035,156 @@ async fn session(
 
     // Headers first, then packets from the next keyframe, timestamps from zero.
     let Subscription { live, headers, mut rx } = hub.subscribe();
+    if let Some(m) = &headers.metadata {
+        sent_info.update_from_metadata(m);
+    }
+    if let Some(v) = &headers.video {
+        sent_info.update_from_video_header(v);
+    }
+    sent_info.merge_hub_stats(hub.stats());
     // The stream may have ended (or a new one begun) while this connection was being set up.
     if !live.on || live.stream != stream {
+        p.finish().await;
         return Ok(Ended::StreamEnded);
     }
+    let progress = p.progress.clone();
+    let mut window = (Instant::now(), progress.load(Ordering::Relaxed));
     if let Some(m) = &headers.metadata {
         let r = p.client.publish_metadata(m);
-        p.send(r).await?;
+        if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+            p.finish().await;
+            return Ok(Ended::Stopped);
+        }
     }
     if let Some(v) = headers.video {
         let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
-        p.send(r).await?;
+        if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+            p.finish().await;
+            return Ok(Ended::Stopped);
+        }
     }
     if let Some(a) = headers.audio {
         let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
-        p.send(r).await?;
+        if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+            p.finish().await;
+            return Ok(Ended::Stopped);
+        }
     }
     if dest.extra_video {
         for (_, v) in headers.extra_video {
             let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
-            p.send(r).await?;
+            if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+                p.finish().await;
+                return Ok(Ended::Stopped);
+            }
         }
     }
     if dest.extra_audio {
         for (_, a) in headers.extra_audio {
             let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
-            p.send(r).await?;
+            if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+                p.finish().await;
+                return Ok(Ended::Stopped);
+            }
         }
     }
     set_state(health, PushState::Live);
+    // Measured on the monotonic clock: the wall clock steps (NTP, a wake from sleep).
+    *live_at = Some(Instant::now());
     let mut base: Option<u32> = None;
-    let mut waiting_for_key = true;
-    let mut window = (Instant::now(), p.sent);
+    let mut started = false;
+    let mut video_drop = VideoDrop::default();
     loop {
         tokio::select! {
+            // Stopped (a destination unticked): the connection is closed properly, as at the
+            // end of a stream, so the platform sees a clean end and not a reset.
+            _ = async { let _ = stop.wait_for(|s| *s).await; } => {
+                p.finish().await;
+                return Ok(Ended::Stopped);
+            }
             frame = rx.recv() => {
                 let frame = match frame {
                     Ok(f) => f,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        health.send_modify(|h| h.dropped += n);
-                        waiting_for_key = true;
+                        health.send_modify(|h| h.dropped = h.dropped.saturating_add(n));
+                        if started {
+                            video_drop.on_lagged();
+                        }
                         continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(Ended::StreamEnded),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        p.finish().await;
+                        return Ok(Ended::StreamEnded);
+                    }
                 };
-                let r = match frame {
-                    Frame::End => return Ok(Ended::StreamEnded),
-                    Frame::Metadata(m) => p.client.publish_metadata(&m),
-                    // Codec headers always go through; other packets wait for a real keyframe.
+                let outbound = match frame {
+                    Frame::End => {
+                        p.finish().await;
+                        return Ok(Ended::StreamEnded);
+                    }
+                    Frame::Metadata(m) => {
+                        sent_info.update_from_metadata(&m);
+                        Some(p.client.publish_metadata(&m))
+                    }
+                    // Codec headers always go through; initial frames wait for a main keyframe,
+                    // and once live, stale non-keyframe video drops until its track's next keyframe.
                     Frame::Video { ts, data, key } => {
                         let extra = flv::video_extra_track(&data);
-                        if extra.is_some() && !dest.extra_video {
-                            continue;
-                        }
                         let header = flv::video_is_header(&data) || extra.is_some_and(|(_, h)| h);
-                        if !header {
-                            if waiting_for_key && !key {
-                                continue;
-                            }
-                            waiting_for_key = false;
+                        if extra.is_none() && flv::video_is_header(&data) {
+                            sent_info.update_from_video_header(&data);
                         }
-                        p.client.publish_video_data(data, stamp(&mut base, ts), false)
+                        let send = if extra.is_some() && !dest.extra_video {
+                            false
+                        } else if header {
+                            true
+                        } else if !started {
+                            started = key;
+                            key
+                        } else {
+                            let track = extra.map_or(0, |(t, _)| t);
+                            let track_key = if extra.is_some() { flv::video_is_keyframe(&data) } else { key };
+                            if video_drop.should_drop(
+                                track,
+                                track_key,
+                                hub.newest_video_ts(),
+                                hub.newest_key_ts(),
+                                hub.prev_key_ts(),
+                                ts,
+                                rx.len(),
+                            ) {
+                                health.send_modify(|h| h.dropped = h.dropped.saturating_add(1));
+                                false
+                            } else {
+                                true
+                            }
+                        };
+                        send.then(|| p.client.publish_video_data(data, stamp(&mut base, ts), false))
                     }
                     Frame::Audio { ts, data } => {
                         let extra = flv::audio_extra_track(&data);
-                        if extra.is_some() && !dest.extra_audio {
-                            continue;
-                        }
                         let header = flv::audio_is_header(&data) || extra.is_some_and(|(_, h)| h);
-                        if waiting_for_key && !header {
-                            continue;
-                        }
-                        p.client.publish_audio_data(data, stamp(&mut base, ts), false)
+                        let send = if extra.is_some() && !dest.extra_audio {
+                            false
+                        } else if header {
+                            true
+                        } else if !started {
+                            false
+                        } else if video_drop.should_drop_audio(ts, hub.newest_video_ts(), hub.newest_key_ts()) {
+                            health.send_modify(|h| h.dropped = h.dropped.saturating_add(1));
+                            false
+                        } else {
+                            true
+                        };
+                        send.then(|| p.client.publish_audio_data(data, stamp(&mut base, ts), false))
                     }
                 };
-                p.send(r).await?;
+                if let Some(r) = outbound
+                    && send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await?
+                {
+                    p.finish().await;
+                    return Ok(Ended::Stopped);
+                }
             }
             // Only the read races the next packet (a read can be dropped safely); the answer
             // is written after, so a write is never cut off halfway.
@@ -412,15 +1193,178 @@ async fn session(
                 p.answer(n).await?;
             }
         }
-        if window.0.elapsed() >= HEALTH_EVERY {
-            let secs = window.0.elapsed().as_secs_f64();
-            let kbps = ((p.sent - window.1) as f64 * 8.0 / 1000.0 / secs) as u32;
-            health.send_modify(|h| {
-                h.kbps = kbps;
-                h.sent += p.sent - window.1;
-            });
-            window = (Instant::now(), p.sent);
+        report_rate(health, &mut window, progress.load(Ordering::Relaxed));
+    }
+}
+
+/// Sends one RTMP session result while updating health bitrate each second and aborting promptly
+/// if `stop` is triggered during an in-flight stalled TCP/TLS write.
+async fn send_result_with_stop(
+    p: &mut Publisher,
+    r: Result<ClientSessionResult, ClientSessionError>,
+    stop: &mut watch::Receiver<bool>,
+    health: &watch::Sender<Health>,
+    window: &mut (Instant, u64),
+    progress: &Arc<AtomicU64>,
+) -> Result<bool, PushError> {
+    if *stop.borrow() {
+        return Ok(true);
+    }
+    let send = p.send(r);
+    tokio::pin!(send);
+    loop {
+        let left = HEALTH_EVERY.saturating_sub(window.0.elapsed()).max(Duration::from_millis(50));
+        tokio::select! {
+            done = &mut send => {
+                done?;
+                return Ok(false);
+            }
+            _ = stop.wait_for(|s| *s) => return Ok(true),
+            _ = tokio::time::sleep(left) => report_rate(health, window, progress.load(Ordering::Relaxed)),
         }
+    }
+}
+
+/// Once a second: what the destination took in that time, as kilobits a second, and the bytes
+/// counted since the last report. (`window`: when it started and the count then.)
+fn report_rate(health: &watch::Sender<Health>, window: &mut (Instant, u64), now_sent: u64) {
+    let secs = window.0.elapsed().as_secs_f64();
+    if secs < HEALTH_EVERY.as_secs_f64() {
+        return;
+    }
+    let took = now_sent.saturating_sub(window.1);
+    let kbps = (took as f64 * 8.0 / 1000.0 / secs) as u32;
+    health.send_modify(|h| {
+        h.kbps = kbps;
+        h.sent += took;
+    });
+    *window = (Instant::now(), now_sent);
+}
+
+/// How far `ts` lags behind `newest` in stream milliseconds, handling `u32` wrap (~49.7 days).
+/// Returns 0 if `ts` is ahead of `newest` (e.g. a timestamp reset or slightly ahead extra track).
+fn behind_ms(newest: u32, ts: u32) -> u32 {
+    let diff = newest.wrapping_sub(ts);
+    if diff < u32::MAX / 2 { diff } else { 0 }
+}
+
+/// Per-track drop gate for a live destination (port of OBS `rtmp-stream.c`
+/// `check_to_drop_frames` / `drop_frames`, extended per video track so Twitch Enhanced
+/// Broadcasting extra qualities each resume cleanly on their own keyframe).
+#[derive(Default)]
+struct VideoDrop {
+    tracks: [u64; 4],
+    /// Main-track keyframe timestamp (ms) we are skipping to when far behind (`> KEY_SKIP_THRESHOLD_MS`),
+    /// dropping all older video (including intermediate keyframes) and non-header audio strictly before it.
+    skip_to_key: Option<u32>,
+}
+
+impl VideoDrop {
+    fn is_dropping(&self, track: u8) -> bool {
+        (self.tracks[(track / 64) as usize] & (1u64 << (track % 64))) != 0
+    }
+
+    fn mark(&mut self, track: u8) {
+        self.tracks[(track / 64) as usize] |= 1u64 << (track % 64);
+    }
+
+    fn clear(&mut self, track: u8) {
+        self.tracks[(track / 64) as usize] &= !(1u64 << (track % 64));
+    }
+
+    fn mark_all(&mut self) {
+        self.tracks = [u64::MAX; 4];
+    }
+
+    fn on_lagged(&mut self) {
+        self.mark_all();
+        self.skip_to_key = None;
+    }
+
+    /// Whether a non-header video packet on `track` should be dropped, updating per-track and
+    /// keyframe-skip state.
+    ///
+    /// Normal lag (`> DROP_THRESHOLD_MS`) drops only inter frames while keeping keyframes and audio
+    /// continuous (OBS `drop_frames`). When far behind (`> KEY_SKIP_THRESHOLD_MS`) and an older
+    /// keyframe can actually be skipped ahead to `newest_key_ts`, we jump to `newest_key_ts` so a
+    /// link slower than keyframes alone does not drift endlessly.
+    #[allow(clippy::too_many_arguments)]
+    fn should_drop(
+        &mut self,
+        track: u8,
+        key: bool,
+        newest_ts: Option<u32>,
+        newest_key_ts: Option<u32>,
+        prev_key_ts: Option<u32>,
+        ts: u32,
+        queued: usize,
+    ) -> bool {
+        let is_main = track == 0;
+        let can_skip_ahead = newest_ts
+            .zip(newest_key_ts)
+            .filter(|&(nv, nk)| behind_ms(nv, ts) > KEY_SKIP_THRESHOLD_MS && behind_ms(nk, ts) > 0)
+            .is_some_and(|(_, nk)| {
+                queued >= MIN_BACKLOG_PACKETS
+                    && ((is_main && key)
+                        || prev_key_ts.is_some_and(|pk| behind_ms(pk, ts) > 0)
+                        || self.skip_to_key.is_some_and(|target| nk != target))
+            });
+
+        if can_skip_ahead && let Some(nk) = newest_key_ts {
+            self.skip_to_key = Some(nk);
+            self.mark_all();
+            return true;
+        }
+
+        if let Some(target) = self.skip_to_key {
+            if behind_ms(target, ts) > 0 {
+                return true;
+            }
+            if is_main && key {
+                // Reached target main keyframe: resume main video and wait for each extra track's keyframe.
+                self.skip_to_key = None;
+                self.clear(0);
+                return false;
+            }
+            return true;
+        }
+
+        if key {
+            self.clear(track);
+            return false;
+        }
+        if self.is_dropping(track) {
+            return true;
+        }
+        if queued >= MIN_BACKLOG_PACKETS && newest_ts.is_some_and(|newest| behind_ms(newest, ts) > DROP_THRESHOLD_MS) {
+            self.mark(track);
+            return true;
+        }
+        false
+    }
+
+    /// Whether non-header audio at `ts` belongs to skipped GOPs during an active keyframe jump.
+    ///
+    /// During normal single-GOP P-frame drops, `skip_to_key` is `None` so audio stays continuous.
+    /// When skipping older keyframes on links slower than keyframes alone, stale audio before
+    /// `target_key_ts` must drop with its video so RTMP/HLS players don't receive seconds of
+    /// stalled audio out of sync with live video and so audio doesn't saturate the slow socket.
+    fn should_drop_audio(&mut self, ts: u32, newest_ts: Option<u32>, newest_key_ts: Option<u32>) -> bool {
+        let Some(target) = self.skip_to_key else {
+            return false;
+        };
+        if behind_ms(target, ts) > 0 {
+            return true;
+        }
+        if let Some((nv, nk)) = newest_ts.zip(newest_key_ts)
+            && nk != target
+            && behind_ms(nv, ts) > KEY_SKIP_THRESHOLD_MS
+            && behind_ms(nk, ts) > 0
+        {
+            self.skip_to_key = Some(nk);
+            return true;
+        }
+        false
     }
 }
 
@@ -439,6 +1383,9 @@ pub(crate) struct Publisher {
     buf: Vec<u8>,
     /// Bytes written since the connection opened.
     pub(crate) sent: u64,
+    /// The same count, kept up to date while a write is still going on (as the kernel takes the
+    /// bytes), so a destination whose writes block can be seen to be getting nothing.
+    progress: Arc<AtomicU64>,
 }
 
 impl Publisher {
@@ -458,7 +1405,7 @@ impl Publisher {
         cfg.tc_url = Some(t.tc_url.clone());
         cfg.flash_version = "FMLE/3.0 (compatible; FMSc/1.0)".to_string();
         let (client, first) = ClientSession::new(cfg).map_err(|_| PushError::NotRtmp(host.clone()))?;
-        let mut p = Self { client, s, host, buf: vec![0u8; READ_BUF], sent: 0 };
+        let mut p = Self { client, s, host, buf: vec![0u8; READ_BUF], sent: 0, progress: Arc::default() };
         p.results(first).await?;
         let mut pending = p.client.handle_input(&rest).map_err(|_| p.not_rtmp())?;
 
@@ -486,9 +1433,9 @@ impl Publisher {
             _ => None,
         })
         .await
-        // Twitch over rtmps:// resets the connection instead of closing it cleanly.
+        // Twitch over rtmps:// resets the connection instead of closing it cleanly, for a bad key.
         .map_err(|e| match e {
-            PushError::Closed(h) | PushError::Broken(h) => PushError::KeyRefused(h),
+            PushError::Closed(h) | PushError::Broken(h) => PushError::PublishDropped(h),
             e => e,
         })?;
         Ok(p)
@@ -518,10 +1465,23 @@ impl Publisher {
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), PushError> {
-        timeout(WRITE_DEADLINE, self.s.write_all(bytes))
-            .await
-            .map_err(|_| PushError::Stalled(self.host.clone()))?
-            .map_err(|_| PushError::Broken(self.host.clone()))?;
+        // The whole write has the deadline, but the bytes the kernel takes are counted as they go.
+        let (s, progress) = (&mut self.s, &self.progress);
+        let wrote = timeout(WRITE_DEADLINE, async {
+            let mut at = 0;
+            while at < bytes.len() {
+                let n = s.write(&bytes[at..]).await?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                at += n;
+                progress.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            std::io::Result::Ok(())
+        })
+        .await
+        .map_err(|_| PushError::Stalled(self.host.clone()))?;
+        wrote.map_err(|_| PushError::Broken(self.host.clone()))?;
         self.sent += bytes.len() as u64;
         Ok(())
     }
@@ -540,6 +1500,17 @@ impl Publisher {
     pub(crate) async fn answer(&mut self, n: usize) -> Result<(), PushError> {
         let results = self.client.handle_input(&self.buf[..n]).map_err(|_| self.not_rtmp())?;
         self.results(results).await.map(|_| ())
+    }
+
+    /// Cleanly closes the outbound stream (TCP FIN / TLS `close_notify`) and briefly drains
+    /// inbound bytes (e.g. an unread RTMP Ack) so dropping the socket doesn't emit a TCP RST
+    /// that discards the last in-flight packets at the server.
+    async fn finish(mut self) {
+        let _ = timeout(Duration::from_millis(500), async {
+            let _ = self.s.shutdown().await;
+            while matches!(self.s.read(&mut self.buf).await, Ok(n) if n > 0) {}
+        })
+        .await;
     }
 
     /// Reads and answers the server until `done` picks an event (within the step deadline).
@@ -570,6 +1541,42 @@ impl Publisher {
 }
 
 #[cfg(test)]
+mod connect_error_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind as K};
+
+    #[test]
+    fn only_no_route_is_the_network_down_a_name_or_a_refusal_is_the_address() {
+        let class = |e: Error| match connect_error(&e, "h") {
+            PushError::NetworkDown(_) => "down",
+            PushError::Slow(_) => "slow",
+            PushError::Unreachable(_) => "unreachable",
+            _ => "other",
+        };
+        assert_eq!(class(K::NetworkUnreachable.into()), "down", "ENETUNREACH");
+        assert_eq!(class(K::HostUnreachable.into()), "down", "EHOSTUNREACH");
+        assert_eq!(class(K::NetworkDown.into()), "down", "ENETDOWN");
+        assert_eq!(class(K::TimedOut.into()), "slow", "ETIMEDOUT / WSAETIMEDOUT");
+        // A name that can't be looked up (a typo, or no DNS; on Windows WSAHOST_NOT_FOUND 11001,
+        // WSATRY_AGAIN 11002, WSANO_DATA 11004 arrive as raw OS errors) is not proof the network is down.
+        assert_eq!(class(Error::other("failed to lookup address information")), "unreachable");
+        for code in [11001, 11002, 11004] {
+            assert_eq!(class(Error::from_raw_os_error(code)), "unreachable", "{code}");
+        }
+        assert_eq!(class(K::ConnectionRefused.into()), "unreachable");
+        assert_eq!(class(K::ConnectionReset.into()), "unreachable");
+    }
+
+    #[test]
+    fn a_network_that_is_down_never_counts_as_a_refusal_or_blocks_failover() {
+        let e = PushError::NetworkDown("h".into());
+        assert!(e.is_network(), "another connection may do better");
+        assert!(e.is_connect_failure(), "the backup ingest may answer");
+        assert!(!matches!(e, PushError::KeyRefused(_) | PushError::Refused(..)));
+    }
+}
+
+#[cfg(test)]
 mod via_tests {
     use super::*;
 
@@ -595,5 +1602,217 @@ mod via_tests {
         assert!(!may_move(&t("rtmp://localhost/live")));
         assert!(PushError::Unreachable("x".into()).is_network());
         assert!(!PushError::KeyRefused("x".into()).is_network());
+    }
+
+    #[test]
+    fn behind_ms_handles_wrap_and_backwards_resets() {
+        assert_eq!(behind_ms(1_000, 1_000), 0);
+        assert_eq!(behind_ms(1_900, 1_000), 900);
+        assert_eq!(behind_ms(1_901, 1_000), 901);
+        // Wraps cleanly across u32::MAX -> 0 (~49.7 days of stream time).
+        assert_eq!(behind_ms(100, u32::MAX - 899), 1_000);
+        assert_eq!(behind_ms(0, u32::MAX), 1);
+        // Packet ahead of newest (or timestamp reset backwards): never treated as huge lag.
+        assert_eq!(behind_ms(1_000, 1_050), 0);
+        assert_eq!(behind_ms(100, 600_000), 0);
+        assert_eq!(behind_ms(u32::MAX, 0), 0);
+    }
+
+    #[test]
+    fn video_drop_respects_threshold_backlog_keyframes_and_extra_tracks() {
+        let mut d = VideoDrop::default();
+        // At threshold (900 ms) or sparse queue (< 4 queued behind): never drops.
+        assert!(!d.should_drop(0, false, Some(1_900), None, None, 1_000, 10));
+        assert!(!d.should_drop(0, false, Some(2_500), None, None, 1_000, MIN_BACKLOG_PACKETS - 1));
+        assert!(!d.should_drop(0, false, None, None, None, 1_000, 10));
+        // With only one keyframe ahead, keyframes never drop even when > 1800 ms behind live.
+        assert!(!d.should_drop(0, true, Some(5_000), Some(1_000), None, 1_000, 50));
+
+        // Past threshold with enough backlog: starts dropping track 0.
+        assert!(d.should_drop(0, false, Some(1_901), None, None, 1_000, MIN_BACKLOG_PACKETS));
+        // Stays dropping track 0 even once caught up, until track 0 sees a keyframe.
+        assert!(d.should_drop(0, false, Some(1_050), None, None, 1_050, 0));
+        // Track 1 isn't affected by track 0 alone when track 1 isn't behind.
+        assert!(!d.should_drop(1, false, Some(1_050), None, None, 1_050, 0));
+        // Track 0 keyframe clears track 0; subsequent in-time inter frames pass.
+        assert!(!d.should_drop(0, true, Some(2_000), None, None, 2_000, 0));
+        assert!(!d.should_drop(0, false, Some(2_033), None, None, 2_033, 0));
+
+        // Wraps across u32::MAX -> 0 cleanly to trigger drop on track 1.
+        assert!(d.should_drop(1, false, Some(100), None, None, u32::MAX - 850, MIN_BACKLOG_PACKETS));
+        assert!(d.should_drop(1, false, Some(120), None, None, 120, 0));
+        assert!(!d.should_drop(1, true, Some(150), None, None, 150, 0));
+
+        // on_lagged (after RecvError::Lagged) drops every track until its own keyframe.
+        d.on_lagged();
+        assert!(d.should_drop(0, false, Some(3_000), None, None, 3_000, 0));
+        assert!(d.should_drop(2, false, Some(3_000), None, None, 3_000, 0));
+        assert!(!d.should_drop(0, true, Some(3_050), None, None, 3_050, 0));
+        assert!(!d.should_drop(0, false, Some(3_083), None, None, 3_083, 0));
+        assert!(d.should_drop(2, false, Some(3_083), None, None, 3_083, 0));
+        assert!(!d.should_drop(2, true, Some(3_100), None, None, 3_100, 0));
+    }
+
+    #[test]
+    fn video_drop_skips_older_keyframes_and_stale_audio_when_far_behind() {
+        let mut d = VideoDrop::default();
+        // Single future keyframe (prev_key=0, newest_key=2000) > 1800 ms behind: keeps keyframe-less inter drop and keeps audio continuous.
+        assert!(d.should_drop(0, false, Some(2_450), Some(2_000), Some(0), 50, 20));
+        assert!(!d.should_drop_audio(60, Some(2_450), Some(2_000)));
+        assert!(!d.should_drop(0, true, Some(2_450), Some(2_000), Some(0), 2_000, 5));
+
+        // Multiple older keyframes ahead (1000, 2000, newest_key=3000, newest_ts=3200) and > 1800 ms behind: skips to 3000.
+        assert!(d.should_drop(0, false, Some(3_200), Some(3_000), Some(2_000), 100, 20));
+        assert!(d.should_drop_audio(110, Some(3_200), Some(3_000)));
+        // Intermediate keyframes (1000, 2000) and their audio are dropped.
+        assert!(d.should_drop(0, true, Some(3_200), Some(3_000), Some(2_000), 1_000, 15));
+        assert!(d.should_drop_audio(1_500, Some(3_200), Some(3_000)));
+        assert!(d.should_drop(0, true, Some(3_200), Some(3_000), Some(2_000), 2_000, 10));
+        assert!(d.should_drop_audio(2_990, Some(3_200), Some(3_000)));
+        // Target keyframe 3000 and its audio resume cleanly; extra track 1 stays dropped until its own keyframe.
+        assert!(!d.should_drop_audio(3_000, Some(3_200), Some(3_000)));
+        assert!(!d.should_drop(0, true, Some(3_200), Some(3_000), Some(2_000), 3_000, 5));
+        assert!(d.should_drop(1, false, Some(3_200), Some(3_000), Some(2_000), 3_020, 4));
+        assert!(!d.should_drop(1, true, Some(3_250), Some(3_000), Some(2_000), 3_050, 3));
+
+        // Extending target while skipping: arriving at 3000 when newest_key moved to 5000 (newest_ts=5200) skips 3000 too.
+        assert!(d.should_drop(0, true, Some(3_200), Some(3_000), Some(2_000), 1_000, 20));
+        assert!(d.should_drop_audio(3_000, Some(5_200), Some(5_000)));
+        assert!(d.should_drop(0, true, Some(5_200), Some(5_000), Some(4_000), 3_000, 10));
+        assert!(!d.should_drop(0, true, Some(5_200), Some(5_000), Some(4_000), 5_000, 4));
+
+        // Wraps across u32::MAX cleanly and resets on RecvError::Lagged without getting stuck.
+        assert!(d.should_drop(0, true, Some(1_100), Some(900), Some(400), u32::MAX - 900, 15));
+        assert!(d.should_drop_audio(u32::MAX - 500, Some(1_100), Some(900)));
+        d.on_lagged();
+        assert!(!d.should_drop_audio(200, Some(1_100), Some(900)));
+        assert!(!d.should_drop(0, true, Some(1_100), Some(900), Some(400), 950, 2));
+    }
+}
+
+#[cfg(test)]
+mod give_up_text_tests {
+    use super::*;
+
+    #[test]
+    fn after_the_network_patience_runs_out_it_says_so_not_that_it_is_waiting_or_the_server_stopped() {
+        for host in ["live.twitch.tv", "a.rtmps.youtube.com", "fa723fc1b171.global-contribute.live-video.net"] {
+            let d = Destination {
+                id: "x".into(),
+                target: Target::parse(&format!("rtmp://{host}/app")).unwrap(),
+                key: "k".into(),
+                retry: Retry::default(),
+                extra_audio: false,
+                extra_video: false,
+                backup: None,
+            };
+            let (reason, detail) =
+                failure_text(&d, &PushError::NetworkDown(host.into()), false, &SentStreamInfo::default(), None);
+            assert!(!reason.contains("waiting") && !reason.contains("stopped taking"), "{reason}");
+            assert!(detail.is_some_and(|x| x.contains(host)));
+        }
+    }
+
+    #[test]
+    fn kick_rapid_close_classification_distinguishes_limits_from_multistreaming() {
+        let kick_dest = Destination {
+            id: "kick".into(),
+            target: Target::parse("rtmp://fa723fc1b171.global-contribute.live-video.net/app").unwrap(),
+            key: "k".into(),
+            retry: Retry::default(),
+            extra_audio: false,
+            extra_video: false,
+            backup: None,
+        };
+        let err = PushError::Closed("fa723fc1b171.global-contribute.live-video.net".into());
+
+        // Over 1080p (26 Nov bug): must report resolution limit, never "Allow multistreaming".
+        let over_res = SentStreamInfo {
+            width: Some(2560),
+            height: Some(1440),
+            fps: Some(60.0),
+            video_kbps: Some(18_000),
+            codec: Some(flv::VideoCodec::H264),
+            keyframe_interval_ms: Some(2_000),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_res, Some(true));
+        assert!(r.contains("1080p"), "{r}");
+        assert!(!r.contains("Allow multistreaming"), "{r}");
+        let d = d.unwrap();
+        assert!(d.contains("2560×1440") && d.contains("1080p60"), "{d}");
+        assert!(!d.contains("Allow multistreaming"), "{d}");
+
+        // Over bitrate alone (measured or configured): must report 8,000 kbps limit.
+        let over_kbps = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(12_000),
+            codec: Some(flv::VideoCodec::H264),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_kbps, None);
+        assert!(r.contains("8,000 kbps"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Non-H.264 codec: must report H.264 required.
+        let over_codec = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::Hevc),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_codec, None);
+        assert!(r.contains("H.264"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Over 60 fps: must report fps limit.
+        let over_fps = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(120.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::H264),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_fps, None);
+        assert!(r.contains("60 fps"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Over 2 s keyframe interval: must report keyframe limit.
+        let over_keyint = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::H264),
+            keyframe_interval_ms: Some(4_000),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_keyint, None);
+        assert!(r.contains("keyframes"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Fits Kick's limits + other platforms live -> "Allow multistreaming".
+        let fits = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::H264),
+            keyframe_interval_ms: Some(2_000),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &fits, Some(true));
+        assert!(r.contains("refused"), "{r}");
+        assert!(d.unwrap().contains("Allow multistreaming"));
+
+        // Fits Kick's limits + NO other platform live -> accurate generic close, not "Allow multistreaming".
+        let (r, d) = failure_text(&kick_dest, &err, true, &fits, Some(false));
+        assert_eq!(r, "Kick closed the stream.");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
     }
 }

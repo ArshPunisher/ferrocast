@@ -134,10 +134,7 @@ impl RemoteConfig {
     /// `origin`: `RELAY_REMOTE_URL` (only its origin counts); `pepper`: any secret bytes.
     pub fn new(origin: Option<&str>, pepper: Option<&[u8]>, dashboard_dir: Option<PathBuf>) -> RemoteConfig {
         RemoteConfig {
-            origin: origin
-                .and_then(|u| reqwest::Url::parse(u).ok())
-                .map(|u| u.origin().ascii_serialization())
-                .filter(|o| o != "null"),
+            origin: origin.and_then(crate::config_origin),
             pepper: pepper.filter(|p| p.len() >= 16).map(|p| hmac(p, b"ferrocast remote pepper v1")),
             dashboard_dir,
             web: None,
@@ -147,8 +144,7 @@ impl RemoteConfig {
 
     /// The website origin and older web hosts (see the fields).
     pub fn with_web(mut self, web: Option<&str>, aliases: &[&str]) -> RemoteConfig {
-        let origin_of =
-            |u: &str| reqwest::Url::parse(u).ok().map(|u| u.origin().ascii_serialization()).filter(|o| o != "null");
+        let origin_of = crate::config_origin;
         self.web = web.and_then(origin_of);
         self.aliases =
             aliases.iter().filter_map(|a| origin_of(a)).filter(|a| Some(a) != self.origin.as_ref()).collect();

@@ -153,7 +153,17 @@ pub async fn download_model(m: &Model, dest: &Path, progress: impl Fn(u8) + Send
         let _ = tokio::fs::remove_file(&part).await;
         return Err(e);
     }
-    tokio::fs::rename(&part, dest).await.map_err(|e| format!("couldn't save the model: {e}"))?;
+    let dest_buf = dest.to_path_buf();
+    let part_buf = part.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = ferrocast_store::durable::rename_patiently(&part_buf, &dest_buf) {
+            let _ = ferrocast_store::durable::remove_patiently(&part_buf);
+            return Err(format!("couldn't save the model: {e}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("couldn't save the model: {e}"))??;
     progress(100);
     Ok(())
 }

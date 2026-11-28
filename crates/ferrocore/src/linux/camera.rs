@@ -40,6 +40,11 @@ pub fn cameras() -> Vec<Device> {
     cameras_in(Path::new("/sys/class/video4linux"))
 }
 
+/// Returns `true` when V4L2 device `id` is currently connected.
+pub fn is_connected(id: &str) -> bool {
+    cameras().into_iter().any(|d| d.id == id)
+}
+
 /// PulseAudio's sources from `pactl list short sources` (index, name, driver…), without the
 /// speakers' monitors (that's what the computer plays, not a microphone).
 pub fn parse_sources(text: &str) -> Vec<Device> {
@@ -56,6 +61,11 @@ pub fn microphones() -> Vec<Device> {
     parse_sources(&super::output_of("pactl", &["list", "short", "sources"]))
 }
 
+/// Monotonic counter bumped when connected devices change (no background monitor on Linux).
+pub fn hotplug_epoch() -> u64 {
+    0
+}
+
 /// A running camera or microphone; dropping it stops.
 #[derive(Debug)]
 pub struct Capture {
@@ -64,6 +74,11 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// What this capture wants said on the dashboard (nothing here).
+    pub fn take_notice(&self) -> Option<crate::notices::Notice> {
+        None
+    }
+
     /// A camera by its device (`/dev/videoN`).
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
         let id = spec.id.as_str();
@@ -117,6 +132,11 @@ impl Capture {
             (None, Some(s)) => s.ended(),
             (None, None) => None,
         }
+    }
+
+    /// V4L2/PulseAudio has no separate suspended-interruption state.
+    pub fn interrupted(&self) -> bool {
+        false
     }
 }
 

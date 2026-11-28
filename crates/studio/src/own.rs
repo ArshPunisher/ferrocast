@@ -24,21 +24,95 @@ use ferrocore::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
 use crate::collection::VERTICAL_SIZE;
 use crate::{EncodeSettings, RecordPlan, RecordStats, StreamSettings, StreamStats, StudioError};
 
+const CAMERA_PICKER_KINDS: [&str; 6] =
+    ["av_capture_input", "av_capture_input_v2", "macos-avcapture", "macos-avcapture-fast", "dshow_input", "v4l2_input"];
+
+fn matching_camera_holds_session_with(
+    stage: &crate::stage::Stage,
+    kind: &str,
+    key: &str,
+    value: &serde_json::Value,
+    holds_session: impl Fn(&str) -> bool,
+) -> bool {
+    if !CAMERA_PICKER_KINDS.contains(&kind) || value.as_str().is_some_and(|s| s.trim().is_empty()) {
+        return false;
+    }
+    for src in stage.sources() {
+        if !CAMERA_PICKER_KINDS.contains(&src.kind.as_str()) {
+            continue;
+        }
+        let Ok(settings) = stage.settings(&src.name) else {
+            continue;
+        };
+        let matched = settings.get(key).is_some_and(|v| v == value)
+            || ["device", "uid", "video_device_id", "device_id"]
+                .iter()
+                .any(|k| settings.get(*k).is_some_and(|v| v == value));
+        if matched && holds_session(&src.name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when any staged camera matching `(kind, key, value)` still owns an open capture session
+/// while waiting or in `no_signal`, so picker stills avoid opening a competing capture session.
+pub fn matching_camera_holds_session(
+    stage: &crate::stage::Stage,
+    kind: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    matching_camera_holds_session_with(stage, kind, key, value, |name| {
+        // Gate on `camera_status` before reading `stage.engine()` so unstarted stages do not
+        // initialize an engine just to answer a picker check.
+        stage.camera_status(name).is_some()
+            && stage.engine().is_ok_and(|shared| shared.engine.is_camera_holding_session(name))
+    })
+}
+
 /// Our encoder's settings for `e` at a picture of this size and rate.
-fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoConfig {
+/// A frame rate as a number (29.97 for 30 with broadcast timing).
+fn fps_f32(fps: u32, ntsc: bool) -> f32 {
+    if ntsc { fps as f32 * 1000.0 / 1001.0 } else { fps as f32 }
+}
+
+fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32, ntsc: bool) -> VideoConfig {
     let codec = if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
     VideoConfig {
         codec,
         input: PixelFormat::Nv12,
         width,
         height,
-        fps_num: fps.max(1),
-        fps_den: 1,
+        // Broadcast timing (29.97): the rate is told as a fraction.
+        fps_num: if ntsc { fps.max(1) * 1000 } else { fps.max(1) },
+        fps_den: if ntsc { 1001 } else { 1 },
         bitrate_kbps: e.video_kbps.max(100),
         rate: rate_of(e),
-        keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
+        keyframe_secs: e.keyframe_s,
         software: is_x264(&e.video_encoder),
+        profile: ferrocore::video::H264Profile::from_name(&e.profile),
+        // Only the Mac's own encoder reorders frames; x264 and FFmpeg's give times back by order.
+        bframes: e.bframes && !is_x264(&e.video_encoder),
+        preset: x264_option(e, "preset", &ferrocore::video::X264_PRESETS),
+        tune: x264_option(e, "tune", &ferrocore::video::X264_TUNES),
     }
+}
+
+/// An x264 preset or tune the settings' encoder options carry (`encode.extra`); only x264 uses it.
+fn x264_option(e: &EncodeSettings, key: &str, list: &[&str]) -> Option<u8> {
+    if !is_x264(&e.video_encoder) {
+        return None;
+    }
+    e.extra.get(key).and_then(|v| v.as_str()).and_then(|n| ferrocore::video::x264_index(list, n))
+}
+
+/// A stream's encoder: platforms ask for a keyframe every 2 s, so "let the encoder pick" (0) is 2.
+fn for_stream(mut v: VideoConfig) -> VideoConfig {
+    if v.keyframe_secs == 0 {
+        v.keyframe_secs = 2;
+    }
+    v
 }
 
 /// x264 (and Lossless) run through FFmpeg, which Ferrocast fetches the first time it's needed.
@@ -94,6 +168,7 @@ fn rate_of(e: &EncodeSettings) -> RateControl {
         Some(q) if is_x264(&e.video_encoder) => RateControl::Crf(q.min(51) as u8),
         Some(q) => RateControl::Quality((100 - q.min(51) * 100 / 51) as f32 / 100.0),
         None if e.vbr => RateControl::Average,
+        None if e.strict_cbr => RateControl::CappedCbr,
         None => RateControl::Cbr,
     }
 }
@@ -131,6 +206,8 @@ struct Counts {
     error: Mutex<Option<String>>,
     /// A new bitrate asked for while live (0: none), for the encoder thread to take.
     new_kbps: AtomicU32,
+    /// What the stream delay holds now, in bytes (0 without a delay).
+    delay_bytes: AtomicU64,
 }
 
 /// Where a stream goes: the server, the key, and how it reconnects.
@@ -154,6 +231,10 @@ pub(crate) struct OwnStream {
     /// Our engine drawing the collection (instead of libobs's frames).
     drawn: Option<Drawn>,
     hub: Option<Arc<Hub>>,
+    /// The delayed tail of the stream, sent after it ended.
+    drain: Arc<DrainGate>,
+    /// Starts a delayed stream on its hub when its first packet is let go.
+    begin: Arc<Begin>,
     /// SRT, RIST and WHIP destinations beside the stream, by id: their stop and health.
     directs:
         std::collections::HashMap<String, (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<Health>)>,
@@ -177,8 +258,10 @@ struct Seen {
     on_air: Option<String>,
     /// What couldn't come over.
     skipped: Vec<String>,
-    /// Sources shown on their own (Source Record): their scenes come back after a reopen.
-    alone: Vec<String>,
+    /// Sources shown on their own (Source Record, projectors, screenshots), reference-counted so
+    /// their hidden scenes survive reopens while any holder is open and are removed when the last
+    /// holder closes.
+    alone: std::collections::HashMap<String, usize>,
     /// Outputs showing the vertical picture: they follow its scene on air.
     vertical: Vec<u64>,
     /// Faded to black (OBS's Fade to Black): black stays on air until it fades back.
@@ -193,15 +276,11 @@ impl Shared {
         // The strong noise removal, when this build has it.
         #[cfg(feature = "deepfilter")]
         crate::denoiser::install();
-        let config = EngineConfig {
-            width: canvas.width,
-            height: canvas.height,
-            fps: canvas.fps.max(1),
-            ..EngineConfig::default()
-        };
+        let config = engine_config(&canvas);
         // Each output brings its own encoding; these only fill the gaps.
-        let video = video_config(&EncodeSettings::with_encoder(""), canvas.width, canvas.height, canvas.fps);
-        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
+        let video =
+            video_config(&EncodeSettings::with_encoder(""), canvas.width, canvas.height, canvas.fps, config.ntsc);
+        let audio = AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: 160 };
         let engine = Engine::new(config, video, audio)
             .map_err(|e| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}")))?;
         let skipped = engine.load_obs(doc);
@@ -217,7 +296,7 @@ impl Shared {
                 opened: std::time::Instant::now(),
                 on_air,
                 skipped,
-                alone: Vec::new(),
+                alone: std::collections::HashMap::new(),
                 vertical: Vec::new(),
                 black: false,
             }),
@@ -228,13 +307,34 @@ impl Shared {
         self.seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Keeps a source shown alone (a projector of it) through reopens.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    /// Keeps a source shown alone (a projector, screenshot, or Source Record) through reopens.
+    /// Pair every call with [`Self::release_alone`]. The scene is made again if the last holder
+    /// took it away between the caller's `show_alone` and now (the count and the scene change
+    /// together, under the lock).
     pub(crate) fn keep_alone(&self, name: &str) {
         let mut seen = self.seen();
-        if !seen.alone.iter().any(|n| n == name) {
-            seen.alone.push(name.to_string());
+        *seen.alone.entry(name.to_string()).or_insert(0) += 1;
+        if let Err(e) = keep_alone_scene(&self.engine, name) {
+            tracing::warn!("Ferrocast's own engine lost the source it shows alone: {e}");
         }
+    }
+
+    /// Releases one holder of `name`'s solo scene; removes the hidden scene once no holders remain.
+    pub(crate) fn release_alone(&self, name: &str) {
+        let mut seen = self.seen();
+        match seen.alone.get_mut(name) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                seen.alone.remove(name);
+                self.engine.remove_scene(&alone_scene(name));
+            }
+            None => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alone_count(&self) -> usize {
+        self.seen().alone.len()
     }
 
     pub(crate) fn skipped(&self) -> Vec<String> {
@@ -275,7 +375,8 @@ impl Shared {
             tracing::warn!("Ferrocast's own engine left this out: {s}");
         }
         seen.skipped = skipped;
-        for name in seen.alone.clone() {
+        let alone_names: Vec<String> = seen.alone.keys().cloned().collect();
+        for name in alone_names {
             if let Err(e) = keep_alone_scene(&self.engine, &name) {
                 tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
             }
@@ -335,7 +436,9 @@ impl Shared {
             if !path.is_empty() {
                 match self.engine.go_stinger(scene, std::path::Path::new(path), cut_ms) {
                     Ok(()) => {
-                        self.seen().on_air = Some(scene.to_string());
+                        let mut seen = self.seen();
+                        seen.on_air = Some(scene.to_string());
+                        seen.black = false;
                         return Ok(());
                     }
                     // A video that's gone or broken mustn't stop the switch: it fades instead.
@@ -345,7 +448,9 @@ impl Shared {
         }
         let (kind, ms) = transition_of(id, ms, settings);
         self.engine.go_with(scene, kind, ms).map_err(fail)?;
-        self.seen().on_air = Some(scene.to_string());
+        let mut seen = self.seen();
+        seen.on_air = Some(scene.to_string());
+        seen.black = false;
         Ok(())
     }
 }
@@ -405,6 +510,8 @@ pub(crate) struct ReplaySaved {
 /// What a drawn output is: where it goes, how it's encoded, and which picture.
 pub(crate) struct Drawing<'a> {
     pub send_to: Option<Send<'a>>,
+    pub hub: Option<Arc<Hub>>,
+    pub fps: Option<u32>,
     pub record: Option<&'a std::path::Path>,
     pub encode: &'a EncodeSettings,
     /// OBS's sound tracks (1 to 6) a recording carries; empty is track 1.
@@ -521,47 +628,369 @@ fn vertical_on_air(doc: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// The audio format, from the settings (set before the engine opens or an output starts): the rate
+/// the engine mixes at (44100 or 48000, from the next start) and the names of the six audio tracks
+/// in a recording's file.
+static AUDIO_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48_000);
+static TRACK_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Broadcast timing (29.97, 59.94, 23.976), from the settings; the engine reads it when it opens.
+static NTSC: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_ntsc(on: bool) {
+    NTSC.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn set_audio_format(rate: u32, names: Vec<String>) {
+    AUDIO_RATE.store(if rate == 44_100 { 44_100 } else { 48_000 }, Ordering::Relaxed);
+    *TRACK_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = names;
+}
+
+/// What the engine runs at for a canvas: its size and rate, and the sound rate set.
+fn engine_config(canvas: &crate::Canvas) -> EngineConfig {
+    EngineConfig {
+        width: canvas.width,
+        height: canvas.height,
+        fps: canvas.fps.max(1),
+        ntsc: NTSC.load(Ordering::Relaxed) && matches!(canvas.fps, 24 | 30 | 60),
+        sample_rate: AUDIO_RATE.load(Ordering::Relaxed),
+        ..EngineConfig::default()
+    }
+}
+
+/// The names of the file's audio tracks, for the tracks (1 to 6) a recording carries.
+fn names_for(tracks: &[u8]) -> Vec<String> {
+    let names = TRACK_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    tracks.iter().map(|t| names.get(usize::from(*t).saturating_sub(1)).cloned().unwrap_or_default()).collect()
+}
+
+/// The most a stream delay holds in memory (OBS has no cap: a long delay through an outage grows
+/// until it runs out). At the cap the oldest seconds go, from a keyframe to the next.
+const DELAY_MAX_MB_DEFAULT: u32 = 256;
+
+/// The cap now, in megabytes (the Studio's setting; set before each stream starts).
+static DELAY_CAP_MB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DELAY_MAX_MB_DEFAULT);
+
+pub(crate) fn set_delay_cap_mb(mb: u32) {
+    DELAY_CAP_MB.store(mb.clamp(16, 4096), Ordering::Relaxed);
+}
+
 /// The stream on its way to Go live's hub, held back `delay` first (OBS's stream delay: what
-/// you do shows that much later, so viewers can't snipe). Ending sends what's still held, so
-/// the last seconds aren't lost.
+/// you do shows that much later, so viewers can't snipe). Ending does not dump what's still held
+/// in one burst (the hub drops what a listener can't take at once): it is sent on at the pace it
+/// would have gone, so the last seconds are not lost, and a new stream (or `discard_delay`) cuts
+/// the rest short.
 struct Delayed {
     hub: Arc<Hub>,
     counts: Arc<Counts>,
     delay: Duration,
     held: std::collections::VecDeque<(std::time::Instant, Tag)>,
+    held_bytes: usize,
+    cap: usize,
+    /// Dropped through the tail without finding a main keyframe: drop inter frames until the next keyframe.
+    need_key: bool,
+    /// Said once: the cap was reached.
+    capped: bool,
+    gate: Arc<DrainGate>,
+    begin: Arc<Begin>,
 }
 
-impl Delayed {
-    fn send(&mut self, t: Tag) {
-        if self.delay.is_zero() {
-            return self.pass(t);
-        }
-        self.held.push_back((std::time::Instant::now(), t));
-        while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
-            if let Some((_, t)) = self.held.pop_front() {
-                self.pass(t);
-            }
+/// What starts a delayed stream on its hub (`Hub::start`, then its metadata) when its first packet is
+/// let go, not when the stream begins: until then nothing is live, so the sender to Go live's local
+/// server, and the platforms behind it, don't connect and sit idle for the whole delay (a server
+/// hangs up on a publisher that sends nothing: mediamtx after 10 s, and the local server after 25;
+/// every destination reconnected over and over, and auto quality saw it as a struggling upload).
+#[derive(Default)]
+struct Begin {
+    start: Mutex<Option<Starter>>,
+    /// Changes to the stream's metadata made (a reshape) before it started: applied once it has.
+    patches: Mutex<Vec<Patch>>,
+    started: AtomicBool,
+}
+
+type Starter = Box<dyn FnOnce(&Hub) + std::marker::Send>;
+type Patch = Box<dyn Fn(&mut ferrocast_golive::hub::StreamMetadata) + std::marker::Send>;
+
+impl std::fmt::Debug for Begin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Begin").field("started", &self.started.load(Ordering::Relaxed)).finish_non_exhaustive()
+    }
+}
+
+impl Begin {
+    fn set(&self, f: impl FnOnce(&Hub) + std::marker::Send + 'static) {
+        *self.start.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(f));
+    }
+
+    /// Changes the metadata platforms are told: now when the stream is live on its hub, else when it
+    /// goes live (the hub's start would erase a change made before it).
+    fn change(&self, hub: &Hub, f: impl Fn(&mut ferrocast_golive::hub::StreamMetadata) + std::marker::Send + 'static) {
+        let mut patches = self.patches.lock().unwrap_or_else(|p| p.into_inner());
+        if self.start.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            patches.push(Box::new(f));
+        } else {
+            drop(patches);
+            hub.metadata_changed(f);
         }
     }
 
-    fn pass(&self, t: Tag) {
-        match t {
-            Tag::Video { ms, body } => {
-                self.counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                self.hub.video(ms, body.into());
+    fn run(&self, hub: &Hub) {
+        // One lock (taken first, as `change` takes it) over taking the start, starting and the
+        // changes queued before: a change made meanwhile waits for all of it. It went to the hub
+        // directly once the start was taken, and the start's own metadata (or an older queued
+        // change) then overwrote it (CodeRabbit).
+        let mut patches = self.patches.lock().unwrap_or_else(|p| p.into_inner());
+        let f = self.start.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(f) = f {
+            f(hub);
+            for p in std::mem::take(&mut *patches) {
+                hub.metadata_changed(p);
             }
-            Tag::Audio { ms, body } => {
-                self.counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                self.hub.audio(ms, body.into());
+            self.started.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// A stream's delayed tail being sent after it ended: lets the stream's owner wait for it, and
+/// whoever starts the next stream (or discards the delay) cut it short.
+#[derive(Debug, Default)]
+struct DrainGate {
+    state: Mutex<DrainState>,
+    cv: std::sync::Condvar,
+    /// When the last held tag is sent, and how many bytes are still to go (for the status).
+    ends_at: Mutex<Option<std::time::Instant>>,
+    left_bytes: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct DrainState {
+    running: bool,
+    cancel: bool,
+}
+
+/// Drains in progress (every stream's tail), so a new stream can end them.
+static DRAINS: Mutex<Vec<std::sync::Weak<DrainGate>>> = Mutex::new(Vec::new());
+
+/// Ends every delayed tail still being sent (a new stream starts, or the streamer chose to stop
+/// at once): what's left of the delay is dropped.
+pub(crate) fn discard_delay() {
+    let mut drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+    drains.retain(|w| w.strong_count() > 0);
+    for g in drains.iter().filter_map(std::sync::Weak::upgrade) {
+        g.cancel();
+    }
+}
+
+/// A delayed tail being sent now: seconds to go and megabytes left (None when there is none).
+pub(crate) fn delay_drain() -> Option<(f64, f64)> {
+    let drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+    drains.iter().filter_map(std::sync::Weak::upgrade).filter(|g| g.is_running()).find_map(|g| {
+        let ends = (*g.ends_at.lock().unwrap_or_else(|p| p.into_inner()))?;
+        let left = ends.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
+        Some((left, g.left_bytes.load(Ordering::Relaxed) as f64 / 1e6))
+    })
+}
+
+impl DrainGate {
+    fn cancel(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).cancel = true;
+        self.cv.notify_all();
+    }
+
+    fn is_running(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).running
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).cancel
+    }
+
+    /// Blocks until the drain is over (sent, or cancelled).
+    fn wait_done(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while st.running {
+            st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Waits until `at`; false when the drain was cancelled meanwhile.
+    fn wait_until(&self, at: std::time::Instant) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if st.cancel {
+                return false;
             }
+            let Some(left) = at.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) else {
+                return true;
+            };
+            st = self.cv.wait_timeout(st, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    fn finish(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).running = false;
+        self.cv.notify_all();
+    }
+}
+
+/// A sequence header: kept whatever else is dropped, or the stream couldn't be decoded.
+fn is_header(t: &Tag) -> bool {
+    match t {
+        Tag::Video { body, .. } => {
+            ferrocast_golive::flv::video_is_header(body)
+                || ferrocast_golive::flv::video_extra_track(body).is_some_and(|(_, header)| header)
+        }
+        Tag::Audio { body, .. } => {
+            ferrocast_golive::flv::audio_is_header(body)
+                || ferrocast_golive::flv::audio_extra_track(body).is_some_and(|(_, header)| header)
+        }
+    }
+}
+
+fn is_keyframe(t: &Tag) -> bool {
+    matches!(
+        t,
+        Tag::Video { body, .. }
+            if !is_header(t)
+                && body.first().is_some_and(|&b| !(b & 0x80 != 0 && b & 0x0f == 6))
+                && ferrocast_golive::flv::video_is_keyframe(body)
+    )
+}
+
+fn tag_len(t: &Tag) -> usize {
+    match t {
+        Tag::Video { body, .. } | Tag::Audio { body, .. } => body.len(),
+    }
+}
+
+impl Delayed {
+    fn new(hub: Arc<Hub>, counts: Arc<Counts>, delay: Duration, gate: Arc<DrainGate>, begin: Arc<Begin>) -> Self {
+        Self {
+            hub,
+            counts,
+            delay,
+            held: std::collections::VecDeque::new(),
+            held_bytes: 0,
+            cap: DELAY_CAP_MB.load(Ordering::Relaxed) as usize * 1024 * 1024,
+            need_key: false,
+            capped: false,
+            gate,
+            begin,
+        }
+    }
+
+    fn send(&mut self, t: Tag) {
+        if self.delay.is_zero() {
+            return pass(&self.hub, &self.counts, &self.begin, t);
+        }
+        if self.need_key && !is_header(&t) {
+            if is_keyframe(&t) {
+                self.need_key = false;
+            } else {
+                return;
+            }
+        }
+        // Notify upstream watchers that a coded IDR left the encoder, even while delay holds packets.
+        if is_keyframe(&t) {
+            self.hub.note_encoded_idr();
+        }
+        self.held_bytes += tag_len(&t);
+        self.held.push_back((std::time::Instant::now(), t));
+        while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
+            if let Some((_, t)) = self.held.pop_front() {
+                self.held_bytes -= tag_len(&t);
+                pass(&self.hub, &self.counts, &self.begin, t);
+            }
+        }
+        self.keep_under_cap();
+        self.counts.delay_bytes.store(self.held_bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Over the cap: the oldest seconds are dropped, up to the next keyframe (never a header).
+    fn keep_under_cap(&mut self) {
+        while self.held_bytes > self.cap {
+            let mut headers = Vec::new();
+            let mut dropped = false;
+            while self.held.front().is_some_and(|(_, t)| !(dropped && is_keyframe(t))) {
+                let Some((at, t)) = self.held.pop_front() else { break };
+                if is_header(&t) {
+                    headers.push((at, t));
+                } else {
+                    self.held_bytes -= tag_len(&t);
+                    dropped = true;
+                }
+            }
+            for h in headers.into_iter().rev() {
+                self.held.push_front(h);
+            }
+            if !dropped {
+                break;
+            }
+            if !self.held.iter().any(|(_, t)| is_keyframe(t)) {
+                self.need_key = true;
+            }
+            if !self.capped {
+                self.capped = true;
+                tracing::warn!(
+                    cap_mb = self.cap / (1024 * 1024),
+                    "the stream delay's memory is full: the oldest seconds are dropped"
+                );
+            }
+        }
+    }
+}
+
+fn pass(hub: &Hub, counts: &Counts, begin: &Begin, t: Tag) {
+    begin.run(hub);
+    match t {
+        Tag::Video { ms, body } => {
+            counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+            hub.video(ms, body.into());
+        }
+        Tag::Audio { ms, body } => {
+            counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+            hub.audio(ms, body.into());
         }
     }
 }
 
 impl Drop for Delayed {
     fn drop(&mut self) {
-        while let Some((_, t)) = self.held.pop_front() {
-            self.pass(t);
+        if self.held.is_empty() || self.gate.is_cancelled() {
+            self.held.clear();
+            self.counts.delay_bytes.store(0, Ordering::Relaxed);
+            return;
+        }
+        // The tail goes on at its own pace (each tag when it is `delay` old), on a thread of its
+        // own; the stream's owner waits for it (`gate`) before it ends the hub.
+        let (hub, counts, delay, gate) = (self.hub.clone(), self.counts.clone(), self.delay, self.gate.clone());
+        let begin = self.begin.clone();
+        let held = std::mem::take(&mut self.held);
+        *gate.ends_at.lock().unwrap_or_else(|p| p.into_inner()) = held.back().map(|(at, _)| *at + delay);
+        gate.left_bytes.store(self.held_bytes as u64, Ordering::Relaxed);
+        self.counts.delay_bytes.store(0, Ordering::Relaxed);
+        gate.state.lock().unwrap_or_else(|p| p.into_inner()).running = true;
+        {
+            let mut drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+            drains.retain(|w| w.strong_count() > 0);
+            drains.push(Arc::downgrade(&gate));
+        }
+        let spawned = std::thread::Builder::new().name("ferrocast-delay-drain".into()).spawn({
+            let gate = gate.clone();
+            move || {
+                for (at, t) in held {
+                    if !gate.wait_until(at + delay) {
+                        break;
+                    }
+                    let n = tag_len(&t) as u64;
+                    pass(&hub, &counts, &begin, t);
+                    // (This thread is the only writer.)
+                    gate.left_bytes.store(gate.left_bytes.load(Ordering::Relaxed).saturating_sub(n), Ordering::Relaxed);
+                }
+                gate.finish();
+            }
+        });
+        if spawned.is_err() {
+            gate.finish();
         }
     }
 }
@@ -660,8 +1089,20 @@ impl OwnStream {
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
     pub(crate) fn drawn(shared: Arc<Shared>, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
-        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay, solo, video_tracks } = how;
-        let streaming = send_to.is_some();
+        let Drawing {
+            send_to,
+            hub: injected_hub,
+            fps: target_fps,
+            record,
+            encode: e,
+            tracks,
+            delay_s,
+            vertical,
+            replay,
+            solo,
+            video_tracks,
+        } = how;
+        let streaming = send_to.is_some() || injected_hub.is_some();
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -669,46 +1110,85 @@ impl OwnStream {
         };
         let engine = &shared.engine;
         let config = engine.config();
-        let video = video_config(e, config.width, config.height, config.fps);
-        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
-        let hub = Hub::new();
-        let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
+        let every = target_fps.filter(|&f| streaming && f > 0 && f < config.fps).map_or(1, |f| (config.fps / f).max(1));
+        let eff_fps = (config.fps / every).max(1);
+        let video = video_config(e, config.width, config.height, eff_fps, config.ntsc);
+        let video = if streaming { for_stream(video) } else { video };
+        let audio =
+            AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let is_injected = injected_hub.is_some();
+        let (hub, runtime, health, stop_push) = match injected_hub {
+            Some(h) => (h, None, None, None),
+            None => {
+                let h = Hub::new();
+                let (rt, hp, sp) = sender(send_to, target, &h).map_err(fail)?;
+                (h, rt, hp, sp)
+            }
+        };
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
-        hub.start();
+        let drain = Arc::new(DrainGate::default());
+        let begin = Arc::new(Begin::default());
+        // A delayed stream is live on its hub only once its first packet is let go.
+        struct HubGuard(Option<Arc<Hub>>);
+        impl Drop for HubGuard {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.end();
+                }
+            }
+        }
+        let deferred = streaming && delay_s > 0;
+        let mut hub_guard = if streaming && !deferred {
+            hub.start();
+            HubGuard(Some(hub.clone()))
+        } else {
+            HubGuard(None)
+        };
         let kind = match (record, replay) {
             (_, Some((seconds, mb))) => OutputKind::Replay { seconds, mb },
             (Some(p), None) => OutputKind::Record(p.to_path_buf()),
             (None, None) => {
-                let mut out = Delayed {
-                    hub: hub.clone(),
-                    counts: counts.clone(),
-                    delay: Duration::from_secs(u64::from(delay_s)),
-                    held: std::collections::VecDeque::new(),
-                };
+                let mut out = Delayed::new(
+                    hub.clone(),
+                    counts.clone(),
+                    Duration::from_secs(u64::from(delay_s)),
+                    drain.clone(),
+                    begin.clone(),
+                );
                 OutputKind::Stream(Box::new(move |t: Tag| out.send(t)))
             }
         };
         // OBS's output resolution: the whole canvas, scaled (sides kept even for the encoder).
+        let filter = ferrocore::Filter::downscale_named(&e.scale_filter).unwrap_or(ferrocore::Filter::Bicubic);
         let mut out = match (vertical, e.scale) {
-            // The vertical picture: its own size and its own scene on air.
+            // The vertical picture: its own size and scene on air, optionally downscaled for an encode group.
+            (true, Some((w, h))) if (w.max(2) & !1, h.max(2) & !1) != VERTICAL_SIZE => {
+                let sw = w.max(2) & !1;
+                let sh = h.max(2) & !1;
+                AvCanvas {
+                    width: sw,
+                    height: sh,
+                    scene: vertical_on_air(doc),
+                    scaled_from: Some((VERTICAL_SIZE.0, VERTICAL_SIZE.1, filter)),
+                    ..AvCanvas::main(config)
+                }
+            }
             (true, _) => AvCanvas {
                 width: VERTICAL_SIZE.0,
                 height: VERTICAL_SIZE.1,
                 scene: vertical_on_air(doc),
                 ..AvCanvas::main(config)
             },
-            (false, Some((w, h))) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
+            (false, Some((w, h))) => AvCanvas::scaled_with(config, w.max(2) & !1, h.max(2) & !1, filter),
             (false, None) => AvCanvas::main(config),
         };
+        out.every = every;
         if let Some(name) = solo {
             let (scene, w, h) = show_alone(engine, name, (config.width, config.height))?;
             // The encoders' NV12 wants even sides: an odd last row or column is left out,
             // the picture never scaled for it.
             (out.scene, out.width, out.height, out.scaled_from) = (Some(scene), w.max(2) & !1, h.max(2) & !1, None);
-            let mut seen = shared.seen();
-            if !seen.alone.iter().any(|n| n == name) {
-                seen.alone.push(name.to_string());
-            }
+            shared.keep_alone(name);
         }
         // OBS's tracks (1 to 6): the first is the file's first sound track, the rest follow.
         let mut picked = tracks.iter().filter(|t| (1..=6).contains(*t)).map(|t| usize::from(*t) - 1);
@@ -716,18 +1196,46 @@ impl OwnStream {
             out.track = first;
             out.more_tracks = picked.collect();
         }
+        // The names the streamer gave the tracks go into a recording's file.
+        if record.is_some() {
+            let carried: Vec<u8> = tracks.iter().copied().filter(|t| (1..=6).contains(t)).collect();
+            out.track_names = names_for(&carried);
+        }
         if streaming && !vertical && solo.is_none() {
             out.video_tracks = video_tracks.to_vec();
         }
         if streaming {
-            hub.metadata(metadata_of(&video, &audio, out.width, out.height, config.fps));
+            let meta = metadata_of(&video, &audio, out.width, out.height, fps_f32(eff_fps, config.ntsc));
+            if deferred {
+                begin.set(move |hub| {
+                    hub.start();
+                    hub.metadata(meta);
+                });
+            } else {
+                hub.metadata(meta);
+            }
         }
-        let output = engine.start_output_with(kind, out, video, audio).map_err(|e| fail(e.to_string()))?;
+        let replaces_tail = !is_injected && record.is_none() && replay.is_none();
+        let output = match engine.start_output_with(kind, out, video, audio) {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(name) = solo {
+                    shared.release_alone(name);
+                }
+                return Err(fail(e.to_string()));
+            }
+        };
+        // A new stream ends the tail of the last one, once it has started: one that fails to
+        // start (here or before) leaves the last stream's last seconds going (CodeRabbit).
+        if replaces_tail {
+            discard_delay();
+        }
         if vertical {
             shared.seen().vertical.push(output);
         }
         let begun = engine.stats();
         let from = (begun.frames, begun.skipped);
+        hub_guard.0 = None;
         tracing::info!(codec = ?video.codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         Ok(Self {
             stop: Arc::new(AtomicBool::new(false)),
@@ -751,6 +1259,8 @@ impl OwnStream {
                 from,
             }),
             hub: Some(hub),
+            drain,
+            begin,
             directs: Default::default(),
         })
     }
@@ -758,6 +1268,12 @@ impl OwnStream {
     /// A recording "Same as stream" joining this running stream's encode, into `path` (one
     /// encode for both: the Mac's one video encoder can't do two at 4K60). Its stats count from
     /// now; when either ends the other goes on.
+    /// A stream and a recording are on this output together (Same as stream): one encode, so one
+    /// picture for both.
+    pub(crate) fn shares_encoder(&self) -> bool {
+        self.drawn.as_ref().is_some_and(|d| Arc::strong_count(&d.lease) > 1)
+    }
+
     /// Whether this output runs on engine `e` (each collection has its own).
     pub(crate) fn runs_on(&self, e: &Arc<Shared>) -> bool {
         self.drawn.as_ref().is_some_and(|d| Arc::ptr_eq(&d.shared, e))
@@ -787,6 +1303,8 @@ impl OwnStream {
                 from: (begun.frames, begun.skipped),
             }),
             hub: None,
+            drain: Arc::new(DrainGate::default()),
+            begin: Arc::new(Begin::default()),
             directs: Default::default(),
         })
     }
@@ -799,29 +1317,77 @@ impl OwnStream {
         e: &EncodeSettings,
         delay_s: u32,
     ) -> Result<Self, StudioError> {
+        self.stream_joining_target(Some(send_to), None, e, delay_s)
+    }
+
+    pub(crate) fn stream_joining_to_hub(
+        &self,
+        hub: Arc<Hub>,
+        e: &EncodeSettings,
+        delay_s: u32,
+    ) -> Result<Self, StudioError> {
+        self.stream_joining_target(None, Some(hub), e, delay_s)
+    }
+
+    fn stream_joining_target(
+        &self,
+        send_to: Option<Send<'_>>,
+        injected_hub: Option<Arc<Hub>>,
+        e: &EncodeSettings,
+        delay_s: u32,
+    ) -> Result<Self, StudioError> {
         let d = self.drawn.as_ref().filter(|d| d.role == Role::Record).ok_or_else(|| {
             StudioError::Failed("Only a running recording's encoder can be shared with a stream.".into())
         })?;
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
-        let target = Target::parse(send_to.server).map_err(|e| fail(e.to_string()))?;
-        let config = d.shared.engine.config();
-        let video = video_config(e, config.width, config.height, config.fps);
-        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
-        let hub = Hub::new();
-        let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
-        let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
-        hub.start();
-        hub.metadata(metadata_of(&video, &audio, config.width, config.height, config.fps));
-        let mut out = Delayed {
-            hub: hub.clone(),
-            counts: counts.clone(),
-            delay: Duration::from_secs(u64::from(delay_s)),
-            held: std::collections::VecDeque::new(),
+        let target = match &send_to {
+            Some(s) => Some(Target::parse(s.server).map_err(|err| fail(err.to_string()))?),
+            None => None,
         };
+        let config = d.shared.engine.config();
+        let video = for_stream(video_config(e, config.width, config.height, config.fps, config.ntsc));
+        let audio =
+            AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let is_injected = injected_hub.is_some();
+        let (hub, runtime, health, stop_push) = match injected_hub {
+            Some(h) => (h, None, None, None),
+            None => {
+                let h = Hub::new();
+                let (rt, hp, sp) = sender(send_to, target, &h).map_err(fail)?;
+                (h, rt, hp, sp)
+            }
+        };
+        let drain = Arc::new(DrainGate::default());
+        let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
+        let meta = metadata_of(&video, &audio, config.width, config.height, fps_f32(config.fps, config.ntsc));
+        let begin = Arc::new(Begin::default());
+        if delay_s > 0 {
+            // Live on its hub once the first packet is let go (see `Begin`).
+            begin.set(move |hub| {
+                hub.start();
+                hub.metadata(meta);
+            });
+        } else {
+            hub.start();
+            hub.metadata(meta);
+        }
+        let mut out = Delayed::new(
+            hub.clone(),
+            counts.clone(),
+            Duration::from_secs(u64::from(delay_s)),
+            drain.clone(),
+            begin.clone(),
+        );
         if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
             // The push started above ends with it (projects-60).
-            hub.end();
+            if delay_s == 0 {
+                hub.end();
+            }
             return Err(fail(err.to_string()));
+        }
+        // The last stream's tail ends once this one has started (not when it fails to).
+        if !is_injected {
+            discard_delay();
         }
         // The shared encode takes the stream's bitrate (what "Same as stream" means): the
         // recording's file follows it from here.
@@ -847,6 +1413,8 @@ impl OwnStream {
                 from: (begun.frames, begun.skipped),
             }),
             hub: Some(hub),
+            drain,
+            begin,
             directs: Default::default(),
         })
     }
@@ -871,19 +1439,20 @@ impl OwnStream {
             return Err(fail("While live, the frame rate can only go to a whole part of the canvas's (60 → 30)."));
         }
         let (w, h) = e.scale.map_or((config.width, config.height), |(w, h)| (w.max(2) & !1, h.max(2) & !1));
-        let video = video_config(e, w, h, fps);
+        let video = for_stream(video_config(e, w, h, fps, config.ntsc));
         d.shared
             .engine
             .reshape_output(d.output, w, h, config.fps / fps, video)
             .map_err(|e| StudioError::Failed(format!("The stream couldn't change while live: {e}")))?;
         // A platform that reconnects from now on is told the new picture, not the old one.
         if let Some(hub) = &self.hub {
-            hub.metadata_changed(|m| {
+            let (rate, kbps, codec) = (fps_f32(fps, config.ntsc), video.bitrate_kbps, video.codec);
+            self.begin.change(hub, move |m| {
                 m.video_width = Some(w);
                 m.video_height = Some(h);
-                m.video_frame_rate = Some(fps as f32);
-                m.video_bitrate_kbps = Some(video.bitrate_kbps);
-                m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
+                m.video_frame_rate = Some(rate);
+                m.video_bitrate_kbps = Some(kbps);
+                m.video_codec_id = Some(if codec == VideoCodec::Hevc { 12 } else { 7 });
             });
         }
         Ok(())
@@ -899,6 +1468,11 @@ impl OwnStream {
             }
             None => self.counts.new_kbps.store(kbps, Ordering::Release),
         }
+    }
+
+    /// Aborts any buffered stream-delay tail immediately rather than draining on drop.
+    pub(crate) fn abort_without_drain(&self) {
+        self.drain.cancel();
     }
 
     /// Keeps a recording's plan: what the next file is called, and when it splits on its own.
@@ -968,8 +1542,14 @@ impl OwnStream {
         let Some(d) = &self.drawn else { return false };
         let Some((plan, since)) = &d.plan else { return false };
         let Ok(state) = d.shared.engine.output_record_state(d.output) else { return false };
-        if state.splitting {
+        // A recording that stopped has nothing to split (and no new file to try for, ten times a
+        // second: M7-01).
+        if state.splitting || state.failed.is_some() {
             return false;
+        }
+        // The video encoder was rebuilt with other parameter sets: a new file now (its frames wait).
+        if state.split_wanted {
+            return true;
         }
         let bytes = state.bytes;
         (plan.split_minutes > 0 && since.elapsed() >= Duration::from_secs(u64::from(plan.split_minutes) * 60))
@@ -981,32 +1561,59 @@ impl OwnStream {
         self.drawn.as_ref().map(|d| d.shared.skipped()).unwrap_or_default()
     }
 
+    /// Why this recording stopped by itself (a full disk, a drive taken away), if it did. Only
+    /// for a recording's own handle: the stream that shares its output goes on.
+    pub(crate) fn record_problem(&self) -> Option<ferrocore::pipeline::RecordProblem> {
+        let d = self.drawn.as_ref()?;
+        d.plan.as_ref()?;
+        d.shared.engine.output_record_state(d.output).ok()?.failed
+    }
+
     pub(crate) fn stats(&self) -> StreamStats {
         let state = self.health.as_ref().map(|h| h.borrow().state.clone());
         // Dropped, as OBS means it: what the network side couldn't send. Frames drawn late are
         // the engine's own count (its `lagged`); counted here too, they read as "your upload
         // can't keep up" and auto quality lowered the bitrate for them (owner, 15 Nov).
         let sent_dropped = self.health.as_ref().map_or(0, |h| h.borrow().dropped);
+        let (failed, attempts, reason, detail, refused) = match &state {
+            Some(PushState::Failed { attempts, reason, detail, refused }) => {
+                (true, *attempts, Some(reason.clone()), detail.clone(), *refused)
+            }
+            _ => (false, 0, None, None, false),
+        };
+        let stopped_or_failed = matches!(state, Some(PushState::Failed { .. } | PushState::Stopped));
         if let Some(d) = &self.drawn {
             let s = d.shared.engine.stats();
             return StreamStats {
-                active: d.shared.engine.error().is_none(),
+                active: d.shared.engine.output_error(d.output).is_none()
+                    && self.record_problem().is_none()
+                    && !stopped_or_failed,
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
                 dropped: sent_dropped.min(u64::from(u32::MAX)) as u32,
                 link: None,
-                reason: None,
+                reason,
+                failed,
+                attempts,
+                detail,
+                refused,
+                delay_mb: self.counts.delay_bytes.load(Ordering::Relaxed) as f32 / 1e6,
             };
         }
         StreamStats {
-            active: self.counts.running.load(Ordering::Acquire),
+            active: self.counts.running.load(Ordering::Acquire) && !stopped_or_failed,
             reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
             bytes: self.counts.bytes.load(Ordering::Relaxed),
             frames: self.counts.frames.load(Ordering::Relaxed),
             dropped: 0,
             link: None,
-            reason: None,
+            reason,
+            failed,
+            attempts,
+            detail,
+            refused,
+            delay_mb: 0.0,
         }
     }
 
@@ -1027,12 +1634,16 @@ impl OwnStream {
         use ferrocast_golive::direct::{Direct, Kind};
         let kind = Kind::of(url)
             .ok_or_else(|| StudioError::Failed("url: an srt://, rist:// or https:// (WHIP) address.".into()))?;
-        if self.runtime.is_none() || self.hub.is_none() {
+        if self.hub.is_none() {
             return Err(StudioError::Failed(
                 "SRT, RIST and WebRTC go out with a stream: start streaming first.".into(),
             ));
         }
         self.remove_direct(id);
+        if self.runtime.is_none() {
+            self.runtime =
+                Some(push::sender_runtime("ferrocast-direct").map_err(|e| StudioError::Failed(e.to_string()))?);
+        }
         let (Some(rt), Some(hub)) = (self.runtime.as_ref(), self.hub.as_ref()) else { return Ok(()) };
         let d = Direct {
             id: id.to_string(),
@@ -1064,10 +1675,17 @@ impl OwnStream {
         }
     }
 
-    /// A direct destination's stats: live or trying again, and what it lost.
+    /// A direct destination's stats: live, trying again, or failed, and what it lost.
     pub(crate) fn direct_stats(&self, id: &str) -> Option<StreamStats> {
         let (_, h) = self.directs.get(id)?;
         let h = h.borrow();
+        let (failed, attempts, reason, detail, refused) = match &h.state {
+            PushState::Reconnecting { reason, .. } => (false, 0, Some(reason.clone()), None, false),
+            PushState::Failed { attempts, reason, detail, refused } => {
+                (true, *attempts, Some(reason.clone()), detail.clone(), *refused)
+            }
+            _ => (false, 0, None, None, false),
+        };
         Some(StreamStats {
             active: h.state == PushState::Live,
             reconnecting: matches!(h.state, PushState::Reconnecting { .. } | PushState::Connecting),
@@ -1075,21 +1693,25 @@ impl OwnStream {
             frames: 0,
             dropped: h.dropped.min(u64::from(u32::MAX)) as u32,
             link: h.link,
-            reason: match &h.state {
-                PushState::Reconnecting { reason, .. } => Some(reason.clone()),
-                _ => None,
-            },
+            reason,
+            failed,
+            attempts,
+            detail,
+            refused,
+            delay_mb: 0.0,
         })
     }
 
     pub(crate) fn record_stats(&self) -> RecordStats {
         let s = self.stats();
         let state = self.drawn.as_ref().and_then(|d| d.shared.engine.output_record_state(d.output).ok());
-        let paused = state.is_some_and(|r| r.paused);
+        let paused = state.as_ref().is_some_and(|r| r.paused);
         // A recording our engine writes counts its bytes in the file itself (nothing is sent):
         // the Stats panel's recording size and rate were always 0 before.
-        let bytes = state.map_or(s.bytes, |r| r.bytes.max(s.bytes));
-        RecordStats { active: s.active, paused, bytes, frames: s.frames }
+        let bytes = state.as_ref().map_or(s.bytes, |r| r.bytes.max(s.bytes));
+        let auto_splits = state.as_ref().map_or(0, |r| r.auto_splits);
+        let error = state.and_then(|r| r.failed).filter(|_| self.plan().is_some()).map(|p| p.reason);
+        RecordStats { active: s.active, paused, bytes, frames: s.frames, error, auto_splits }
     }
 
     /// Which encoder our engine's output uses ("h264_nvenc"…), while it runs.
@@ -1097,16 +1719,49 @@ impl OwnStream {
         self.drawn.as_ref().and_then(|d| d.shared.engine.output_encoder(d.output))
     }
 
+    /// Approximate per-frame encode time in milliseconds for this output's encoder, while it runs.
+    pub(crate) fn encode_ms(&self) -> Option<f64> {
+        self.drawn.as_ref().and_then(|d| d.shared.engine.output_encode_ms(d.output)).map(f64::from)
+    }
+
+    /// Engine-skipped frames observed since this output started.
+    pub(crate) fn engine_skipped(&self) -> u64 {
+        self.drawn.as_ref().map(|d| d.shared.engine.stats().skipped.saturating_sub(d.from.1)).unwrap_or(0)
+    }
+
     pub(crate) fn last_error(&self) -> Option<String> {
-        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.error()) {
+        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.output_error(d.output)) {
             return Some(e);
         }
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {
             return Some(e);
         }
+        // Only terminal failure surfaces as `error`; transient `Reconnecting` is already shown
+        // via `reconnecting: true` and must not make vertical/light sync kill secondary streams.
         match self.health.as_ref().map(|h| h.borrow().state.clone()) {
-            Some(PushState::Reconnecting { reason, .. }) => Some(reason),
+            Some(PushState::Failed { reason, .. }) => Some(reason),
             _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn test_failed(error: &str) -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            thread: None,
+            counts: Arc::new(Counts {
+                running: AtomicBool::new(false),
+                error: Mutex::new(Some(error.to_string())),
+                ..Default::default()
+            }),
+            health: None,
+            stop_push: None,
+            runtime: None,
+            drawn: None,
+            hub: None,
+            drain: Arc::new(DrainGate::default()),
+            begin: Arc::new(Begin::default()),
+            directs: std::collections::HashMap::new(),
         }
     }
 }
@@ -1119,14 +1774,14 @@ fn metadata_of(
     audio: &AudioConfig,
     width: u32,
     height: u32,
-    fps: u32,
+    fps: f32,
 ) -> ferrocast_golive::hub::StreamMetadata {
     let mut m = ferrocast_golive::hub::StreamMetadata::new();
     m.video_width = Some(width);
     m.video_height = Some(height);
     // FLV's codec ids: 7 is H.264 (AVC); HEVC goes as 12, the id OBS and FFmpeg use.
     m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
-    m.video_frame_rate = Some(fps as f32);
+    m.video_frame_rate = Some(fps);
     m.video_bitrate_kbps = Some(video.bitrate_kbps);
     // 10 is AAC.
     m.audio_codec_id = Some(10);
@@ -1147,15 +1802,15 @@ type Sender = (
 
 fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> Result<Sender, String> {
     let (Some(d), Some(target)) = (send_to, target) else { return Ok((None, None, None)) };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .thread_name("ferrocast-own-stream")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let rt = push::sender_runtime("ferrocast-own-stream").map_err(|e| e.to_string())?;
     let retry = match d.reconnect {
-        Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
-        None => Retry::default(),
+        Some((retries, every)) => Retry {
+            first: Duration::from_secs(u64::from(every.max(1))),
+            max_attempts: retries.max(1),
+            ..Retry::default()
+        },
+        // Reconnecting turned off: the first failure is final.
+        None => Retry::never(),
     };
     // Every track goes on (Go live then gives Twitch's VOD track and Enhanced Broadcasting's
     // other qualities to Twitch only); a stream without one has none to send.
@@ -1166,6 +1821,7 @@ fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> 
         retry,
         extra_audio: true,
         extra_video: true,
+        backup: None,
     };
     let (health_tx, h) = tokio::sync::watch::channel(Health {
         state: PushState::Waiting,
@@ -1200,13 +1856,38 @@ impl Drop for OwnStream {
                     tracing::warn!(role = ?d.role, "a shared output's part didn't end cleanly: {e}");
                 }
             }
-            // A source no longer recorded alone needn't come back after a reopen.
-            if let Some(name) = &d.solo {
-                d.shared.seen().alone.retain(|n| n != name);
-            }
+            // A source no longer recorded alone needn't come back after a reopen; release after
+            // `drop(d)` stops the output so the hidden scene is never removed while still rendered.
+            let solo_release = d.solo.as_ref().map(|name| (d.shared.clone(), name.clone()));
             // The last holder's lease stops the output first, so its last tags reach the hub
             // before it ends.
             drop(d);
+            if let Some((shared, name)) = solo_release {
+                shared.release_alone(&name);
+            }
+            // The stream's delayed tail is still being sent: the hub ends, the sender stops, after
+            // it, on a thread of its own so stopping doesn't wait out the delay.
+            if self.drain.is_running() {
+                let (gate, hub) = (self.drain.clone(), self.hub.take());
+                let (stop_push, runtime) = (self.stop_push.take(), self.runtime.take());
+                let finish = move || {
+                    gate.wait_done();
+                    if let Some(hub) = hub {
+                        hub.end();
+                    }
+                    if let Some(sp) = stop_push {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let _ = sp.send(true);
+                    }
+                    if let Some(rt) = runtime {
+                        rt.shutdown_timeout(Duration::from_secs(5));
+                    }
+                };
+                if let Err(e) = std::thread::Builder::new().name("ferrocast-delay-end".into()).spawn(finish) {
+                    tracing::warn!(error = %e, "the delayed stream's end couldn't be waited for");
+                }
+                return;
+            }
             if let Some(hub) = self.hub.take() {
                 hub.end();
             }
@@ -1238,19 +1919,60 @@ mod tests {
         }
     }
 
+    /// The picked profile and keyframe interval reach the encoder config (the profile was
+    /// dropped and 0 was forced to 2 everywhere).
+    #[test]
+    fn the_profile_and_keyframe_choices_reach_the_encoder_config() {
+        let mut e = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        e.profile = "main".into();
+        e.keyframe_s = 0;
+        let v = video_config(&e, 1920, 1080, 60, false);
+        assert_eq!(v.profile, ferrocore::video::H264Profile::Main);
+        assert_eq!((v.keyframe_secs, v.gop_secs()), (0, 10), "a recording lets the encoder pick");
+        assert_eq!(for_stream(v).keyframe_secs, 2, "a stream is held to 2 s");
+        e.keyframe_s = 4;
+        assert_eq!(for_stream(video_config(&e, 1920, 1080, 60, false)).keyframe_secs, 4);
+    }
+
+    /// A picked x264 preset and tune (the recording's "Your own" options) reach the encoder
+    /// config; another encoder ignores them and an unknown name is dropped.
+    #[test]
+    fn a_picked_encoder_option_reaches_the_recording_encoder() {
+        let mut e = EncodeSettings::with_encoder("obs_x264");
+        e.extra.insert("preset".into(), "SLOW".into());
+        e.extra.insert("tune".into(), "film".into());
+        let v = video_config(&e, 1280, 720, 30, false);
+        let at = |l: &[&str], n: &str| ferrocore::video::x264_index(l, n);
+        assert_eq!(
+            (v.preset, v.tune),
+            (at(&ferrocore::video::X264_PRESETS, "slow"), at(&ferrocore::video::X264_TUNES, "film"))
+        );
+        assert!(v.preset.is_some() && v.tune.is_some());
+        e.extra.insert("preset".into(), "ludicrous".into());
+        assert_eq!(video_config(&e, 1280, 720, 30, false).preset, None);
+        let mut vt = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        vt.extra.insert("preset".into(), "slow".into());
+        assert_eq!(video_config(&vt, 1280, 720, 30, false).preset, None);
+        assert_eq!(ferrocast_studio_options_len("obs_x264"), 2);
+    }
+
+    fn ferrocast_studio_options_len(id: &str) -> usize {
+        crate::kinds::own_encoder_options(id).len()
+    }
+
     #[test]
     fn the_stream_says_what_it_is_like_obs() {
         let e = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
-        let video = video_config(&e, 1920, 1080, 60);
+        let video = video_config(&e, 1920, 1080, 60, false);
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
-        let m = metadata_of(&video, &audio, 1920, 1080, 60);
+        let m = metadata_of(&video, &audio, 1920, 1080, 60.0);
         assert_eq!((m.video_width, m.video_height, m.video_frame_rate), (Some(1920), Some(1080), Some(60.0)));
         assert_eq!((m.video_codec_id, m.audio_codec_id), (Some(7), Some(10)), "H.264 and AAC");
         assert_eq!((m.audio_sample_rate, m.audio_channels, m.audio_is_stereo), (Some(48_000), Some(2), Some(true)));
         assert_eq!(m.video_bitrate_kbps, Some(video.bitrate_kbps));
         assert!(m.encoder.unwrap().starts_with("Ferrocast "));
-        let hevc = video_config(&EncodeSettings::with_encoder("hevc"), 1920, 1080, 60);
-        assert_eq!(metadata_of(&hevc, &audio, 1920, 1080, 60).video_codec_id, Some(12));
+        let hevc = video_config(&EncodeSettings::with_encoder("hevc"), 1920, 1080, 60, false);
+        assert_eq!(metadata_of(&hevc, &audio, 1920, 1080, 60.0).video_codec_id, Some(12));
     }
 
     #[test]
@@ -1289,23 +2011,284 @@ mod tests {
         assert_eq!(without_on_air(&a), without_on_air(&b));
     }
 
-    #[test]
-    fn a_delayed_stream_holds_back_then_sends_the_rest_at_the_end() {
+    fn delayed(delay_ms: u64) -> (Delayed, Arc<Counts>) {
         let counts = Arc::new(Counts::default());
-        let mut out = Delayed {
-            hub: Hub::new(),
-            counts: counts.clone(),
-            delay: Duration::from_millis(200),
-            held: std::collections::VecDeque::new(),
-        };
+        let out = Delayed::new(
+            Hub::new(),
+            counts.clone(),
+            Duration::from_millis(delay_ms),
+            Arc::new(DrainGate::default()),
+            Arc::new(Begin::default()),
+        );
+        (out, counts)
+    }
+
+    fn video(ms: u32, key: bool, len: usize) -> Tag {
+        let mut body = vec![0u8; len];
+        body[0] = if key { 0x17 } else { 0x27 };
+        body[1] = 1;
+        Tag::Video { ms, body }
+    }
+
+    /// Each packet goes when it is the delay old, never sooner: while the stream runs, and after it
+    /// ends (no burst of what was held). Checked as "not before" from when each was sent, so a
+    /// slow computer (a CI runner oversleeping) can't fail it: one that slept past 300 ms let the
+    /// first go before the end, as it should, and the old "nothing sent at the end" check failed.
+    #[test]
+    fn a_delayed_stream_holds_back_then_sends_the_rest_after_it_ends_at_its_own_pace() {
+        let delay = Duration::from_millis(300);
+        let (mut out, counts) = delayed(300);
+        let gate = out.gate.clone();
         let sent = || counts.bytes.load(Ordering::Relaxed);
-        out.send(Tag::Video { ms: 0, body: vec![0; 10] });
-        assert_eq!(sent(), 0, "held back");
-        std::thread::sleep(Duration::from_millis(250));
-        out.send(Tag::Audio { ms: 250, body: vec![0; 5] });
-        assert_eq!(sent(), 10, "the first goes once it's 200 ms old; the second waits");
+        let t0 = std::time::Instant::now();
+        out.send(video(0, true, 10));
+        assert!(sent() == 0 || t0.elapsed() >= delay, "held back");
+        std::thread::sleep(Duration::from_millis(100));
+        let t1 = std::time::Instant::now();
+        out.send(video(100, false, 5));
+        std::thread::sleep(Duration::from_millis(100));
+        let t2 = std::time::Instant::now();
+        out.send(video(200, false, 7));
+        // Ending: no burst. Each goes when it is 300 ms old, as it would have.
         drop(out);
-        assert_eq!(sent(), 15, "ending sends what's left");
+        // (Unless this thread was held up past the last one's time: then it has gone.)
+        assert!(gate.is_running() || t2.elapsed() >= delay, "the last is still held");
+        // When each amount was first seen sent (stamped after it was read, so never before it went).
+        let mut seen: Vec<(u64, std::time::Instant)> = Vec::new();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while gate.is_running() && std::time::Instant::now() < end {
+            let n = sent();
+            if seen.last().is_none_or(|(m, _)| *m != n) {
+                seen.push((n, std::time::Instant::now()));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        gate.wait_done();
+        seen.push((sent(), std::time::Instant::now()));
+        // Every amount was seen at some point (the last one at least after the end), and never
+        // sooner than the delay after its packet was sent.
+        let not_before = |bytes: u64, at: std::time::Instant| {
+            seen.iter().any(|(n, _)| *n >= bytes)
+                && seen.iter().filter(|(n, _)| *n >= bytes).all(|(_, when)| *when >= at + delay)
+        };
+        assert!(not_before(10, t0), "the first not before it is 300 ms old: {seen:?}");
+        assert!(not_before(15, t1), "the second not before it is: {seen:?}");
+        assert!(not_before(22, t2), "the last not before it is: {seen:?}");
+        assert!(t0.elapsed() >= delay + Duration::from_millis(200), "the end waited for the last");
+        assert_eq!(sent(), 22, "all of it, after the delay");
+    }
+
+    /// A delayed stream is not live on its hub (so nothing connects to a platform, and nothing idles
+    /// there) until its first packet is let go: it began live at once, the platforms' connections sat
+    /// silent for the whole delay and servers hung up on them.
+    #[test]
+    fn a_delayed_stream_goes_live_on_its_hub_when_its_first_packet_is_let_go() {
+        let (mut out, _) = delayed(300);
+        let hub = out.hub.clone();
+        out.begin.set(|hub| {
+            hub.start();
+            hub.metadata(ferrocast_golive::hub::StreamMetadata::new());
+        });
+        // A reshape while everything is held isn't lost when the hub starts.
+        out.begin.change(&hub, |m| m.video_width = Some(1280));
+        out.send(video(0, true, 10));
+        assert!(!hub.live().borrow().on, "nothing is live while everything is held");
+        std::thread::sleep(Duration::from_millis(350));
+        out.send(video(350, false, 10));
+        assert!(hub.live().borrow().on, "live when the first is let go");
+        assert_eq!(hub.subscribe().headers.metadata.and_then(|m| m.video_width), Some(1280), "the reshape was kept");
+        // Stopped while still holding: the tail goes out as a stream of its own, started by its first.
+        let (mut out, _) = delayed(200);
+        let (hub, gate) = (out.hub.clone(), out.gate.clone());
+        out.begin.set(|hub| hub.start());
+        out.send(video(0, true, 10));
+        drop(out);
+        assert!(!hub.live().borrow().on);
+        gate.wait_done();
+        assert!(hub.live().borrow().on, "the tail started it");
+    }
+
+    /// A reshape made while the hub is being started (its start taken, its metadata not set yet)
+    /// waits for it and lands after it: it went to the hub directly and the start's own metadata
+    /// then overwrote it (or, made before metadata existed, was lost).
+    #[test]
+    fn a_reshape_while_the_hub_starts_lands_after_it() {
+        let hub = Hub::new();
+        let begin = Arc::new(Begin::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        begin.set(move |hub| {
+            hub.start();
+            let _ = started_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_millis(500));
+            let mut m = ferrocast_golive::hub::StreamMetadata::new();
+            m.video_width = Some(640);
+            hub.metadata(m);
+        });
+        let runner = {
+            let (b, h) = (begin.clone(), hub.clone());
+            std::thread::spawn(move || b.run(&h))
+        };
+        assert!(started_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the start runs");
+        let changer = {
+            let (b, h) = (begin.clone(), hub.clone());
+            std::thread::spawn(move || b.change(&h, |m| m.video_width = Some(1280)))
+        };
+        // Time for the change to land while the start is still under way (it waits now).
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = go_tx.send(());
+        let _ = runner.join();
+        let _ = changer.join();
+        assert_eq!(hub.subscribe().headers.metadata.and_then(|m| m.video_width), Some(1280), "the reshape was kept");
+    }
+
+    /// A new stream that fails to start leaves the last one's delayed tail going: it was cut before
+    /// the engine took the new one, and a failed start lost the last seconds of the stream before.
+    /// (The only test that starts an output that could end every tail: `discard_delay` is global.)
+    #[test]
+    fn a_new_stream_that_fails_to_start_leaves_the_last_ones_tail() {
+        let doc = serde_json::json!({ "sources": [] });
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 30 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let (mut out, _) = delayed(5_000);
+        let gate = out.gate.clone();
+        out.send(video(0, true, 10));
+        drop(out);
+        assert!(gate.is_running());
+        let enc = EncodeSettings::with_encoder("obs_x264");
+        let how = Drawing {
+            send_to: None,
+            hub: None,
+            fps: None,
+            record: None,
+            encode: &enc,
+            tracks: &[],
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: Some("Nothing called this"),
+            video_tracks: &[],
+        };
+        assert!(OwnStream::drawn(shared, &doc, how).is_err(), "it can't start");
+        let cancelled = gate.state.lock().unwrap_or_else(|p| p.into_inner()).cancel;
+        gate.cancel();
+        gate.wait_done();
+        assert!(!cancelled, "the last stream's tail goes on");
+    }
+
+    #[test]
+    fn a_new_stream_or_discarding_ends_the_delayed_tail_at_once() {
+        let (mut out, counts) = delayed(5_000);
+        let gate = out.gate.clone();
+        out.send(video(0, true, 10));
+        out.send(video(10, false, 10));
+        drop(out);
+        assert!(gate.is_running());
+        let t = std::time::Instant::now();
+        // (This gate only: `discard_delay` ends every stream's tail, and tests run side by side.)
+        gate.cancel();
+        gate.wait_done();
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), 0, "what was left is dropped");
+    }
+
+    #[test]
+    fn the_delay_never_holds_more_than_its_cap_and_resumes_at_a_keyframe() {
+        let (mut out, counts) = delayed(60_000);
+        out.cap = 1_000;
+        // Headers first (they must survive), then GOPs of a keyframe and four more, 100 bytes each.
+        out.send(Tag::Video { ms: 0, body: vec![0x17, 0, 0, 0, 0] });
+        out.send(Tag::Audio { ms: 0, body: vec![0xAF, 0, 0x12, 0x10] });
+        let mut ms = 0;
+        for gop in 0..6 {
+            for i in 0..5 {
+                ms += 33;
+                out.send(video(ms, i == 0, 100));
+            }
+            assert!(out.held_bytes <= 1_000 + 500, "over the cap after gop {gop}: {}", out.held_bytes);
+        }
+        assert!(out.held_bytes <= 1_000, "{}", out.held_bytes);
+        assert!(is_header(&out.held[0].1) && is_header(&out.held[1].1), "the headers are kept");
+        assert!(is_keyframe(&out.held[2].1), "what's kept starts at a keyframe");
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), 0, "nothing was sent early");
+        // The count of bytes is true.
+        assert_eq!(out.held_bytes, out.held.iter().map(|(_, t)| tag_len(t)).sum::<usize>());
+    }
+
+    #[test]
+    fn delayed_cap_ignores_multitrack_keyframes_and_keeps_multitrack_headers() {
+        let (mut out, _) = delayed(60_000);
+        out.cap = 380;
+        // Main video & audio headers, plus Enhanced RTMP extra video & audio track headers.
+        out.send(Tag::Video { ms: 0, body: vec![0x17, 0x00, 0, 0, 0] });
+        out.send(Tag::Audio { ms: 0, body: vec![0xAF, 0x00, 0x12, 0x10] });
+        out.send(Tag::Video { ms: 0, body: b"\x96\x00avc1\x01\x01\x00".to_vec() });
+        out.send(Tag::Audio { ms: 0, body: b"\x95\x00mp4a\x01\x12\x10".to_vec() });
+        // Main GOP 1: keyframe + inter + multitrack extra-track keyframe + inter.
+        out.send(video(33, true, 100));
+        out.send(video(66, false, 100));
+        out.send(Tag::Video { ms: 66, body: [b"\x96\x03avc1\x01".as_slice(), &[7u8; 40]].concat() });
+        out.send(video(99, false, 100));
+        // Main GOP 2: real main keyframe -> exceeds cap 380, must skip \x96\x03 and land here.
+        out.send(video(132, true, 100));
+        assert!(out.held_bytes <= out.cap, "{}", out.held_bytes);
+        let first_non_header = out.held.iter().find(|(_, t)| !is_header(t)).map(|(_, t)| t.clone());
+        assert!(
+            matches!(first_non_header, Some(Tag::Video { body, .. }) if body[0] == 0x17 && body[1] == 1),
+            "must trim up to a main-track keyframe, not an extra track keyframe or inter: {:?}",
+            out.held
+                .iter()
+                .map(|(_, t)| match t {
+                    Tag::Video { body, .. } => body[0],
+                    Tag::Audio { body, .. } => body[0],
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(out.held.iter().any(|(_, t)| matches!(t, Tag::Video { body, .. } if body[0] == 0x96 && body[1] == 0)));
+        assert!(out.held.iter().any(|(_, t)| matches!(t, Tag::Audio { body, .. } if body[0] == 0x95 && body[1] == 0)));
+
+        // If a tight cap drops the whole GOP before the next keyframe arrives, trailing inters must not orphan.
+        let (mut tight, _) = delayed(60_000);
+        tight.cap = 150;
+        tight.send(Tag::Video { ms: 0, body: vec![0x17, 0x00, 0, 0, 0] });
+        tight.send(video(33, true, 100));
+        tight.send(video(66, false, 100)); // drops GOP 1 -> need_key = true
+        tight.send(video(99, false, 100)); // must be dropped, not left orphaned after headers
+        assert_eq!(tight.held.iter().filter(|(_, t)| !is_header(t)).count(), 0);
+        tight.send(video(132, true, 100));
+        assert_eq!(tight.held.iter().filter(|(_, t)| !is_header(t)).count(), 1);
+    }
+
+    #[test]
+    fn the_sound_rate_and_track_names_set_reach_the_engine_and_the_file() {
+        // (This test is the only one that sets them; the others run at the defaults.)
+        let canvas = crate::Canvas { width: 1920, height: 1080, fps: 60 };
+        assert_eq!(engine_config(&canvas).sample_rate, 48_000);
+        assert!(!engine_config(&canvas).ntsc);
+        set_ntsc(true);
+        assert!(engine_config(&canvas).ntsc, "59.94");
+        assert!(!engine_config(&crate::Canvas { fps: 50, ..canvas }).ntsc, "only 24, 30 and 60 have a broadcast rate");
+        set_ntsc(false);
+        set_audio_format(44_100, vec!["Mic".into(), "".into(), "Game".into()]);
+        assert_eq!(engine_config(&canvas).sample_rate, 44_100, "from the setting, not a fixed 48 kHz");
+        assert_eq!((engine_config(&canvas).width, engine_config(&canvas).fps), (1920, 60));
+        // Tracks 3 and 1, in the file's order: Game, Mic; track 2 has no name.
+        assert_eq!(names_for(&[3, 1, 2]), vec!["Game", "Mic", ""]);
+        // The helper engines (the network-media probe, the headless page) build their own
+        // `EngineConfig` and never read these settings: they stay at 48 kHz and the plain clock
+        // while the Studio's is at 44.1 kHz / 59.94. (The statics are read in `engine_config`, which
+        // only `Shared::open_at` calls: the one engine the app makes outside tests.)
+        set_ntsc(true);
+        let helper = EngineConfig { width: 1280, height: 720, fps: 30, ..Default::default() };
+        assert_eq!((helper.sample_rate, helper.ntsc), (48_000, false));
+        assert_eq!(helper.frame_ns(), 33_333_333);
+        set_ntsc(false);
+        // Anything but 44100 is 48000.
+        set_audio_format(96_000, Vec::new());
+        assert_eq!(engine_config(&canvas).sample_rate, 48_000);
+        assert_eq!(names_for(&[1]), vec![""]);
     }
 
     #[test]
@@ -1371,9 +2354,200 @@ mod tests {
         assert_eq!(rate_of(&cq.encode), RateControl::Quality(0.69));
         cq.encode.quality = None;
         assert_eq!(rate_of(&cq.encode), RateControl::Cbr);
+        cq.encode.strict_cbr = true;
+        assert_eq!(rate_of(&cq.encode), RateControl::CappedCbr);
+        cq.encode.strict_cbr = false;
         // Lossless: x264 at rate factor 0.
         cq.encode.video_encoder = "obs_x264".into();
         cq.encode.quality = Some(0);
         assert_eq!(rate_of(&cq.encode), RateControl::Crf(0));
+    }
+
+    #[test]
+    fn matching_camera_holds_session_detects_no_signal_devices_without_starting_engine() {
+        let stage = crate::stage::Stage::new(crate::Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap();
+        let _ = stage
+            .add_source("Main", "av_capture_input_v2", "Card", &serde_json::json!({ "device": "hdmi-card-0" }), false)
+            .unwrap();
+        let _ = stage
+            .add_source(
+                "Main",
+                "color_source_v3",
+                "Color",
+                &serde_json::json!({ "width": 16, "height": 16, "color": 0xFF00_00FFu32 }),
+                false,
+            )
+            .unwrap();
+
+        // Must never start an engine lazily when none is running.
+        assert!(!super::matching_camera_holds_session(
+            &stage,
+            "av_capture_input_v2",
+            "device",
+            &serde_json::json!("hdmi-card-0"),
+        ));
+        assert!(stage.camera_status("Card").is_none());
+
+        assert!(super::matching_camera_holds_session_with(
+            &stage,
+            "macos-avcapture",
+            "uid",
+            &serde_json::json!("hdmi-card-0"),
+            |n| n == "Card",
+        ));
+        assert!(!super::matching_camera_holds_session_with(
+            &stage,
+            "av_capture_input_v2",
+            "device",
+            &serde_json::json!("other-card"),
+            |_| true,
+        ));
+        assert!(!super::matching_camera_holds_session_with(
+            &stage,
+            "av_capture_input_v2",
+            "device",
+            &serde_json::json!(""),
+            |_| true,
+        ));
+        assert!(!super::matching_camera_holds_session_with(
+            &stage,
+            "color_source_v3",
+            "device",
+            &serde_json::json!("hdmi-card-0"),
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn direct_hub_injection_streams_without_rtmp_loopback_and_decimates_fps() {
+        let doc = serde_json::json!({ "sources": [], "current_scene": "Main", "scenes": { "Main": [] } });
+        if !ferrocore::ffenc::available() {
+            eprintln!("skipped: x264 needs FFmpeg here");
+            return;
+        }
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let hub = Hub::new();
+        let mut enc = EncodeSettings::with_encoder("obs_x264");
+        enc.scale = Some((320, 180));
+        enc.video_kbps = 1_200;
+        let how = Drawing {
+            send_to: None,
+            hub: Some(hub.clone()),
+            fps: Some(30),
+            record: None,
+            encode: &enc,
+            tracks: &[1],
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: None,
+            video_tracks: &[],
+        };
+        let own = OwnStream::drawn(shared, &doc, how).unwrap();
+        assert!(own.runtime.is_none(), "direct Hub injection must not spawn loopback RTMP sender runtime");
+        assert!(hub.live().borrow().on, "injected Hub must go live immediately");
+        let mut sub = hub.subscribe();
+        let meta = sub.headers.metadata.expect("Hub metadata set");
+        assert_eq!((meta.video_width, meta.video_height, meta.video_frame_rate), (Some(320), Some(180), Some(30.0)));
+        drop(own);
+        assert!(!hub.live().borrow().on, "dropping OwnStream must end injected Hub");
+        let _ = sub.rx.try_recv();
+    }
+
+    #[test]
+    fn vertical_direct_hub_scales_and_decimates_fps() {
+        let doc = serde_json::json!({
+            "sources": [
+                { "id": "scene", "versioned_id": "scene", "name": "Main", "settings": { "items": [] } },
+                { "id": "scene", "versioned_id": "scene", "name": "VScene", "settings": { "items": [] } }
+            ],
+            "current_scene": "Main",
+            "scene_order": [{ "name": "Main" }],
+            "ferrocast": {
+                "vertical": { "on": true, "current_scene": "VScene", "scene_order": [{ "name": "VScene" }] }
+            }
+        });
+        if !ferrocore::ffenc::available() {
+            eprintln!("skipped: x264 needs FFmpeg here");
+            return;
+        }
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let hub = Hub::new();
+        let mut enc = EncodeSettings::with_encoder("obs_x264");
+        enc.scale = Some((720, 1280));
+        enc.video_kbps = 2_000;
+        let how = Drawing {
+            send_to: None,
+            hub: Some(hub.clone()),
+            fps: Some(30),
+            record: None,
+            encode: &enc,
+            tracks: &[],
+            delay_s: 0,
+            vertical: true,
+            replay: None,
+            solo: None,
+            video_tracks: &[],
+        };
+        let own = OwnStream::drawn(shared, &doc, how).unwrap();
+        let mut sub = hub.subscribe();
+        let meta = sub.headers.metadata.expect("vertical Hub metadata set");
+        assert_eq!((meta.video_width, meta.video_height, meta.video_frame_rate), (Some(720), Some(1280), Some(30.0)));
+        drop(own);
+        let _ = sub.rx.try_recv();
+    }
+
+    #[test]
+    fn failed_start_does_not_leave_injected_hub_live() {
+        let doc = serde_json::json!({ "sources": [], "current_scene": "Main", "scenes": { "Main": [] } });
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let hub = Hub::new();
+        let enc = EncodeSettings::with_encoder("obs_x264");
+        let how = Drawing {
+            send_to: None,
+            hub: Some(hub.clone()),
+            fps: Some(60),
+            record: None,
+            encode: &enc,
+            tracks: &[1],
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: Some("__missing_source__"),
+            video_tracks: &[],
+        };
+        assert!(OwnStream::drawn(shared, &doc, how).is_err());
+        assert!(!hub.live().borrow().on, "failed OwnStream::drawn must not leave injected Hub marked live");
+    }
+
+    #[test]
+    fn delayed_emits_encoded_idr_before_delay_and_abort_skips_drain() {
+        let hub = Hub::new();
+        let counts = Arc::new(Counts::default());
+        let drain = Arc::new(DrainGate::default());
+        let begin = Arc::new(Begin::default());
+        begin.set(|h| h.start());
+        let mut delayed = Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(10), drain.clone(), begin);
+
+        delayed.send(Tag::Video { ms: 0, body: vec![0x17, 0x00, 1, 2] });
+        assert_eq!(hub.encoded_idr_count(), 0, "sequence header must not notify encoded_idr");
+
+        delayed.send(Tag::Video { ms: 0, body: vec![0x17, 0x01, 0, 0, 0] });
+        assert!(!hub.live().borrow().on, "delay must keep Hub deferred while holding packet");
+        assert_eq!(hub.encoded_idr_count(), 1, "coded IDR must notify Hub before delay expires");
+
+        drain.cancel();
+        drop(delayed);
+        assert!(!drain.is_running(), "cancelled drain must drop held tags without spawning drain thread");
+        assert_eq!(counts.delay_bytes.load(Ordering::Relaxed), 0);
     }
 }

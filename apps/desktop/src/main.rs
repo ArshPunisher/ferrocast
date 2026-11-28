@@ -15,15 +15,22 @@
 // window's thread).
 #![recursion_limit = "256"]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod crash;
+mod log_limit;
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
+mod mac_quit;
 #[cfg(target_os = "macos")]
 mod mac_update;
+mod menu;
+mod quit;
 mod store;
 mod studio;
 mod studio_history;
@@ -45,6 +52,14 @@ use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 const SHOW_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+F";
 /// Passed by the login item: start in the tray without opening the window.
 const MINIMIZED_ARG: &str = "--minimized";
+/// Launch directly in Safe Mode (no third-party plugins, VSTs, auto-start, or auto-loaded collection).
+const SAFE_MODE_ARG: &str = "--safe-mode";
+/// Bundle identifier in `tauri.conf.json`, used for LaunchServices relaunch when bundle path is unavailable.
+#[cfg(any(target_os = "macos", test))]
+const BUNDLE_ID: &str = "com.clearcraftlabs.ferrocast";
+/// Set before `app.exit(0)` on macOS so `RunEvent::Exit` schedules LaunchServices relaunch after exit.
+#[cfg(target_os = "macos")]
+pub(crate) static RELAUNCH_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
 /// How often the shell picks up settings changed in the dashboard.
 const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 
@@ -65,7 +80,7 @@ struct Running {
     token: String,
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FERROCAST_HOME") {
         // Absolute: on Windows the Studio moves the working folder to OBS's (studio crate).
         let dir = PathBuf::from(dir);
@@ -74,6 +89,166 @@ fn data_dir() -> PathBuf {
     // Debug builds never touch the installed app's data.
     let name = if cfg!(debug_assertions) { "Ferrocast-dev" } else { "Ferrocast" };
     dirs::data_dir().unwrap_or_else(std::env::temp_dir).join(name)
+}
+
+/// Maximum bytes in `ferrocast.log` before it rotates to `ferrocast.1.log` while running.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Size-capped rotating log writer: keeps `ferrocast.log` under `max_bytes` with at most one
+/// rotated backup (`ferrocast.1.log`) even across week-long sessions.
+struct RotatingLogWriter {
+    path: PathBuf,
+    backup: PathBuf,
+    max_bytes: u64,
+    written: u64,
+    file: Option<std::fs::File>,
+}
+
+impl RotatingLogWriter {
+    fn open(dir: &std::path::Path, max_bytes: u64) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("ferrocast.log");
+        let backup = dir.join("ferrocast.1.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() >= max_bytes) {
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::rename(&path, &backup);
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self { path, backup, max_bytes: max_bytes.max(1), written, file: Some(file) })
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        if let Some(mut f) = self.file.take() {
+            let _ = std::io::Write::flush(&mut f);
+        }
+        // Remove previous backup first so rename succeeds on Windows as well as Unix.
+        let _ = std::fs::remove_file(&self.backup);
+        let _ = std::fs::rename(&self.path, &self.backup);
+        let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&self.path)?;
+        self.written = 0;
+        self.file = Some(file);
+        Ok(())
+    }
+}
+
+impl std::io::Write for RotatingLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written > 0 && self.written.saturating_add(buf.len() as u64) > self.max_bytes {
+            let _ = self.rotate();
+        }
+        let f = match self.file.as_mut() {
+            Some(f) => f,
+            None => {
+                let file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+                self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
+                self.file.insert(file)
+            }
+        };
+        let n = f.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = self.file.as_mut() {
+            f.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// The file log's writer, to flush it at quit.
+static LOG_FILE: std::sync::OnceLock<NonBlockingLog> = std::sync::OnceLock::new();
+
+/// How many log lines wait for the writer thread before new ones are dropped.
+const LOG_QUEUE: usize = 8_192;
+
+enum LogMsg {
+    Line(Vec<u8>),
+    /// Everything before this is written; then it answers.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// The log file's writer, off the threads that log: `write` hands the line to a thread of its own and
+/// never waits (a full queue drops the line), so a slow disk, a rotation or a locked file can't park a
+/// runtime worker or the audio thread that happens to log. (A log line through the file layer used to
+/// be a `std` mutex and a write on the logging thread: with a single-worker runtime that was a way to
+/// stall the Studio's sender with nothing logged.)
+#[derive(Clone)]
+struct NonBlockingLog {
+    tx: std::sync::mpsc::SyncSender<LogMsg>,
+    /// Lines dropped because the queue was full, not yet said in the log.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl NonBlockingLog {
+    fn spawn(mut inner: impl std::io::Write + Send + 'static, queue: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(queue);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let said = dropped.clone();
+        let _ = std::thread::Builder::new().name("ferrocast-log".into()).spawn(move || {
+            while let Ok(m) = rx.recv() {
+                match m {
+                    LogMsg::Line(l) => {
+                        let _ = inner.write_all(&l);
+                    }
+                    LogMsg::Flush(done) => {
+                        let _ = inner.flush();
+                        let _ = done.send(());
+                    }
+                }
+                // A gap in the log says so, once the writer has caught up enough to write it.
+                let n = said.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if n > 0 {
+                    let _ =
+                        inner.write_all(format!("{n} log lines were dropped (the log couldn't keep up)\n").as_bytes());
+                }
+            }
+        });
+        Self { tx, dropped }
+    }
+
+    /// Waits (at most `wait`) until what was logged before is written: for a panic or a quit.
+    fn flush(&self, wait: std::time::Duration) {
+        let (done, rx) = std::sync::mpsc::sync_channel(1);
+        let deadline = std::time::Instant::now() + wait;
+        let mut msg = LogMsg::Flush(done);
+        // A full queue makes room as the writer goes on: try until the deadline.
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(m)) if std::time::Instant::now() < deadline => {
+                    msg = m;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+impl std::io::Write for NonBlockingLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Lossy by design: the queue being full means the disk is far behind.
+        if self.tx.try_send(LogMsg::Line(buf.to_vec())).is_err() {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NonBlockingLog {
+    type Writer = NonBlockingLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 /// The log goes to the terminal and to `<data>/logs/ferrocast.log` (kept under 5 MB, one old
@@ -85,43 +260,76 @@ fn init_tracing(dir: &std::path::Path) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tao=warn,wry=warn"));
     let logs = dir.join("logs");
-    let file = std::fs::create_dir_all(&logs).ok().and_then(|()| {
-        let path = logs.join("ferrocast.log");
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
-            let _ = std::fs::rename(&path, logs.join("ferrocast.1.log"));
-        }
-        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
-    });
-    let to_file = file.map(|f| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)));
-    let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
+    let writer = RotatingLogWriter::open(&logs, MAX_LOG_BYTES).ok().map(|w| NonBlockingLog::spawn(w, LOG_QUEUE));
+    let flush_log = writer.clone();
+    if let Some(w) = &writer {
+        let _ = LOG_FILE.set(w.clone());
+    }
+    let to_file = writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w));
+    // The terminal too: stdout may be a pipe nobody reads, and a write to it must not park a worker.
+    let to_terminal = tracing_subscriber::fmt::layer().with_writer(NonBlockingLog::spawn(std::io::stdout(), LOG_QUEUE));
+    // A line repeated many times a second (DeepFilterNet's clipping warning) passes once a minute.
+    let _ =
+        tracing_subscriber::registry().with(filter).with(log_limit::layer()).with(to_terminal).with(to_file).try_init();
+    log_limit::report_in_background();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Where it came from too (function names in builds with symbols, addresses without).
         let trace = std::backtrace::Backtrace::force_capture();
         tracing::error!(%info, %trace, "Ferrocast stopped unexpectedly");
+        // The line is queued: give the writer a moment to put it in the file before the process goes.
+        if let Some(l) = &flush_log {
+            l.flush(std::time::Duration::from_secs(2));
+        }
         default(info);
     }));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "Ferrocast starting");
 }
 
 fn main() {
+    let _ = MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());
     let dir = data_dir();
     init_tracing(&dir);
+    let safe_mode = std::env::args().any(|a| a == SAFE_MODE_ARG);
+    let guarded = safe_mode || ferrocast_engine::safe_mode::has_unclean_exit(&dir);
     // VST plugins run in their own locked-down helper, which may never read this folder (stream
-    // keys, sign-ins); the Studio's sound filters then reach them.
+    // keys, sign-ins); the Studio's sound filters then reach them. Deferred in Safe Mode.
     ferrocast_vsthost::client::keep_private(vec![dir.clone()]);
-    ferrocast_vsthost::install();
+    if !guarded {
+        ferrocast_vsthost::install();
+    } else {
+        tracing::warn!(safe_mode, "Safe Mode active at launch: VST plugins and third-party plugins held off");
+    }
     #[cfg(windows)]
     crash::install(&dir);
     #[cfg(all(windows, debug_assertions))]
     crash::test_crash_if_asked();
     // The Store package's startup task can't pass `--minimized`: it's asked instead.
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
+    let startup_deeplink = std::env::args().find(|a| is_ferrocast_deeplink(a));
+    let recent_link = RecentLink::default();
+    if let Some(l) = &startup_deeplink {
+        // The launch is the first report: the OS reporting the same link again is not a second click.
+        recent_link.accept(l, std::time::Instant::now());
+    }
+    let has_startup_link = startup_deeplink.is_some();
     if store::packaged() {
         tracing::info!("running from the Microsoft Store package: the Store updates it");
     }
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
+        .manage(PendingDeepLink(std::sync::Mutex::new(startup_deeplink)))
+        .manage(recent_link)
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(uri) = args.iter().find(|a| is_ferrocast_deeplink(a)) {
+                dispatch_deeplink(app, uri);
+            } else {
+                show_window(app);
+            }
+        }))
+        // Registers ferrocast:// with the OS (macOS Info.plist, the Windows registry, Linux
+        // .desktop and MIME); the links themselves come through the command line (single instance)
+        // and macOS's opened-URL event, both handled below.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().args([MINIMIZED_ARG]).build())
@@ -150,7 +358,16 @@ fn main() {
                 .build(),
         )
         .setup(move |app| {
-            let started = tauri::async_runtime::block_on(start(&dir));
+            // An install that didn't go through the installer (an AppImage, a portable copy)
+            // registers the scheme itself; the Store package and the bundles already have it.
+            #[cfg(any(windows, target_os = "linux"))]
+            if !store::packaged() {
+                use tauri_plugin_deep_link::DeepLinkExt as _;
+                if let Err(e) = app.deep_link().register_all() {
+                    tracing::warn!(error = %e, "couldn't register the ferrocast:// scheme");
+                }
+            }
+            let started = tauri::async_runtime::block_on(start(&dir, safe_mode));
             let running = match started {
                 Ok(r) => r,
                 Err(message) => {
@@ -160,8 +377,11 @@ fn main() {
                 }
             };
             let engine = running.engine.clone();
+            engine.on_exit_safe_mode(Arc::new(ferrocast_vsthost::install));
+            let show_for_safe_mode = engine.safe_mode_status().active || engine.safe_mode_status().offer;
             app.manage(running);
             app.manage(studio_keys::StudioKeys::new(engine.clone()));
+            engine.watch_saves();
             engine.set_studio_host(Arc::new(studio::DesktopStudio::new(app.handle().clone(), dir.clone())));
             // The Studio's saved shortcuts work from the start, Studio running or not.
             {
@@ -178,6 +398,19 @@ fn main() {
             watch_threads(app.handle().clone());
             // A desktop with no tray, or its icon file not writable (Linux, 19 Nov: a second
             // user's start panicked on the first one's /tmp/tray-icon), runs without the tray.
+            // macOS: the menu bar (Settings, Undo, Quit… where a Mac user looks for them).
+            #[cfg(target_os = "macos")]
+            {
+                match menu::build(app.handle()) {
+                    Ok(bar) => {
+                        if let Err(e) = app.set_menu(bar) {
+                            tracing::warn!(error = %e, "the menu bar didn't show");
+                        }
+                        app.on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "the menu bar couldn't be made"),
+                }
+            }
             match build_tray(app.handle()) {
                 Ok(()) => shell.has_tray.store(true, Ordering::Relaxed),
                 Err(e) => tracing::warn!(error = %e, "no tray icon: Ferrocast runs without it, and closing quits"),
@@ -198,32 +431,46 @@ fn main() {
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
-            // Started minimized (at login) with no tray: shown, or nothing could bring it up.
-            if !minimized || !has_tray {
+            #[cfg(any(unix, windows))]
+            tauri::async_runtime::spawn(quit_on_signal(app.handle().clone()));
+            // Started minimized (at login) with no tray, or offering/running Safe Mode: shown so
+            // the prompt is never hidden in the tray.
+            if opens_window_at_start(minimized, has_tray, show_for_safe_mode, has_startup_link) {
                 show_window(app.handle());
             }
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::DragDrop(drop) = event
-                && window.label() == "main"
-            {
-                forward_drop(window, drop);
-            }
-            if let WindowEvent::CloseRequested { api, .. } = event
-                && window.label() == "main"
-            {
-                let app = window.app_handle();
-                let _ = app.save_window_state(StateFlags::all());
-                let to_tray = app
-                    .try_state::<Arc<Shell>>()
-                    .is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed) && s.has_tray.load(Ordering::Relaxed));
-                if to_tray {
-                    // Closing hides: the engine keeps alerts and the bot running from the tray.
-                    api.prevent_close();
-                    let _ = window.hide();
-                } else {
-                    app.exit(0);
+            if window.label() == "main" {
+                match event {
+                    WindowEvent::DragDrop(drop) => forward_drop(window, drop),
+                    WindowEvent::Resized(size) => studio::on_window_resized(window, size.width, size.height),
+                    WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size, .. } => {
+                        studio::on_window_scale_changed(
+                            window,
+                            *scale_factor,
+                            Some((new_inner_size.width, new_inner_size.height)),
+                        );
+                    }
+                    WindowEvent::Destroyed => studio::on_window_destroyed(window.app_handle()),
+                    WindowEvent::CloseRequested { api, .. } => {
+                        let app = window.app_handle();
+                        let _ = app.save_window_state(StateFlags::all());
+                        let to_tray = app.try_state::<Arc<Shell>>().is_none_or(|s| {
+                            s.close_to_tray.load(Ordering::Relaxed) && s.has_tray.load(Ordering::Relaxed)
+                        });
+                        if to_tray {
+                            // Closing hides: the engine keeps alerts and the bot running from the tray.
+                            api.prevent_close();
+                            let _ = window.hide();
+                            studio::on_window_hidden(app);
+                        } else {
+                            // Closing the window quits: asked first when something is on air.
+                            api.prevent_close();
+                            quit::request(app);
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
@@ -241,19 +488,215 @@ fn main() {
         // window really exits.
         RunEvent::ExitRequested { api, code: None, .. } if app.try_state::<Running>().is_some() => {
             api.prevent_exit();
+            // macOS: the Dock's Quit (and a Quit from Activity Monitor or a logout) arrives here;
+            // it is a quit request like any other, asked about when something is on air.
+            #[cfg(target_os = "macos")]
+            quit::request(app);
         }
+        // macOS: the app delegate gets the answer to a Quit from the Dock or an AppleEvent.
+        #[cfg(target_os = "macos")]
+        RunEvent::Ready => mac_quit::install(app),
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        RunEvent::Opened { urls } => {
+            if let Some(uri) = urls.iter().map(|u| u.as_str()).find(|u| is_ferrocast_deeplink(u)) {
+                dispatch_deeplink(app, uri);
+            } else {
+                show_window(app);
+            }
+        }
         RunEvent::Exit => {
-            studio::end_session();
             tracing::info!("Ferrocast quitting");
-            // Before the main thread's own end, which can't run the engine's GPU cleanup.
-            studio::close();
+            let running = app.try_state::<Running>();
+            clean_exit_sequence(
+                studio::mark_quitting,
+                studio::close,
+                || {
+                    if let Some(r) = running.as_ref() {
+                        r.engine.shutdown();
+                    }
+                },
+                || clear_run_markers(running.as_ref().map(|r| &r.engine)),
+            );
             tracing::info!("the Studio closed");
+            // The file's writer is a thread of its own: the last lines are written before the process goes.
+            if let Some(l) = LOG_FILE.get() {
+                l.flush(std::time::Duration::from_secs(2));
+            }
+            // After updating or restarting in Safe Mode, relaunch via LaunchServices once this
+            // process has exited so macOS reuses the pinned Dock icon instead of opening a second one.
+            #[cfg(target_os = "macos")]
+            {
+                let safe = quit::RELAUNCH_SAFE.load(Ordering::SeqCst);
+                let update_restart = RELAUNCH_AFTER_EXIT.load(Ordering::SeqCst);
+                if safe || update_restart {
+                    schedule_mac_relaunch(&app.env(), safe);
+                }
+            }
         }
         _ => {}
     });
+}
+
+/// The signals that mean "end now": `kill` and `pkill` (SIGTERM), Ctrl-C in a terminal (SIGINT), a
+/// terminal or login ending (SIGHUP). By default each ends the process on the spot, with no
+/// `RunEvent::Exit`: the run markers stayed and the next launch opened in Safe Mode (20 Nov, a
+/// plain `kill` of the test app). They are caught instead and asked to quit as Quit does.
+#[cfg(unix)]
+struct QuitSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl QuitSignals {
+    /// Must run inside the async runtime.
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// The first of them to arrive.
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+            _ = self.hup.recv() => "SIGHUP",
+        }
+    }
+}
+
+/// Windows console / session termination events (`SetConsoleCtrlHandler` via Tokio): Ctrl-C,
+/// Ctrl-Break, closing a console window, user logoff, and system shutdown. Tokio parks the OS
+/// handler thread on `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` so `app.exit(0)` has Windows'
+/// shutdown grace period to run `RunEvent::Exit` and clear the run markers instead of triggering
+/// Safe Mode on the next launch (GUI logoff/shutdown also arrives via `WM_ENDSESSION` → `tao` →
+/// `RunEvent::Exit`).
+#[cfg(windows)]
+struct QuitSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    ctrl_close: tokio::signal::windows::CtrlClose,
+    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
+    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl QuitSignals {
+    /// Must run inside the async runtime.
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        Ok(Self {
+            ctrl_c: ctrl_c()?,
+            ctrl_break: ctrl_break()?,
+            ctrl_close: ctrl_close()?,
+            ctrl_logoff: ctrl_logoff()?,
+            ctrl_shutdown: ctrl_shutdown()?,
+        })
+    }
+
+    /// The first of them to arrive.
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => "CTRL_C",
+            _ = self.ctrl_break.recv() => "CTRL_BREAK",
+            _ = self.ctrl_close.recv() => "CTRL_CLOSE",
+            _ = self.ctrl_logoff.recv() => "CTRL_LOGOFF",
+            _ = self.ctrl_shutdown.recv() => "CTRL_SHUTDOWN",
+        }
+    }
+}
+
+/// Quits through the normal path (`RunEvent::Exit`, the clean-exit sequence) on the first signal.
+/// A second one means the quit is stuck (a drain that won't end, a window that won't close): the
+/// handlers stay installed, so without this only SIGKILL / TerminateProcess would end the process.
+#[cfg(any(unix, windows))]
+async fn quit_on_signal(app: AppHandle) {
+    let mut signals = match QuitSignals::register() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't listen for quit signals: termination may skip clean quit");
+            return;
+        }
+    };
+    quit_then_force(&mut signals, || app.exit(0), || std::process::exit(1)).await;
+}
+
+/// `quit` on the first signal, `force` on the next.
+#[cfg(any(unix, windows))]
+async fn quit_then_force(signals: &mut QuitSignals, quit: impl FnOnce(), force: impl FnOnce()) {
+    let which = signals.next().await;
+    tracing::info!(signal = which, "asked to quit by a signal");
+    quit();
+    let again = signals.next().await;
+    tracing::warn!(signal = again, "asked again while quitting: ending now, without the clean quit");
+    force();
+}
+
+/// The "Ferrocast is running" notes (the Studio's session and the engine's `running.json`) that
+/// the next launch reads as a crash and answers with Safe Mode. Removed at the end of a clean quit,
+/// and by the Windows updater just before its installer ends the process.
+fn clear_run_markers(engine: Option<&Engine>) {
+    studio::end_session();
+    if let Some(engine) = engine {
+        engine.clear_running_marker();
+    }
+}
+
+fn clean_exit_sequence(
+    mark_quitting: impl FnOnce(),
+    close_studio: impl FnOnce() -> bool,
+    shutdown_engine: impl FnOnce(),
+    clear_markers: impl FnOnce(),
+) -> bool {
+    mark_quitting();
+    // Before the main thread's own end, which can't run the engine's GPU cleanup.
+    let closed = close_studio();
+    shutdown_engine();
+    if closed {
+        clear_markers();
+    } else {
+        tracing::warn!("clean quit markers preserved: Studio did not finish closing cleanly");
+    }
+    closed
+}
+
+fn updater_before_exit(
+    mark_quitting: impl FnOnce(),
+    close_studio: impl FnOnce() -> bool,
+    shutdown_engine: impl FnOnce(),
+    clear_markers: impl FnOnce(),
+    flush_logs: impl FnOnce(),
+) -> bool {
+    let clean = clean_exit_sequence(mark_quitting, close_studio, shutdown_engine, clear_markers);
+    flush_logs();
+    clean
+}
+
+static MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+fn close_studio_for_exit<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    if MAIN_THREAD_ID.get().copied() == Some(std::thread::current().id()) {
+        return studio::close();
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+    if app
+        .run_on_main_thread(move || {
+            let _ = tx.send(studio::close());
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // Wait past Studio's Windows drain bound (3 s) + durable scene flush (6 s) before timing out.
+    rx.recv_timeout(Duration::from_secs(15)).unwrap_or(false)
 }
 
 fn shortcut_of(s: &str) -> Shortcut {
@@ -301,6 +744,31 @@ async fn check_update<R: tauri::Runtime>(
         let url = feed.parse().map_err(tauri_plugin_updater::Error::UrlParse)?;
         builder = builder.endpoints(vec![url])?;
     }
+    // Windows: the updater runs the installer and ends the process itself (`process::exit`, no
+    // `RunEvent::Exit`), so the clean-quit notes would stay behind and the first launch of every
+    // new version would open in Safe Mode with the owner's scenes held back. The hook runs once the
+    // installer is ready to start, so a failed install leaves the notes where they were. (It does
+    // nothing on the other systems, where the restart goes through the clean exit.)
+    let handle = app.clone();
+    builder = builder.on_before_exit(move || {
+        tracing::info!("Ferrocast quitting for update");
+        let running = handle.try_state::<Running>();
+        updater_before_exit(
+            studio::mark_quitting,
+            || close_studio_for_exit(&handle),
+            || {
+                if let Some(r) = running.as_ref() {
+                    r.engine.shutdown();
+                }
+            },
+            || clear_run_markers(running.as_ref().map(|r| &r.engine)),
+            || {
+                if let Some(l) = LOG_FILE.get() {
+                    l.flush(Duration::from_secs(2));
+                }
+            },
+        );
+    });
     builder.timeout(timeout).configure_client(|c| c.connect_timeout(CONNECT_TIMEOUT)).build()?.check().await
 }
 
@@ -485,13 +953,17 @@ async fn install_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
         };
         let size = bytes.len() as u64;
         engine.update_progress(&version, size, Some(size));
-        // A stream may have started during the download: check again right before applying.
+        // A stream or local capture may have started during the download: check again before applying.
         if engine.update_blocked() {
-            engine.update_install_failed(ferrocast_engine::UpdateProblem::new(
-                "went_live",
-                "You went live during the download, so it waits.",
-                "Press Update now again after your stream.",
-            ));
+            let (msg, hint) = if engine.is_live() {
+                ("You went live during the download, so it waits.", "Press Update now again after your stream.")
+            } else {
+                (
+                    "Recording or replay buffer started during the download, so it waits.",
+                    "Press Update now again after it stops.",
+                )
+            };
+            engine.update_install_failed(ferrocast_engine::UpdateProblem::new("went_live", msg, hint));
             continue;
         }
         engine.update_installing(&version);
@@ -551,7 +1023,102 @@ async fn restart_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
             }
         }
         tracing::info!("restarting to finish the update");
+        #[cfg(target_os = "macos")]
+        {
+            RELAUNCH_AFTER_EXIT.store(true, Ordering::SeqCst);
+            app.exit(0);
+            break;
+        }
+        #[cfg(not(target_os = "macos"))]
         app.restart();
+    }
+}
+
+/// Command specification to wait for `pid` to exit and reopen the app via LaunchServices.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct MacRelaunchSpec {
+    program: &'static str,
+    args: Vec<std::ffi::OsString>,
+}
+
+/// Filters raw `env.args_os` down to persistent flags (`--minimized`, plus `--safe-mode` only
+/// when relaunching into Safe Mode), stripping LaunchServices `-psn_*` serial tokens and
+/// one-shot `ferrocast://` deep links.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn relaunch_forward_args(env_args: &[std::ffi::OsString], safe_mode: bool) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = env_args.iter().skip(1).filter(|a| *a == MINIMIZED_ARG).cloned().collect();
+    if safe_mode {
+        out.push(SAFE_MODE_ARG.into());
+    }
+    out
+}
+
+/// Shell snippet that blocks until the parent closes the inherited relaunch pipe at process exit.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const MAC_RELAUNCH_WAIT_SH: &str = "while IFS= read -r _; do :; done";
+
+/// Builds a detached `/bin/sh` + `/usr/bin/open` invocation that waits for the parent's
+/// inherited pipe EOF (process exit) before asking LaunchServices to launch the `.app` bundle
+/// (or bundle ID fallback).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn mac_relaunch_spec(
+    bundle: Option<&Path>,
+    bundle_id: &str,
+    env_args: &[std::ffi::OsString],
+    safe_mode: bool,
+) -> MacRelaunchSpec {
+    let script = format!("{MAC_RELAUNCH_WAIT_SH}; /bin/sleep 0.2; exec /usr/bin/open \"$@\"");
+    let mut args: Vec<std::ffi::OsString> = vec!["-c".into(), script.into(), "ferrocast-relaunch".into()];
+    match bundle {
+        Some(path) => args.push(path.as_os_str().to_os_string()),
+        None => {
+            args.push("-b".into());
+            args.push(bundle_id.into());
+        }
+    }
+    let forward = relaunch_forward_args(env_args, safe_mode);
+    if !forward.is_empty() {
+        args.push("--args".into());
+        args.extend(forward);
+    }
+    MacRelaunchSpec { program: "/bin/sh", args }
+}
+
+/// Write end of the anonymous pipe held open until process exit so the detached macOS relaunch
+/// watcher unblocks on kernel descriptor close rather than polling a numeric PID.
+#[cfg(target_os = "macos")]
+static RELAUNCH_PIPE_WRITE: Mutex<Option<std::io::PipeWriter>> = Mutex::new(None);
+
+/// Spawns a detached watcher that relaunches via LaunchServices only after this process exits.
+#[cfg(target_os = "macos")]
+fn schedule_mac_relaunch(env: &tauri::Env, safe_mode: bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let (reader, writer) = match std::io::pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(error = %e, "couldn't create LaunchServices relaunch exit pipe");
+            return;
+        }
+    };
+    let bundle = std::env::current_exe().ok().and_then(|exe| mac_update::bundle_of(&exe));
+    let spec = mac_relaunch_spec(bundle.as_deref(), BUNDLE_ID, &env.args_os, safe_mode);
+    match Command::new(spec.program)
+        .args(&spec.args)
+        .stdin(Stdio::from(reader))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(_) => {
+            *RELAUNCH_PIPE_WRITE.lock().unwrap_or_else(|p| p.into_inner()) = Some(writer);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "couldn't schedule LaunchServices relaunch");
+        }
     }
 }
 
@@ -597,6 +1164,18 @@ async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
     }
 }
 
+/// The show-window key and the panic key put back, after a shortcut field let every global
+/// shortcut go (see `studio_keys::capture`).
+pub(crate) fn restore_app_shortcuts(app: &AppHandle) {
+    if let Err(e) = app.global_shortcut().register(shortcut_of(SHOW_SHORTCUT)) {
+        tracing::warn!(error = %e, "couldn't register the show-window shortcut again (another app may use it)");
+    }
+    if let (Some(shell), Some(running)) = (app.try_state::<Arc<Shell>>(), app.try_state::<Running>()) {
+        let wanted = running.engine.panic_state().1.hotkey.trim().to_string();
+        set_panic_hotkey(app, &shell, &wanted);
+    }
+}
+
 fn set_panic_hotkey(app: &AppHandle, shell: &Shell, wanted: &str) {
     let mut slot = shell.panic_shortcut.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(old) = slot.take() {
@@ -638,20 +1217,49 @@ async fn notify_when_hidden(app: AppHandle, engine: Engine) {
         if visible {
             continue;
         }
-        let body = v["data"]["message"].as_str().unwrap_or("").chars().take(300).collect::<String>();
+        // The line, then its detail (the dashboard keeps that behind an (i); a system
+        // notification has no such place).
+        let line = v["data"]["message"].as_str().unwrap_or("");
+        let body = match v["data"]["detail"].as_str() {
+            Some(d) if !d.is_empty() => {
+                let stop = if line.ends_with(['.', '!', '?']) { "" } else { "." };
+                format!("{line}{stop} {d}")
+            }
+            _ => line.to_string(),
+        }
+        .chars()
+        .take(300)
+        .collect::<String>();
         if let Err(e) = app.notification().builder().title("Ferrocast").body(body).show() {
             tracing::debug!(error = %e, "couldn't show a notification");
         }
     }
 }
 
-async fn start(dir: &std::path::Path) -> Result<Running, String> {
-    let engine = Engine::start(dir).await.map_err(|e| e.to_string())?;
+async fn start(dir: &std::path::Path, safe_mode: bool) -> Result<Running, String> {
+    start_with(dir, safe_mode, |engine, opts| async move { ferrocast_server::serve(engine, opts).await }).await
+}
+
+/// [`start`] with the server's opening handed in (so a failure of it can be tested). When the
+/// server can't open, the launch is over: the engine is closed and the "running" notes it wrote
+/// are cleared, as a clean quit does. Left behind, the next launch took this for a crash and
+/// offered Safe Mode (a computer short of network buffers, os error 55, made that happen).
+async fn start_with<F, Fut>(dir: &std::path::Path, safe_mode: bool, serve: F) -> Result<Running, String>
+where
+    F: FnOnce(Engine, ferrocast_server::ServeOptions) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<ferrocast_server::Server>>,
+{
+    let engine = Engine::start_with_mode(dir, safe_mode).await.map_err(|e| e.to_string())?;
     // LAN access is read once here: changing it takes effect the next time Ferrocast starts.
     let opts = ferrocast_server::ServeOptions { lan: engine.settings().lan_access, ..Default::default() };
-    let server = ferrocast_server::serve(engine.clone(), opts)
-        .await
-        .map_err(|e| format!("The local server couldn't start: {e}"))?;
+    let server = match serve(engine.clone(), opts).await {
+        Ok(server) => server,
+        Err(e) => {
+            engine.shutdown();
+            clear_run_markers(Some(&engine));
+            return Err(format!("The local server couldn't start: {e}"));
+        }
+    };
     let token = server.sessions.desktop_token().to_string();
     // Dev builds only: tests drive this window's engine from outside (never in a release).
     #[cfg(debug_assertions)]
@@ -747,21 +1355,129 @@ fn forward_drop(window: &tauri::Window, drop: &tauri::DragDropEvent) {
 }
 
 /// Shows the main window, creating it if it was never opened.
-fn show_window(app: &AppHandle) {
+struct PendingDeepLink(std::sync::Mutex<Option<String>>);
+
+impl PendingDeepLink {
+    /// The link waiting, left in place.
+    fn peek(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Clears the link, but only if it is still `used`: one that arrived since stays for its own turn.
+    fn clear_if(&self, used: &str) -> bool {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_deref() == Some(used) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn is_ferrocast_deeplink(s: &str) -> bool {
+    let lower = s.get(..11).map(str::to_ascii_lowercase);
+    lower.as_deref() == Some("ferrocast:/")
+        && s.get(11..12) == Some("/")
+        && s.len() <= 512
+        && s.is_ascii()
+        && !s.chars().any(char::is_control)
+        && !s.contains('\\')
+}
+
+/// Whether the first window opens at launch. A launch at login stays in the tray, but one that
+/// carries a `ferrocast://` link is a person clicking it: the window opens to show the link.
+fn opens_window_at_start(minimized: bool, has_tray: bool, show_for_safe_mode: bool, has_link: bool) -> bool {
+    !minimized || !has_tray || show_for_safe_mode || has_link
+}
+
+fn store_deeplink_route(uri: &str) -> String {
+    let mut encoded = String::with_capacity(uri.len());
+    for b in uri.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(*b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("#/store?link={encoded}")
+}
+
+/// The links dispatched lately and when: the same link reported again within a moment is one
+/// click, even when another link was reported in between (A, B, A). Bounded and expiring.
+#[derive(Default)]
+struct RecentLink(std::sync::Mutex<Vec<(String, std::time::Instant)>>);
+
+impl RecentLink {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX: usize = 32;
+
+    /// Whether this report is a new click (false: a repeat of one seen within the window, or not a ferrocast link).
+    fn accept(&self, uri: &str, now: std::time::Instant) -> bool {
+        if !is_ferrocast_deeplink(uri) {
+            return false;
+        }
+        let mut seen = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        seen.retain(|(_, at)| now.saturating_duration_since(*at) < Self::WINDOW);
+        if seen.iter().any(|(u, _)| u == uri) {
+            return false;
+        }
+        if seen.len() >= Self::MAX {
+            seen.remove(0);
+        }
+        seen.push((uri.to_string(), now));
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+fn dispatch_deeplink(app: &AppHandle, uri: &str) {
+    if !is_ferrocast_deeplink(uri) {
+        return;
+    }
+    if let Some(recent) = app.try_state::<RecentLink>()
+        && !recent.accept(uri, std::time::Instant::now())
+    {
+        return;
+    }
+    if let Some(pending) = app.try_state::<PendingDeepLink>() {
+        *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(uri.to_string());
+    }
+    show_window(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let detail = serde_json::json!({ "uri": uri });
+        let _ = w.eval(format!("window.dispatchEvent(new CustomEvent('ferrocast:deeplink', {{ detail: {detail} }}))"));
+        if let Some(pending) = app.try_state::<PendingDeepLink>() {
+            *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+}
+
+pub(crate) fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        studio::on_window_shown(app);
         return;
     }
     let Some(running) = app.try_state::<Running>() else {
         return;
     };
+    // Read, not taken: it is cleared below only once the window is really there.
+    let pending_uri = app.try_state::<PendingDeepLink>().and_then(|p| p.peek());
+    let pending_route = pending_uri.as_deref().map(store_deeplink_route);
     // Dev builds only: FERROCAST_DEBUG_ROUTE (e.g. #/studio/golive) opens there, for testing.
     #[cfg(debug_assertions)]
-    let route = std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")).unwrap_or_default();
+    let route = pending_route
+        .or_else(|| std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")))
+        .unwrap_or_default();
     #[cfg(not(debug_assertions))]
-    let route = String::new();
+    let route = pending_route.unwrap_or_default();
     let Ok(url) = format!("{}/app/{route}", running.base).parse() else {
         return;
     };
@@ -793,8 +1509,15 @@ fn show_window(app: &AppHandle) {
             tauri::webview::NewWindowResponse::Deny
         })
         .build();
-    if let Err(e) = built {
-        tracing::error!(error = %e, "couldn't open the window");
+    match built {
+        Ok(win) => {
+            studio::attach_window_watcher(&win);
+            if let (Some(used), Some(pending)) = (&pending_uri, app.try_state::<PendingDeepLink>()) {
+                pending.clear_if(used);
+            }
+        }
+        // The link stays: the next time the window is asked for it opens where the link said.
+        Err(e) => tracing::error!(error = %e, "couldn't open the window"),
     }
 }
 
@@ -888,14 +1611,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         }),
         "panic" => toggle_panic(app),
-        "quit" => app.exit(0),
+        "quit" => quit::request(app),
         _ => {}
     })
     .build(app)?;
     Ok(())
 }
 
-fn with_engine<F, Fut>(app: &AppHandle, f: F)
+pub(crate) fn with_engine<F, Fut>(app: &AppHandle, f: F)
 where
     F: FnOnce(Engine) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -934,6 +1657,36 @@ mod tests {
     use super::*;
 
     const BASE: &str = "http://127.0.0.1:7878";
+
+    /// The link a window is opened for stays until the window is really there, and a newer link
+    /// that arrived meanwhile is never cleared by the older one's success.
+    #[test]
+    fn a_launch_with_a_link_opens_the_window_even_when_started_minimized() {
+        // Login launch, tray present, no link: stays in the tray.
+        assert!(!opens_window_at_start(true, true, false, false));
+        // The same launch carrying a ferrocast:// link: the window opens.
+        assert!(opens_window_at_start(true, true, false, true));
+        // Not minimized, no tray, or Safe Mode: opens as before.
+        assert!(opens_window_at_start(false, true, false, false));
+        assert!(opens_window_at_start(true, false, false, false));
+        assert!(opens_window_at_start(true, true, true, false));
+    }
+
+    #[test]
+    fn a_pending_link_is_cleared_only_after_its_window_opened_and_only_that_link() {
+        let p = PendingDeepLink(std::sync::Mutex::new(Some("ferrocast://store/install/a".into())));
+        // Reading it for the route leaves it: if the window fails to build, the next try has it.
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/a"));
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/a"));
+        // A newer link arrives while the window is being built: the older one's success keeps it.
+        *p.0.lock().unwrap() = Some("ferrocast://store/install/b".into());
+        assert!(!p.clear_if("ferrocast://store/install/a"));
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/b"));
+        // The one that was used is cleared.
+        assert!(p.clear_if("ferrocast://store/install/b"));
+        assert_eq!(p.peek(), None);
+        assert!(!p.clear_if("ferrocast://store/install/b"), "nothing left to clear");
+    }
 
     fn nav(u: &str) -> (bool, bool) {
         navigation(&u.parse().unwrap(), BASE)
@@ -1187,5 +1940,376 @@ mod update_tests {
         let cut = release_notes(Some(&long)).unwrap();
         assert_eq!(cut.chars().count(), NOTES_MAX + 1);
         assert!(cut.ends_with('…'));
+    }
+
+    /// A launch whose server can't open (os error 55 on a Mac short of network buffers) is not a
+    /// crash: its "running" notes are cleared, so the next launch is a normal one and not Safe Mode.
+    #[tokio::test]
+    async fn a_launch_whose_server_cannot_open_leaves_no_crash_marker() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let failed =
+            start_with(dir.path(), false, |_, _| async { Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory)) })
+                .await;
+        let said = failed.err().unwrap_or_else(|| panic!("the launch should have failed"));
+        assert!(said.starts_with("The local server couldn't start"), "{said}");
+        assert!(!dir.path().join("running.json").exists(), "no note of a running launch is left");
+        assert!(
+            !ferrocast_engine::safe_mode::has_unclean_exit(dir.path()),
+            "the next launch must not take this for a crash"
+        );
+    }
+
+    /// The Windows updater ends the process after its `on_before_exit` hook, which calls this: with
+    /// the notes left behind, the next launch reads the update as a crash and opens in Safe Mode.
+    #[tokio::test]
+    async fn the_run_markers_the_updater_clears_are_the_ones_that_start_safe_mode() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = Engine::start_with_mode(dir.path(), false).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(dir.path().join("running.json").exists(), "a running launch leaves its note");
+        assert!(
+            ferrocast_engine::safe_mode::has_unclean_exit(dir.path()),
+            "and the next launch would take it for a crash"
+        );
+        clear_run_markers(Some(&engine));
+        assert!(!dir.path().join("running.json").exists());
+        assert!(
+            !ferrocast_engine::safe_mode::has_unclean_exit(dir.path()),
+            "a launch after the update is a normal one"
+        );
+        engine.shutdown();
+    }
+
+    /// A signal goes to every listener in the process: the tests that send one take turns.
+    #[cfg(unix)]
+    static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `kill` (SIGTERM) used to end Ferrocast with the run markers left behind; it is caught now.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kill_signal_is_caught_so_the_quit_can_run_clean() {
+        let _turn = SIGNAL_TESTS.lock().await;
+        let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("{e}"));
+        let pid = std::process::id().to_string();
+        let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap_or_else(|e| panic!("{e}"));
+        assert!(sent.success());
+        let which = tokio::time::timeout(Duration::from_secs(5), signals.next()).await;
+        assert_eq!(which.ok(), Some("SIGTERM"));
+    }
+
+    /// A second signal while the quit is stuck ends the process (it used to be swallowed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_signal_forces_the_exit_when_the_quit_is_stuck() {
+        let _turn = SIGNAL_TESTS.lock().await;
+        let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("{e}"));
+        let log = std::sync::Mutex::new(Vec::new());
+        let pid = std::process::id().to_string();
+        let term = || {
+            let sent =
+                std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap_or_else(|e| panic!("{e}"));
+            assert!(sent.success());
+        };
+        let task = quit_then_force(
+            &mut signals,
+            || log.lock().unwrap_or_else(|e| e.into_inner()).push("quit"),
+            || log.lock().unwrap_or_else(|e| e.into_inner()).push("force"),
+        );
+        tokio::pin!(task);
+        term();
+        // One signal: asked to quit, nothing forced.
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut task).await.is_err());
+        assert_eq!(*log.lock().unwrap_or_else(|e| e.into_inner()), vec!["quit"]);
+        term();
+        assert!(tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_ok());
+        assert_eq!(*log.lock().unwrap_or_else(|e| e.into_inner()), vec!["quit", "force"]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_quit_signals_register_cleanly() {
+        let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("SetConsoleCtrlHandler failed: {e}"));
+        // No signal sent: polling times out cleanly rather than firing spuriously.
+        assert!(tokio::time::timeout(Duration::from_millis(50), signals.next()).await.is_err());
+    }
+
+    #[test]
+    fn clean_exit_sequence_deletes_markers_only_after_clean_close() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ok = clean_exit_sequence(
+            || log.borrow_mut().push("mark_quitting"),
+            || {
+                log.borrow_mut().push("close_studio");
+                true
+            },
+            || log.borrow_mut().push("shutdown_engine"),
+            || log.borrow_mut().push("clear_markers"),
+        );
+        assert!(ok);
+        assert_eq!(*log.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine", "clear_markers"]);
+
+        let partial = std::cell::RefCell::new(Vec::new());
+        let failed = clean_exit_sequence(
+            || partial.borrow_mut().push("mark_quitting"),
+            || {
+                partial.borrow_mut().push("close_studio");
+                false
+            },
+            || partial.borrow_mut().push("shutdown_engine"),
+            || partial.borrow_mut().push("clear_markers"),
+        );
+        assert!(!failed);
+        assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine"]);
+    }
+
+    #[test]
+    fn windows_update_before_exit_closes_studio_and_engine_before_clearing_markers() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ok = updater_before_exit(
+            || log.borrow_mut().push("mark_quitting"),
+            || {
+                log.borrow_mut().push("close_studio");
+                true
+            },
+            || log.borrow_mut().push("shutdown_engine"),
+            || log.borrow_mut().push("clear_markers"),
+            || log.borrow_mut().push("flush_logs"),
+        );
+        assert!(ok);
+        assert_eq!(
+            *log.borrow(),
+            vec!["mark_quitting", "close_studio", "shutdown_engine", "clear_markers", "flush_logs"]
+        );
+
+        let partial = std::cell::RefCell::new(Vec::new());
+        let failed = updater_before_exit(
+            || partial.borrow_mut().push("mark_quitting"),
+            || {
+                partial.borrow_mut().push("close_studio");
+                false
+            },
+            || partial.borrow_mut().push("shutdown_engine"),
+            || partial.borrow_mut().push("clear_markers"),
+            || partial.borrow_mut().push("flush_logs"),
+        );
+        assert!(!failed);
+        assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine", "flush_logs"]);
+    }
+
+    /// A log writer whose disk is slow (or locked, or rotating) must not slow the threads that log:
+    /// writes return at once and a full queue drops lines; what was queued is written, in order.
+    #[test]
+    fn the_log_writer_never_makes_the_logging_thread_wait() {
+        use std::io::Write;
+        struct Slow(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Slow {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut log = NonBlockingLog::spawn(Slow(got.clone()), 16);
+        let t = std::time::Instant::now();
+        for i in 0..1_000 {
+            log.write_all(format!("line {i}\n").as_bytes()).unwrap();
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(200), "1000 writes took {:?}", t.elapsed());
+        log.flush(std::time::Duration::from_secs(10));
+        let text = String::from_utf8(got.lock().unwrap().clone()).unwrap();
+        assert!(text.starts_with("line 0\n"), "the first lines are kept, in order");
+        assert!(text.lines().count() < 1_000, "a full queue drops lines instead of waiting");
+        assert!(text.contains("log lines were dropped"), "the gap is said in the log: {text}");
+    }
+
+    #[test]
+    fn rotating_log_writer_caps_active_and_backup_while_running() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ferrocast-log-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cap = 64 * 1024u64;
+        let mut w = RotatingLogWriter::open(&dir, cap).unwrap();
+        let line = vec![b'a'; 1024];
+        // Write 1 MB through a 64 KB cap (~16 rotations during a single live session).
+        for _ in 0..1024 {
+            w.write_all(&line).unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+        let cur_len = std::fs::metadata(dir.join("ferrocast.log")).unwrap().len();
+        let bak_len = std::fs::metadata(dir.join("ferrocast.1.log")).unwrap().len();
+        let file_count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(file_count, 2, "only active log and one backup");
+        assert!(cur_len <= cap, "active log exceeded cap: {cur_len} > {cap}");
+        assert!(bak_len <= cap, "backup log exceeded cap: {bak_len} > {cap}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One click must reach the dashboard once, even when the OS and the app both report it (the
+    /// launch's command line and the opened-URL event, or the single-instance relay).
+    #[test]
+    fn the_same_link_reported_twice_in_a_moment_is_dispatched_once() {
+        use std::time::{Duration, Instant};
+        let recent = RecentLink::default();
+        let t0 = Instant::now();
+        let a = "ferrocast://store/install/aurora-pulse";
+        assert!(recent.accept(a, t0), "the first report goes through");
+        assert!(!recent.accept(a, t0 + Duration::from_millis(400)), "the same link again at once is the same click");
+        assert!(
+            recent.accept("ferrocast://store/install/other", t0 + Duration::from_millis(500)),
+            "another link is its own"
+        );
+        assert!(recent.accept(a, t0 + Duration::from_secs(10)), "the same link clicked later is a new click");
+        // Many distinct links never grow the record without bound.
+        for i in 0..500 {
+            assert!(recent.accept(&format!("ferrocast://store/install/x{i}"), t0 + Duration::from_secs(20)));
+        }
+        assert!(recent.len() <= RecentLink::MAX);
+        // Not a ferrocast link: never accepted, never remembered.
+        assert!(!recent.accept("https://evil.example/x", t0 + Duration::from_secs(20)));
+    }
+
+    /// A link that launched the app (cold start) is kept until the window can show it, then the
+    /// same link reported again by the OS does not open the confirmation a second time.
+    #[test]
+    fn a_launch_link_is_pending_once_and_not_repeated_by_the_os() {
+        use std::time::{Duration, Instant};
+        let uri = "ferrocast://store/install/aurora-pulse";
+        let pending = PendingDeepLink(std::sync::Mutex::new(Some(uri.to_string())));
+        let recent = RecentLink::default();
+        let t0 = Instant::now();
+        // The launch itself counts as the first report.
+        assert!(recent.accept(uri, t0));
+        assert_eq!(pending.peek().as_deref(), Some(uri));
+        // macOS then reports the same link as an opened URL: swallowed.
+        assert!(!recent.accept(uri, t0 + Duration::from_millis(250)));
+        assert!(pending.clear_if(uri));
+        assert!(pending.peek().is_none());
+    }
+
+    /// The scheme's registration is in the app's own config, so the bundles carry it.
+    #[test]
+    fn the_ferrocast_scheme_is_registered_in_the_bundle_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json is JSON");
+        let schemes = &conf["plugins"]["deep-link"]["desktop"]["schemes"];
+        assert_eq!(schemes, &serde_json::json!(["ferrocast"]), "{conf}");
+    }
+
+    #[test]
+    fn deeplinks_validate_strictly_and_route_to_store() {
+        assert!(is_ferrocast_deeplink("ferrocast://store/install/aurora-pulse"));
+        assert!(!is_ferrocast_deeplink("https://evil.com/store/install/x"));
+        assert!(!is_ferrocast_deeplink("ferrocast://store/install/x\\y"));
+        assert!(!is_ferrocast_deeplink("ferrocast://store/install/x\ny"));
+        assert_eq!(
+            store_deeplink_route("ferrocast://store/install/aurora-pulse"),
+            "#/store?link=ferrocast%3A%2F%2Fstore%2Finstall%2Faurora-pulse"
+        );
+    }
+
+    #[test]
+    fn bundle_id_matches_tauri_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(conf["identifier"].as_str(), Some(BUNDLE_ID));
+    }
+
+    #[test]
+    fn mac_relaunch_spec_uses_launchservices_after_exit_and_filters_psn_args() {
+        let env_args: Vec<std::ffi::OsString> = vec![
+            "/Applications/Ferrocast.app/Contents/MacOS/ferrocast".into(),
+            "-psn_0_123456".into(),
+            "--minimized".into(),
+        ];
+        let spec = mac_relaunch_spec(Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &env_args, true);
+        assert_eq!(spec.program, "/bin/sh");
+        assert!(!spec.args.iter().any(|a| a == "-n"), "open -n must not be passed: {:?}", spec.args);
+        assert_eq!(
+            spec.args[2..],
+            [
+                std::ffi::OsString::from("ferrocast-relaunch"),
+                "/Applications/Ferrocast.app".into(),
+                "--args".into(),
+                "--minimized".into(),
+                "--safe-mode".into(),
+            ]
+        );
+        let script = spec.args[1].to_string_lossy();
+        assert!(script.contains(MAC_RELAUNCH_WAIT_SH) && script.contains("exec /usr/bin/open"), "{script}");
+
+        // Without extra flags and without a bundle path, falls back to `-b <bundle_id>` with no `--args`.
+        let fallback =
+            mac_relaunch_spec(None, BUNDLE_ID, &["/usr/local/bin/ferrocast".into(), "-psn_0_777".into()], false);
+        assert_eq!(fallback.args[2..], [std::ffi::OsString::from("ferrocast-relaunch"), "-b".into(), BUNDLE_ID.into()]);
+    }
+
+    #[test]
+    fn mac_relaunch_strips_safe_mode_and_deeplinks_and_guards_dying_pid_handoff() {
+        let forwarded = relaunch_forward_args(
+            &[
+                "/Applications/Ferrocast.app/Contents/MacOS/ferrocast".into(),
+                "-psn_0_999".into(),
+                "--safe-mode".into(),
+                "--minimized".into(),
+                "ferrocast://auth/callback?code=abc".into(),
+            ],
+            false,
+        );
+        assert_eq!(forwarded, [std::ffi::OsString::from("--minimized")]);
+
+        let spec = mac_relaunch_spec(Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &[], false);
+        let script = spec.args[1].to_string_lossy();
+        assert!(script.contains("sleep 0.2"), "expected LaunchServices settle sleep in script: {script}");
+        assert!(
+            script.contains(MAC_RELAUNCH_WAIT_SH),
+            "script must block on inherited exit pipe EOF before calling open: {script}"
+        );
+    }
+
+    #[test]
+    fn mac_relaunch_does_not_poll_numeric_pid_with_kill_zero() {
+        let spec = mac_relaunch_spec(Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &[], false);
+        let script = spec.args[1].to_string_lossy();
+        assert!(
+            !script.contains("kill -0"),
+            "relaunch script must not poll PID with kill -0 (vulnerable to PID reuse): {script}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::process::{Command, Stdio};
+
+            // Spawn an unrelated same-UID process to simulate a recycled PID staying alive.
+            let mut unrelated = Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let (reader, writer) = std::io::pipe().unwrap();
+            let wait_script = format!("{MAC_RELAUNCH_WAIT_SH}; printf ready");
+            let mut watcher = Command::new("/bin/sh")
+                .args(["-c", &wait_script])
+                .stdin(Stdio::from(reader))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            assert!(watcher.try_wait().unwrap().is_none(), "watcher must wait while pipe write-end stays open");
+            drop(writer);
+            let out = watcher.wait_with_output().unwrap();
+            assert!(out.status.success(), "watcher failed: {:?}", out.status);
+            assert_eq!(out.stdout, b"ready");
+
+            let _ = unrelated.kill();
+            let _ = unrelated.wait();
+        }
     }
 }

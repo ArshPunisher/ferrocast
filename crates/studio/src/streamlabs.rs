@@ -27,14 +27,16 @@ pub fn scenes_dir() -> Option<PathBuf> {
 }
 
 /// A Streamlabs collection file: its root says so.
-fn is_streamlabs(doc: &Value) -> bool {
+pub(crate) fn is_streamlabs(doc: &Value) -> bool {
     doc.get("nodeType").and_then(Value::as_str) == Some("RootNode")
 }
 
 /// Collection names, from `manifest.json` (`collections: [{ id, name }]`).
 fn names(dir: &Path) -> Map<String, Value> {
     let Some(doc) =
-        std::fs::read(dir.join("manifest.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        crate::import_preview::read_plain_file(&dir.join("manifest.json"), crate::import_preview::MAX_MANIFEST_BYTES)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     else {
         return Map::new();
     };
@@ -65,7 +67,9 @@ pub fn list(dir: &Path) -> Vec<ObsCollection> {
             if id == "manifest" || !valid_id(&id) {
                 return None;
             }
-            let doc: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let bytes =
+                crate::import_preview::read_plain_file(&path, crate::import_preview::MAX_COLLECTION_BYTES).ok()?;
+            let doc: Value = serde_json::from_slice(&bytes).ok()?;
             if !is_streamlabs(&doc) {
                 return None;
             }
@@ -82,10 +86,24 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
     if !valid_id(id) || id == "manifest" {
         return Err(StudioError::Failed("That isn't one of Streamlabs' scene collections.".into()));
     }
-    let bytes = std::fs::read(dir.join(format!("{id}.json")))
-        .map_err(|_| StudioError::Failed("That Streamlabs scene collection isn't there any more.".into()))?;
-    let doc: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| StudioError::Failed(format!("The Streamlabs scene collection didn't read ({e}).")))?;
+    let bytes = crate::import_preview::read_plain_file(
+        &dir.join(format!("{id}.json")),
+        crate::import_preview::MAX_COLLECTION_BYTES,
+    )
+    .map_err(|e| {
+        StudioError::Failed(match e {
+            crate::import_preview::ReadFail::TooBig => {
+                "That Streamlabs scene collection is too large to import.".into()
+            }
+            crate::import_preview::ReadFail::Missing => "That Streamlabs scene collection isn't there any more.".into(),
+        })
+    })?;
+    let doc: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        StudioError::Failed(
+            "That Streamlabs scene collection is damaged and can't be read. Open it in Streamlabs to check it, or start fresh."
+                .into(),
+        )
+    })?;
     if !is_streamlabs(&doc) {
         return Err(StudioError::Failed("That file isn't a Streamlabs scene collection.".into()));
     }
@@ -93,16 +111,31 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
     Ok(to_obs(&doc, &name))
 }
 
-/// A name not taken yet in `taken`: "Name", else "Name(1)", "Name(2)"… (as OBS does).
-fn free_name(taken: &[Value], name: &str) -> String {
-    let used = |n: &str| taken.iter().any(|s| s.get("name").and_then(Value::as_str) == Some(n));
-    let mut out = name.to_string();
-    let mut n = 1;
-    while used(&out) {
-        out = format!("{name}({n})");
-        n += 1;
+/// The names used so far, and for each wanted name where to start counting.
+#[derive(Default)]
+struct Names {
+    used: std::collections::HashSet<String>,
+    next: std::collections::HashMap<String, u32>,
+}
+
+impl Names {
+    /// A name not taken yet: "Name", else "Name(1)", "Name(2)"… (as OBS does). Thousands of
+    /// sources with one name stay quick: each wanted name remembers its last number.
+    fn take(&mut self, name: &str) -> String {
+        let mut out = name.to_string();
+        if self.used.contains(&out) {
+            let n = self.next.entry(name.to_string()).or_insert(1);
+            loop {
+                out = format!("{name}({n})");
+                *n += 1;
+                if !self.used.contains(&out) {
+                    break;
+                }
+            }
+        }
+        self.used.insert(out.clone());
+        out
     }
-    out
 }
 
 /// Streamlabs' filters keep their kind in `type`; OBS's in `id`.
@@ -124,7 +157,7 @@ fn filters(v: &Value) -> Value {
 
 /// Streamlabs' one Screen Capture (game, display or window, picked in `capture_source_list`)
 /// as the OBS kind it stands for.
-fn screen_capture(settings: &mut Map<String, Value>) -> &'static str {
+pub(crate) fn screen_capture(settings: &mut Map<String, Value>) -> &'static str {
     let list = settings.get("capture_source_list").and_then(Value::as_str).unwrap_or("").to_string();
     let kind = list.split(':').next().unwrap_or("");
     let out = match kind {
@@ -175,7 +208,8 @@ pub fn for_this_computer(kind: &str) -> (&str, bool) {
 pub fn to_obs(root: &Value, name: &str) -> Value {
     let mut sources: Vec<Value> = Vec::new();
     // Streamlabs' id → the name it has here (items point at sources by id).
-    let mut by_id: Vec<(String, String)> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut names = Names::default();
     for s in items(root, "sources") {
         let mut settings = s.get("settings").and_then(Value::as_object).cloned().unwrap_or_default();
         let mut kind = s.get("type").and_then(Value::as_str).unwrap_or("").to_string();
@@ -183,7 +217,7 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
             kind = screen_capture(&mut settings).to_string();
         }
         let (here, keep) = for_this_computer(&kind);
-        let out_name = free_name(&sources, s.get("name").and_then(Value::as_str).unwrap_or("Source"));
+        let out_name = names.take(s.get("name").and_then(Value::as_str).unwrap_or("Source"));
         let sync = s
             .get("syncOffset")
             .map(|o| {
@@ -192,7 +226,7 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
             })
             .unwrap_or(0.0) as i64;
         if let Some(id) = s.get("id").and_then(Value::as_str) {
-            by_id.push((id.to_string(), out_name.clone()));
+            by_id.entry(id.to_string()).or_insert_with(|| out_name.clone());
         }
         sources.push(json!({
             "id": here,
@@ -210,16 +244,19 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
     // Scenes are sources too, and items may point at a scene (a nested scene).
     let mut scene_names = Vec::new();
     for sc in &scenes {
-        let n = free_name(&sources, sc.get("name").and_then(Value::as_str).unwrap_or("Scene"));
+        let n = names.take(sc.get("name").and_then(Value::as_str).unwrap_or("Scene"));
         if let Some(id) = sc.get("id").and_then(Value::as_str) {
-            by_id.push((id.to_string(), n.clone()));
+            by_id.entry(id.to_string()).or_insert_with(|| n.clone());
         }
-        // Held as a placeholder so the next scene's name sees it taken.
-        sources.push(json!({ "name": n }));
         scene_names.push(n);
     }
-    sources.truncate(sources.len() - scenes.len());
-    let name_of = |id: &str| by_id.iter().find(|(i, _)| i == id).map(|(_, n)| n.clone());
+    let name_of = |id: &str| by_id.get(id).cloned();
+    // Only scenes (not sources) can be an end of a transition rule.
+    let scene_ids: std::collections::HashMap<String, String> = scenes
+        .iter()
+        .zip(&scene_names)
+        .filter_map(|(sc, n)| Some((sc.get("id")?.as_str()?.to_string(), n.clone())))
+        .collect();
     for (sc, n) in scenes.iter().zip(&scene_names) {
         let list: Vec<Value> = items(sc, "sceneItems")
             .iter()
@@ -257,6 +294,8 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         }));
     }
     let default_t = root.get("transitions").and_then(|t| t.get("defaultTransitionId")).and_then(Value::as_str);
+    let mut tr_names = Names::default();
+    let mut tr_by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let transitions: Vec<Value> = root
         .get("transitions")
         .and_then(|t| t.get("transitions"))
@@ -264,23 +303,57 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         .into_iter()
         .flatten()
         .map(|t| {
+            // Transition names are limited to 100 characters (every later edit checks it), and
+            // "(n)" may be added: keep room for it.
+            // Trimmed first (the Studio trims every name, so "Swipe " and "Swipe" would become one),
+            // and never blank.
+            // Cut to length first, then trimmed again: the cut can leave a space on the end.
+            let named: String =
+                t.get("name").and_then(Value::as_str).unwrap_or("Fade").trim().chars().take(90).collect();
+            let named = named.trim();
+            let wanted: String = if named.is_empty() { "Transition".into() } else { named.to_string() };
+            let t_name = tr_names.take(&wanted);
+            if let Some(id) = t.get("id").and_then(Value::as_str) {
+                tr_by_id.insert(id.to_string(), t_name.clone());
+            }
             json!({
                 "id": t.get("type").cloned().unwrap_or(json!("fade_transition")),
-                "name": t.get("name").cloned().unwrap_or(json!("Fade")),
+                "name": t_name,
                 "settings": t.get("settings").cloned().unwrap_or(json!({})),
                 "duration": t.get("duration").and_then(Value::as_i64).unwrap_or(300),
             })
         })
         .collect();
-    let current_t = root
-        .get("transitions")
-        .and_then(|t| t.get("transitions"))
-        .and_then(Value::as_array)
-        .and_then(|l| l.iter().find(|t| t.get("id").and_then(Value::as_str) == default_t))
-        .and_then(|t| t.get("name").cloned())
-        .unwrap_or(json!(""));
+    let current_t = default_t.and_then(|id| tr_by_id.get(id).cloned()).map(Value::String).unwrap_or_else(|| json!(""));
+    // Streamlabs saves connections in order and plays the first that matches a pair: only that
+    // one is kept (the Studio's own matrix is last-wins, so two for one pair would flip it).
+    let mut matrix: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<(Option<String>, Option<String>)> = std::collections::HashSet::new();
+    for c in root.get("transitions").and_then(|t| t.get("connections")).and_then(Value::as_array).into_iter().flatten()
+    {
+        let Some(tid) = c.get("transitionId").and_then(Value::as_str) else { continue };
+        let Some(tr) = tr_by_id.get(tid) else { continue };
+        // "ALL" (or no end at all) is a wildcard; any other id must be a scene that came across.
+        // A scene deleted in Streamlabs leaves a dead rule: dropped, not turned into "any". An end
+        // of another type (a number) is malformed: dropped too, never a wildcard.
+        let end = |key: &str| -> Option<Option<String>> {
+            match c.get(key) {
+                None | Some(Value::Null) => Some(None),
+                Some(Value::String(s)) if s.is_empty() || s.eq_ignore_ascii_case("all") => Some(None),
+                Some(Value::String(id)) => scene_ids.get(id.as_str()).cloned().map(Some),
+                Some(_) => None,
+            }
+        };
+        let (Some(from), Some(to)) = (end("fromSceneId"), end("toSceneId")) else { continue };
+        if from.is_none() && to.is_none() {
+            continue;
+        }
+        if seen.insert((from.clone(), to.clone())) {
+            matrix.push(json!({ "from": from, "to": to, "transition": tr }));
+        }
+    }
     let first = scene_names.first().cloned().unwrap_or_default();
-    json!({
+    let mut out = json!({
         "name": name,
         "sources": sources,
         "transitions": transitions,
@@ -288,11 +361,32 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         "current_program_scene": first,
         "current_transition": current_t,
         "scene_order": scene_names.iter().map(|n| json!({ "name": n })).collect::<Vec<_>>(),
-    })
+    });
+    if !matrix.is_empty() {
+        out["ferrocast"] = json!({ "transition_matrix": matrix });
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thousands_of_sources_with_one_name_convert_quickly_and_keep_obs_names() {
+        let n = 30_000;
+        let sources: Vec<Value> = (0..n)
+            .map(|i| json!({ "id": format!("s{i}"), "name": "A", "type": "color_source", "settings": {} }))
+            .collect();
+        let root = json!({ "nodeType": "RootNode", "sources": { "items": sources }, "scenes": { "items": [] } });
+        let started = std::time::Instant::now();
+        let out = to_obs(&root, "Big");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let names: Vec<&str> = out["sources"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(names.len(), n);
+        assert_eq!(&names[..3], ["A", "A(1)", "A(2)"]);
+        let unique: std::collections::HashSet<&&str> = names.iter().collect();
+        assert_eq!(unique.len(), n, "every name is its own");
+    }
+
     use super::*;
 
     fn sample() -> Value {
@@ -319,10 +413,124 @@ mod tests {
                 ] } },
                 { "id": "c2", "name": "BRB", "sceneItems": { "items": [ { "sourceId": "s2" } ] } }
             ] },
-            "transitions": { "defaultTransitionId": "t1", "transitions": [
-                { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} }
-            ] }
+            "transitions": {
+                "defaultTransitionId": "t1",
+                "transitions": [
+                    { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} }
+                ],
+                "connections": [
+                    { "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t1" }
+                ]
+            }
         })
+    }
+
+    #[test]
+    fn long_transition_names_stay_editable() {
+        let mut v = sample();
+        let long = "L".repeat(150);
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": long, "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": "L".repeat(150), "type": "fade_transition", "duration": 300, "settings": {} }
+        ]);
+        let doc = to_obs(&v, "Main");
+        for t in doc["transitions"].as_array().unwrap() {
+            assert!(t["name"].as_str().unwrap().chars().count() <= 100);
+        }
+        assert_ne!(doc["transitions"][0]["name"], doc["transitions"][1]["name"]);
+    }
+
+    #[test]
+    fn transition_names_are_trimmed_before_they_are_made_unique() {
+        let mut v = sample();
+        v["transitions"]["defaultTransitionId"] = json!("t2");
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": "Swipe ", "type": "fade_transition", "duration": 300, "settings": {} },
+            { "id": "t3", "name": "   ", "type": "cut_transition", "duration": 0, "settings": {} }
+        ]);
+        v["transitions"]["connections"] = json!([{ "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t2" }]);
+        let doc = to_obs(&v, "Main");
+        let names: Vec<&str> =
+            doc["transitions"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().all(|n| n.trim() == *n && !n.is_empty()), "{names:?}");
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        // The rule and the default point at the Fade one, whatever name it ended up with.
+        let fade = doc["transitions"][1]["name"].clone();
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["transition"], fade);
+        assert_eq!(doc["current_transition"], fade);
+    }
+
+    #[test]
+    fn a_name_cut_to_length_is_trimmed_before_it_is_made_unique() {
+        let base = "A".repeat(89);
+        let mut v = sample();
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": format!("{base} X"), "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": base.clone(), "type": "fade_transition", "duration": 300, "settings": {} }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let names: Vec<&str> =
+            doc["transitions"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().all(|n| n.trim() == *n), "{names:?}");
+        assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn the_first_connection_for_a_pair_is_the_one_streamlabs_plays() {
+        let mut v = sample();
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": "Cut", "type": "cut_transition", "duration": 0, "settings": {} }
+        ]);
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t2" },
+            { "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "ALL", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "ALL", "toSceneId": "c2", "transitionId": "t2" }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let rules = doc["ferrocast"]["transition_matrix"].as_array().unwrap();
+        assert_eq!(rules.len(), 2, "one per pair: {rules:?}");
+        assert_eq!(rules[0]["transition"], "Cut");
+        assert_eq!(rules[1]["transition"], "Swipe");
+        // A first rule that can't be kept (a scene that is gone) doesn't hold the pair.
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": "gone_scene", "toSceneId": "c2", "transitionId": "t2" },
+            { "fromSceneId": "gone_scene", "toSceneId": "c2", "transitionId": "t1" }
+        ]);
+        assert!(to_obs(&v, "Main").get("ferrocast").is_none());
+    }
+
+    #[test]
+    fn a_connection_end_of_the_wrong_type_is_not_a_wildcard() {
+        let mut v = sample();
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": 7, "toSceneId": "c2", "transitionId": "t1" },
+            { "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": null, "toSceneId": "c1", "transitionId": "t1" }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let rules = doc["ferrocast"]["transition_matrix"].as_array().unwrap();
+        // Only the two with the end absent or null: Any -> BRB and Any -> the first scene.
+        assert_eq!(rules.len(), 2, "{rules:?}");
+    }
+
+    #[test]
+    fn dangling_transition_ends_are_dropped_and_all_stays_a_wildcard() {
+        let mut v = sample();
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": "scene_deleted_9", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "ALL", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "c1", "toSceneId": "gone_too", "transitionId": "t1" },
+            { "fromSceneId": "s1", "toSceneId": "c2", "transitionId": "t1" }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let rules = doc["ferrocast"]["transition_matrix"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0]["from"], Value::Null);
+        assert_eq!(rules[0]["to"], "BRB");
     }
 
     #[test]
@@ -348,6 +556,9 @@ mod tests {
         assert_eq!(it[2]["name"], "BRB");
         assert_eq!(doc["current_transition"], "Swipe");
         assert_eq!(doc["transitions"][0]["duration"], 500);
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["from"], "Live(1)");
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["to"], "BRB");
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["transition"], "Swipe");
         assert_eq!(doc["scene_order"].as_array().unwrap().len(), 2);
         if cfg!(target_os = "macos") {
             // Windows devices and captures come in as this Mac's kinds, empty.

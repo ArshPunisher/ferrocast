@@ -11,6 +11,29 @@ use ferrocast_core::event::{Event, Platform};
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use tokio::sync::mpsc;
 
+/// What a video sent to a platform is called and who can see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoUpload {
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    /// "private", "unlisted" or "public".
+    pub privacy: String,
+    /// A video category's number (YouTube), when chosen.
+    pub category_id: Option<String>,
+    pub made_for_kids: bool,
+}
+
+/// The bytes of a file, read piece by piece (so a big video is never held whole).
+pub trait UploadSource: Send {
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Up to `len` bytes from `offset` (fewer only at the end).
+    fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
+}
+
 /// Where adapters send events. Bounded so a flood applies backpressure instead of memory.
 pub type EventSink = mpsc::Sender<Event>;
 
@@ -104,15 +127,52 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "add chapters to a video" })
     }
 
+    /// Sends a video file to the platform's library (YouTube) → its id. `progress` is told the
+    /// bytes sent so far and the total.
+    async fn upload_video(
+        &self,
+        _meta: &VideoUpload,
+        _source: &mut dyn UploadSource,
+        _progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<String> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "upload videos" })
+    }
+
     /// When `login` followed the channel, if the platform says (Unix ms).
     async fn followed_at(&self, _user_id: &str) -> Result<Option<i64>> {
         Ok(None)
     }
 
+    /// Read-only ingest server address for connection tests, pre-flight and upload checks.
+    /// Must never create, bind or mutate broadcasts or stream keys on the platform.
+    /// Platforms whose [`ingest`](Self::ingest) is already read-only inherit it by default.
+    async fn peek_ingest(&self) -> Result<String> {
+        self.ingest().await.map(|i| i.url)
+    }
+
+    /// Read-only vertical ingest server address for connection tests, pre-flight and upload
+    /// checks; must never create, bind or mutate broadcasts or stream keys on the platform.
+    async fn peek_vertical_ingest(&self) -> Result<String> {
+        self.peek_ingest().await
+    }
+
     /// Where this channel streams to and with which key, fetched from the platform so the
-    /// streamer never pastes it (Go live everywhere).
+    /// streamer never pastes it (Go live everywhere). May create or bind a live broadcast
+    /// when actually going live.
     async fn ingest(&self) -> Result<Ingest> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "give out the stream key" })
+    }
+
+    /// The stream keys the vertical canvas is set to send to by hand (a custom server on it): a
+    /// platform that hands out keys must not give any of them to the normal stream. Platforms with
+    /// one key per channel ignore it.
+    fn set_vertical_keys(&self, _keys: Vec<String>) {}
+
+    /// Creates a broadcast for `start_ms` (Unix ms) on the platform, so viewers can find it and
+    /// be reminded, where the platform has scheduled broadcasts (YouTube, Facebook). It never
+    /// goes live by itself: going live stays the streamer's own Go live.
+    async fn schedule_broadcast(&self, _info: &StreamInfo, _start_ms: i64) -> Result<ScheduledBroadcast> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "schedule a broadcast" })
     }
 
     /// Where an upright (vertical) stream goes, made by Ferrocast when needed (YouTube Shorts
@@ -120,6 +180,49 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn vertical_ingest(&self) -> Result<Ingest> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "take a second, vertical stream" })
     }
+
+    /// Current concurrent live viewers for this channel, when live and available.
+    /// Returns `Ok(None)` when offline or when the platform hides the count.
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Reports whether this platform can host a native poll right now.
+    async fn poll_capability(&self) -> Option<ferrocast_core::poll::PlatformPollCapability> {
+        None
+    }
+
+    /// Starts a platform-native poll and returns its external id plus initial tallies.
+    async fn create_native_poll(&self, _spec: &NativePollSpec) -> Result<NativePollTally> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "run native polls" })
+    }
+
+    /// Reads the latest tallies/status for an active or recently closed native poll.
+    async fn get_native_poll(&self, _external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(None)
+    }
+
+    /// Ends a native poll early and returns final tallies when the platform supplies them.
+    async fn end_native_poll(&self, _external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(None)
+    }
+}
+
+/// Request sent to a platform's native poll API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePollSpec {
+    pub question: String,
+    pub options: Vec<String>,
+    /// `None` means "No timer" (Twitch uses 1800s max and terminates early on End).
+    pub duration_s: Option<u32>,
+}
+
+/// Snapshot returned by a platform's native poll API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePollTally {
+    pub external_id: String,
+    pub counts: Vec<u64>,
+    pub ended: bool,
 }
 
 /// A channel's ingest: the server address and the stream key. The key is a secret: it never
@@ -129,6 +232,11 @@ pub struct Ingest {
     /// `rtmp://` or `rtmps://` server address, without the key.
     pub url: String,
     pub key: String,
+    /// Another server for the same key, tried when this one can't be reached (YouTube's backup
+    /// ingest). The same scheme as `url`.
+    pub backup: Option<String>,
+    /// Which key it is, for the destination's details ("Ferrocast · variable"); never the key.
+    pub note: Option<String>,
 }
 
 impl std::fmt::Debug for Ingest {
@@ -138,6 +246,13 @@ impl std::fmt::Debug for Ingest {
 }
 
 pub use ferrocast_core::stream_info::StreamInfo;
+
+/// A broadcast made for a later time: the platform's id for it and a link to it, when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledBroadcast {
+    pub id: String,
+    pub url: Option<String>,
+}
 
 /// One category search result.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

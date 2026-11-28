@@ -1,7 +1,14 @@
 //! Cameras (DirectShow, read by FFmpeg) and microphones (WASAPI, through cpal) on Windows.
 
-use crate::ffsrc::{Live, ffmpeg};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use crate::ffsrc::{Live, Nv12Picture, OpenFail, ProbeFail, ffmpeg, stderr_within};
 use crate::sound_in::{SoundIn, Which};
+use crate::win_logic::{
+    DshowCameraCache, DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options,
+    resolve_dshow_list, resolve_dshow_open_target,
+};
 use crate::{AvError, Picture};
 
 /// A camera or microphone.
@@ -32,21 +39,71 @@ pub fn parse_dshow(text: &str) -> Vec<Device> {
     out
 }
 
-/// Cameras connected now (FFmpeg asks DirectShow; none without FFmpeg yet).
+fn probe_dshow_devices() -> Option<Vec<Device>> {
+    ffmpeg()
+        .ok()
+        .and_then(|ff| {
+            let args: Vec<String> = ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            stderr_within(&ff, &args, Duration::from_secs(4)).ok()
+        })
+        .map(|text| parse_dshow(&text))
+}
+
+fn dshow_cache() -> &'static DshowCameraCache<Device> {
+    static CACHE: OnceLock<DshowCameraCache<Device>> = OnceLock::new();
+    CACHE.get_or_init(DshowCameraCache::default)
+}
+
+/// Cameras connected now (FFmpeg asks DirectShow; bounded by a timeout and shared across
+/// overlapping callers so concurrent checks do not spawn redundant FFmpeg processes).
 pub fn cameras() -> Vec<Device> {
-    let Ok(ff) = ffmpeg() else { return Vec::new() };
-    let mut cmd = std::process::Command::new(ff);
-    cmd.args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+    dshow_cache().get_or_probe(Instant::now, probe_dshow_devices)
+}
+
+fn cameras_fresh() -> Vec<Device> {
+    dshow_cache().get_or_probe_fresh(Instant::now, probe_dshow_devices)
+}
+
+fn resolve_camera_dev(id: &str) -> Result<String, AvError> {
+    if id.starts_with('@') {
+        return Ok(id.to_string());
     }
-    cmd.output().map(|o| parse_dshow(&String::from_utf8_lossy(&o.stderr))).unwrap_or_default()
+    if id.contains(":\\\\") {
+        let lookup = |devs: &[Device]| {
+            let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+            resolve_dshow_open_target(&pairs, id)
+        };
+        let (devs, from_cache) = dshow_cache().get_or_probe_status(Instant::now, probe_dshow_devices);
+        if let Some(dev) = lookup(&devs) {
+            return Ok(dev);
+        }
+        if from_cache && let Some(dev) = lookup(&cameras_fresh()) {
+            return Ok(dev);
+        }
+        return Err(AvError::Source("that camera isn't connected".into()));
+    }
+    Ok(id.to_string())
+}
+
+/// Returns `true` when the camera matching `id` (alternative id, friendly name, or OBS combined
+/// form) is currently enumerated by DirectShow.
+pub fn is_connected(id: &str) -> bool {
+    let devs = cameras();
+    let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+    dshow_matches_id(&pairs, id)
 }
 
 /// Microphones and other inputs connected now.
 pub fn microphones() -> Vec<Device> {
     crate::sound_in::inputs().into_iter().map(|n| Device { id: n.clone(), name: n }).collect()
+}
+
+/// Monotonic counter bumped when connected devices change (no background monitor on Windows).
+pub fn hotplug_epoch() -> u64 {
+    0
 }
 
 /// A running camera or microphone; dropping it stops.
@@ -56,23 +113,64 @@ pub struct Capture {
     sound: Option<SoundIn>,
 }
 
+fn list_dshow_options(dev: &str) -> Result<Vec<DshowOption>, ProbeFail> {
+    let ff = ffmpeg().map_err(|e| ProbeFail::Error(e.to_string()))?;
+    let args: Vec<String> =
+        ["-hide_banner", "-nostdin", "-f", "dshow", "-list_options", "true", "-i", &format!("video={dev}")]
+            .into_iter()
+            .map(String::from)
+            .collect();
+    let text = stderr_within(&ff, &args, Duration::from_secs(4))?;
+    if text.contains("Could not find video device") {
+        return Err(ProbeFail::Missing);
+    }
+    Ok(parse_dshow_options(&text))
+}
+
+fn resolve_dshow_options(res: Result<Vec<DshowOption>, ProbeFail>, dev: &str) -> Result<Vec<DshowOption>, AvError> {
+    let status = match res {
+        Ok(opts) => DshowListStatus::Ok(opts),
+        Err(ProbeFail::Missing) => DshowListStatus::Missing,
+        Err(ProbeFail::Timeout) => {
+            tracing::warn!(dev, "listing camera options timed out; opening with default formats");
+            DshowListStatus::TimedOut
+        }
+        Err(ProbeFail::Error(_)) => DshowListStatus::Failed,
+    };
+    resolve_dshow_list(status).map_err(|msg| AvError::Source(msg.into()))
+}
+
 impl Capture {
-    /// A camera by its id (an OBS-style "Name:\\?\usb#…" works too: its name is used).
+    /// What this capture wants said on the dashboard (nothing here).
+    pub fn take_notice(&self) -> Option<crate::notices::Notice> {
+        None
+    }
+
+    /// A camera by its id (`@alt_id`, OBS `"Name:\\?\usb#…"`, or friendly name), resolving
+    /// OBS-style IDs against the enumerated alternative names so duplicate USB cameras open the
+    /// matching device. Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG
+    /// (e.g. 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
+    /// asked, and device default, and reading NV12 through the pipe.
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
-        let id = spec.id.as_str();
-        let dev = if id.starts_with('@') { id.to_string() } else { id.split(":\\\\").next().unwrap_or(id).to_string() };
-        let open = |asked: bool| {
+        let dev = resolve_camera_dev(&spec.id)?;
+        let options = resolve_dshow_options(list_dshow_options(&dev), &dev)?;
+        let max = spec.size.unwrap_or((1920, 1080));
+        let mut last_err = AvError::Source("FFmpeg couldn't open it".into());
+        for attempt in dshow_attempts(spec, &options) {
             let mut input: Vec<String> = vec!["-f".into(), "dshow".into(), "-rtbufsize".into(), "256M".into()];
-            if asked {
-                input.extend(crate::engine::camera_args(spec));
-            }
+            input.extend(attempt.args);
             input.extend(["-i".into(), format!("video={dev}")]);
-            Live::start(&input, spec.size.unwrap_or((1920, 1080)), spec.fps.unwrap_or(60), None)
-        };
-        // A size or rate the camera can't do: its own instead.
-        let live =
-            open(true).or_else(|e| if spec.size.is_some() || spec.fps.is_some() { open(false) } else { Err(e) })?;
-        Ok(Capture { live: Some(live), sound: None })
+            let fps = attempt.fps_hint.or(spec.fps).unwrap_or(60);
+            match Live::start_nv12_checked(&input, max, fps, None) {
+                Ok(live) => return Ok(Capture { live: Some(live), sound: None }),
+                Err(OpenFail::Timeout) => {
+                    return Err(AvError::Source("FFmpeg timed out opening the camera".into()));
+                }
+                Err(OpenFail::Missing(e)) => return Err(e),
+                Err(OpenFail::Rejected(e)) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
     /// A microphone by name ("default" or empty: the system's).
@@ -80,28 +178,44 @@ impl Capture {
         Ok(Capture { live: None, sound: Some(SoundIn::start(Which::Input(Some(id.to_string())))?) })
     }
 
-    /// The newest picture and when it came (taken).
+    /// The newest picture and when it came (taken), converting NV12 to RGBA when the camera
+    /// delivers NV12 (e.g. one-shot picker thumbnails).
     pub fn take_frame(&self) -> Option<(Picture, u64)> {
-        self.live.as_ref()?.take()
+        let live = self.live.as_ref()?;
+        live.take().or_else(|| {
+            let (nv12, t) = live.take_nv12()?;
+            Some((nv12.to_picture()?, t))
+        })
+    }
+
+    /// The newest NV12 picture and when it came (taken), for GPU upload without CPU RGBA copy.
+    pub fn take_nv12(&self) -> Option<(Nv12Picture, u64)> {
+        self.live.as_ref()?.take_nv12()
     }
 
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
         self.sound.as_ref().map(SoundIn::take_sound).unwrap_or_default()
     }
 
-    /// Pictures received so far.
+    /// Pictures (a camera) or sound pieces (a microphone) received so far.
     pub fn received(&self) -> u64 {
-        self.live.as_ref().map_or(0, Live::frames)
+        self.live.as_ref().map_or(0, Live::frames) + self.sound.as_ref().map_or(0, SoundIn::received)
     }
 
-    /// A camera sends all the time (a microphone here has no count to watch).
+    /// A camera or a microphone sends all the time: quiet for long means it stopped (a
+    /// microphone counted nothing before 20 Nov, so the watchdog never saw one stop).
     pub fn steady(&self) -> bool {
-        self.live.is_some()
+        self.live.is_some() || self.sound.is_some()
     }
 
-    /// Why FFmpeg's camera ended, if it did.
+    /// Why FFmpeg's camera or the microphone ended, if it did.
     pub fn ended(&self) -> Option<String> {
-        self.live.as_ref()?.ended()
+        self.live.as_ref().and_then(Live::ended).or_else(|| self.sound.as_ref()?.ended())
+    }
+
+    /// DirectShow/WASAPI has no separate suspended-interruption state.
+    pub fn interrupted(&self) -> bool {
+        false
     }
 }
 

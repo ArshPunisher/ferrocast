@@ -18,21 +18,68 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::accounts::ConnectFlow;
 use crate::frames::{LiveFrame, NoticeLevel};
-use crate::state::{AccountView, ConnectorView};
+use crate::state::ConnectorView;
 use crate::{Engine, EngineError, now};
 
 pub(crate) const INSTALL: &str = "relay-install";
-const KICK_TOKENS: &str = "kick-tokens";
+
+/// What a 401 from the relay's Kick refresh means (its `error.code`, relay `ApiError`).
+#[derive(Debug, PartialEq, Eq)]
+enum Kick401 {
+    /// Kick refused the refresh token (`sign_in_needed`): the streamer signs in to Kick again.
+    SignInAgain,
+    /// The relay doesn't recognise this install (`unauthorized`): the install is forgotten so the
+    /// next try registers a new one, and the streamer signs in to Kick again, because the relay
+    /// keeps which install owns a Kick channel, and the new install owns none: Kick's events
+    /// would never come, with Kick looking connected (a relay that has forgotten an install
+    /// that signed in to Kick lost its data).
+    InstallForgotten,
+    /// No JSON code (a proxy, another server): not a verdict. Nothing is forgotten, and the
+    /// streamer isn't signed out.
+    Unclear,
+}
+
+fn kick_refresh_401(code: Option<&str>) -> Kick401 {
+    match code {
+        Some("sign_in_needed") => Kick401::SignInAgain,
+        Some("unauthorized") => Kick401::InstallForgotten,
+        _ => Kick401::Unclear,
+    }
+}
+
+#[cfg(test)]
+mod kick_401_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_relays_own_codes_decide_what_a_kick_401_means() {
+        assert_eq!(kick_refresh_401(Some("sign_in_needed")), Kick401::SignInAgain);
+        assert_eq!(kick_refresh_401(Some("unauthorized")), Kick401::InstallForgotten);
+        // A 401 from a proxy, or an HTML page: neither a sign-out nor a reason to forget the
+        // install (that would register a new install on every try).
+        assert_eq!(kick_refresh_401(None), Kick401::Unclear);
+        assert_eq!(kick_refresh_401(Some("something_new")), Kick401::Unclear);
+    }
+}
+pub(crate) const KICK_TOKENS: &str = "kick-tokens";
 
 impl Engine {
     pub(crate) fn relay_url(&self) -> Result<String, EngineError> {
         self.apps().relay_url.clone().ok_or_else(|| {
-            EngineError::Unavailable("This build of Ferrocast has no relay set up, so Kick and tips can't work.".into())
+            EngineError::Unavailable(
+                "This build of Ferrocast has no relay set up, so Kick, Facebook and tips can't work.".into(),
+            )
         })
     }
 
     pub(crate) fn relay_http(&self) -> reqwest::Client {
-        reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap_or_default()
+        self.relay_http_with_timeout(Duration::from_secs(15))
+    }
+
+    /// The relay client with its own total time limit, for a call that sends a big body (a
+    /// crash report is up to ~900 KB: on a slow uplink 15 s is not enough).
+    pub(crate) fn relay_http_with_timeout(&self, total: Duration) -> reqwest::Client {
+        reqwest::Client::builder().timeout(total).build().unwrap_or_default()
     }
 
     /// The install's `id.secret`, registering with the relay the first time.
@@ -109,6 +156,20 @@ impl Engine {
             // The relay no longer knows this install (it removes ones that never connected
             // after a week): forget it, so the next attempt registers a fresh one.
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) if res.status().as_u16() == 401 => {
+                // The relay keeps which install owns a Kick channel: the new install registered
+                // next owns none, so Kick's events would never come with Kick looking connected.
+                // While Kick is signed in, the streamer signs in to Kick again (as when the
+                // relay forgets the install at a Kick refresh).
+                if self.connector(Platform::Kick).is_some() {
+                    let _ = self
+                        .submit(ferrocast_core::event::Event::live(
+                            Platform::Kick,
+                            None,
+                            Millis(0),
+                            ferrocast_core::event::EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
+                }
                 return match self.inner.secrets.delete(INSTALL) {
                     Ok(()) => Err("the relay didn't recognise this install; registering again".into()),
                     Err(e) => {
@@ -180,9 +241,30 @@ impl Engine {
                 let e = ferrocast_kick::map::map(ty, id, &payload["body"], Millis(now().0));
                 let _ = self.submit(e).await;
             }
+            "facebook_connected" => {
+                let done = match ferrocast_facebook::UserGrant::from_relay(payload) {
+                    Some(grant) => self.finish_facebook(grant).await,
+                    None => Err(EngineError::Invalid(
+                        "the relay's Facebook sign-in was not in a form this app reads".into(),
+                    )),
+                };
+                if let Err(e) = done {
+                    self.notice_detail(
+                        "account:facebook",
+                        NoticeLevel::Error,
+                        "Facebook sign-in didn't finish",
+                        &e.to_string(),
+                    );
+                }
+            }
             "kick_connected" => {
                 if let Err(e) = self.finish_kick(payload).await {
-                    self.notice("account:kick", NoticeLevel::Error, &format!("Kick sign-in didn't finish: {e}"));
+                    self.notice_detail(
+                        "account:kick",
+                        NoticeLevel::Error,
+                        "Kick sign-in didn't finish",
+                        &e.to_string(),
+                    );
                 }
             }
             "tip" => {
@@ -254,15 +336,30 @@ impl Engine {
         let api = self.kick_api(tokens)?;
         // Events go to the app's webhook (the relay); subscribe this channel to them.
         if let Err(e) = api.subscribe_events(&user_id).await {
-            self.notice(
+            self.notice_detail(
                 "account:kick",
                 NoticeLevel::Warn,
-                &format!("Kick is connected, but subscribing to its events failed: {e}"),
+                "Kick is connected, without its events",
+                &format!("Subscribing to its events failed: {e}"),
             );
         }
         self.start_kick(api, account);
+        self.push_overlay_links().await;
         self.notice("account:kick", NoticeLevel::Info, "Kick is connected.");
         Ok(())
+    }
+
+    /// Kick refused the refresh: the connector says "sign in again" (the dashboard banner), not only
+    /// the call that failed.
+    async fn kick_sign_in_needed(&self) {
+        let _ = self
+            .submit(ferrocast_core::event::Event::live(
+                Platform::Kick,
+                None,
+                Millis(0),
+                ferrocast_core::event::EventKind::Connector(ConnectorStatus::SignInNeeded),
+            ))
+            .await;
     }
 
     fn kick_api(&self, tokens: KickTokens) -> Result<Arc<KickApi>, EngineError> {
@@ -276,14 +373,37 @@ impl Engine {
                 let res = engine
                     .relay_http()
                     .post(format!("{relay}/v1/kick/refresh"))
-                    .bearer_auth(auth)
+                    .bearer_auth(&auth)
                     .json(&json!({ "refresh_token": refresh_token }))
                     .send()
                     .await
                     .map_err(|e| KickError::Network(e.to_string()))?;
                 match res.status().as_u16() {
                     200..=299 => res.json::<KickTokens>().await.map_err(|e| KickError::Network(e.to_string())),
-                    401 => Err(KickError::SignInNeeded),
+                    401 => {
+                        let code = res
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v.pointer("/error/code").and_then(|c| c.as_str()).map(String::from));
+                        match kick_refresh_401(code.as_deref()) {
+                            Kick401::SignInAgain => {
+                                engine.kick_sign_in_needed().await;
+                                Err(KickError::SignInNeeded)
+                            }
+                            Kick401::InstallForgotten => {
+                                // Forget it so the next try registers again, but only if it is
+                                // still the install this call used: the link may have
+                                // registered a new one meanwhile, which isn't to be dropped.
+                                if engine.inner.secrets.get(INSTALL).ok().flatten().as_deref() == Some(auth.as_str()) {
+                                    let _ = engine.inner.secrets.delete(INSTALL);
+                                }
+                                engine.kick_sign_in_needed().await;
+                                Err(KickError::SignInNeeded)
+                            }
+                            Kick401::Unclear => Err(KickError::Refused("the relay answered 401".into())),
+                        }
+                    }
                     s => Err(KickError::Refused(format!("the relay answered {s}"))),
                 }
             }) as ferrocast_kick::api::RefreshFuture
@@ -300,7 +420,7 @@ impl Engine {
         self.register_connector(Arc::new(KickConnector { api, broadcaster_id: account.user_id.clone() }));
         let mut st = self.state_mut();
         let v = st.connectors.entry("kick".into()).or_insert_with(ConnectorView::off);
-        v.account = Some(AccountView { name: account.display_name.clone(), avatar_url: account.avatar_url.clone() });
+        v.account = Some(crate::accounts::account_view(&account));
         v.state = "connected".into();
         // No standing caveat: the dashboard warns only while the relay link is down.
         v.detail = None;
@@ -312,14 +432,14 @@ impl Engine {
     }
 
     /// On start: Kick saved from an earlier run.
-    pub(crate) async fn resume_kick(&self, account: repo::settings::Account) {
-        let saved = self.inner.secrets.get(KICK_TOKENS).ok().flatten();
-        match saved.and_then(|j| serde_json::from_str::<KickTokens>(&j).ok()) {
-            Some(t) => match self.kick_api(t) {
+    pub(crate) async fn resume_kick(&self, account: repo::settings::Account) -> bool {
+        match crate::accounts::saved_tokens::<KickTokens>(&*self.inner.secrets, KICK_TOKENS) {
+            crate::accounts::Saved::Unreadable => return true,
+            crate::accounts::Saved::Found(t) => match self.kick_api(t) {
                 Ok(api) => self.start_kick(api, account),
                 Err(e) => tracing::warn!(%e, "Kick is saved but can't start"),
             },
-            None => {
+            crate::accounts::Saved::Missing => {
                 let _ = self
                     .submit(ferrocast_core::event::Event::live(
                         Platform::Kick,
@@ -330,6 +450,7 @@ impl Engine {
                     .await;
             }
         }
+        false
     }
 
     /// Sends the tip page settings to the relay; returns the page and webhook URLs.

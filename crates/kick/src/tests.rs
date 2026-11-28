@@ -295,3 +295,188 @@ fn kick_servers_get_ivs_app_when_kick_leaves_it_out() {
     assert_eq!(with_app("rtmps://x.live-video.net:443/app/"), "rtmps://x.live-video.net:443/app");
     assert_eq!(with_app(" rtmps://x/custom "), "rtmps://x/custom");
 }
+
+/// The relay already spent Kick's refresh token when the new one comes back: a save that fails
+/// (a keychain hiccup) must not throw it away, and is tried again at the next use.
+#[tokio::test]
+async fn a_refresh_whose_save_fails_keeps_the_new_tokens_and_saves_them_later() {
+    let (base, seen) = fake_api(true).await;
+    let tokens = KickTokens { access_token: "old".into(), refresh_token: "r".into(), expires_at: now_ms() + 3_600_000 };
+    let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let saved = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (at, sv, sn) = (attempts.clone(), saved.clone(), seen.clone());
+    let kick = KickApi::new(
+        &base,
+        tokens,
+        Arc::new(move |_rt| {
+            let sn = sn.clone();
+            Box::pin(async move {
+                sn.lock().unwrap().refreshed += 1;
+                Ok(KickTokens {
+                    access_token: "new".into(),
+                    refresh_token: "r2".into(),
+                    expires_at: now_ms() + 3_600_000,
+                })
+            })
+        }),
+        Arc::new(move |t| {
+            if at.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err("the keychain is locked".into());
+            }
+            sv.lock().unwrap().push(t.refresh_token.clone());
+            Ok(())
+        }),
+    );
+    assert_eq!(kick.me().await.unwrap().id, "42", "the call goes through on the new tokens");
+    assert_eq!(seen.lock().unwrap().refreshed, 1);
+    assert!(saved.lock().unwrap().is_empty());
+    kick.me().await.unwrap();
+    assert_eq!(*saved.lock().unwrap(), vec!["r2".to_string()], "the next use saved them");
+    assert_eq!(seen.lock().unwrap().refreshed, 1, "no second refresh");
+}
+
+#[test]
+fn parse_kick_viewer_counts_handles_channels_and_livestreams_fixtures() {
+    use crate::api::{KickChannelViewers, parse_channel_viewers, parse_livestream_viewers};
+
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true, "viewer_count": 42 } }] })),
+        KickChannelViewers::Live(42)
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true, "viewer_count": 0 } }] })),
+        KickChannelViewers::Live(0)
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true, "viewer_count": "19" } }] })),
+        KickChannelViewers::Live(19)
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true } }] })),
+        KickChannelViewers::LiveMissingCount
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": false, "viewer_count": 42 } }] })),
+        KickChannelViewers::Offline
+    );
+    assert_eq!(
+        parse_livestream_viewers(
+            &json!({
+                "data": [
+                    { "broadcaster_user_id": 11, "viewer_count": 5 },
+                    { "broadcaster_user_id": 42, "viewer_count": 88 }
+                ]
+            }),
+            Some("42")
+        ),
+        Some(88)
+    );
+    assert_eq!(
+        parse_livestream_viewers(&json!({ "data": [{ "broadcaster_user_id": 99, "viewer_count": "12" }] }), Some("42")),
+        None
+    );
+    assert_eq!(
+        parse_livestream_viewers(
+            &json!({
+                "data": [
+                    { "broadcaster_user_id": 11, "viewer_count": 5 },
+                    { "broadcaster_user_id": 99, "viewer_count": 12 }
+                ]
+            }),
+            Some("42")
+        ),
+        None
+    );
+    assert_eq!(parse_livestream_viewers(&json!({ "data": [{ "viewer_count": 19 }] }), Some("42")), None);
+}
+
+#[tokio::test]
+async fn connector_viewer_count_reads_channels_falls_back_to_livestreams_and_maps_403() {
+    use axum::extract::State;
+    use ferrocast_connector::{Connector, ConnectorError};
+    use ferrocast_core::event::Platform;
+
+    #[derive(Clone, Default)]
+    struct MockSt {
+        calls: Arc<Mutex<Vec<String>>>,
+        channels_body: Arc<Mutex<(axum::http::StatusCode, Value)>>,
+        livestreams_body: Arc<Mutex<(axum::http::StatusCode, Value)>>,
+    }
+
+    let st = MockSt {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        channels_body: Arc::new(Mutex::new((
+            axum::http::StatusCode::OK,
+            json!({ "data": [{ "stream": { "is_live": true, "viewer_count": 42 } }] }),
+        ))),
+        livestreams_body: Arc::new(Mutex::new((
+            axum::http::StatusCode::OK,
+            json!({ "data": [{ "broadcaster_user_id": 42, "viewer_count": 65 }] }),
+        ))),
+    };
+
+    let app = axum::Router::new()
+        .route(
+            "/public/v1/channels",
+            axum::routing::get(|State(st): State<MockSt>| async move {
+                st.calls.lock().unwrap().push("GET /public/v1/channels".into());
+                let (code, body) = st.channels_body.lock().unwrap().clone();
+                (code, axum::Json(body))
+            }),
+        )
+        .route(
+            "/public/v1/livestreams",
+            axum::routing::get(
+                |State(st): State<MockSt>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    st.calls.lock().unwrap().push(format!(
+                        "GET /public/v1/livestreams broadcaster_user_id={}",
+                        q.get("broadcaster_user_id").map(String::as_str).unwrap_or("")
+                    ));
+                    let (code, body) = st.livestreams_body.lock().unwrap().clone();
+                    (code, axum::Json(body))
+                },
+            ),
+        )
+        .with_state(st.clone());
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let c = KickConnector { api: Arc::new(api(&base, seen)), broadcaster_id: "42".into() };
+
+    assert_eq!(c.viewer_count().await.unwrap(), Some(42));
+    assert_eq!(*st.calls.lock().unwrap(), vec!["GET /public/v1/channels"]);
+
+    *st.channels_body.lock().unwrap() =
+        (axum::http::StatusCode::OK, json!({ "data": [{ "stream": { "is_live": true } }] }));
+    assert_eq!(c.viewer_count().await.unwrap(), Some(65), "falls back to /livestreams when stream lacks viewer_count");
+    assert_eq!(
+        *st.calls.lock().unwrap(),
+        vec!["GET /public/v1/channels", "GET /public/v1/channels", "GET /public/v1/livestreams broadcaster_user_id=42",]
+    );
+
+    *st.channels_body.lock().unwrap() =
+        (axum::http::StatusCode::OK, json!({ "data": [{ "stream": { "is_live": false } }] }));
+    assert_eq!(c.viewer_count().await.unwrap(), None, "offline channel does not fall back to /livestreams");
+    assert_eq!(st.calls.lock().unwrap().len(), 4);
+
+    *st.channels_body.lock().unwrap() = (axum::http::StatusCode::FORBIDDEN, json!({ "message": "Forbidden" }));
+    let err = c.viewer_count().await.unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::MissingScope { platform: Platform::Kick, ref scope } if scope == "channel:read"),
+        "expected MissingScope(channel:read), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn kick_poll_capability_reports_chat_fallback() {
+    use ferrocast_connector::Connector;
+    use ferrocast_core::poll::PollCapabilityMode;
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let c = KickConnector { api: Arc::new(api("http://127.0.0.1:1", seen)), broadcaster_id: "42".into() };
+    let cap = c.poll_capability().await.unwrap();
+    assert_eq!(cap.platform, Platform::Kick);
+    assert_eq!(cap.mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(cap.reason.as_deref(), Some("platform_unsupported"));
+}

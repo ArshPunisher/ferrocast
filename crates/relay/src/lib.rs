@@ -19,8 +19,10 @@ pub mod billing;
 pub mod blob;
 pub mod bot;
 pub mod cloud;
+pub mod crash;
 pub mod db;
 pub mod discord;
+pub mod facebook;
 pub mod guests;
 mod history;
 pub mod kick;
@@ -85,10 +87,7 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             // Only the origin counts: pages are served at `/<name>` on that host.
-            tip_url: env("RELAY_TIP_URL")
-                .and_then(|u| reqwest::Url::parse(&u).ok())
-                .map(|u| u.origin().ascii_serialization())
-                .filter(|o| o != "null"),
+            tip_url: env("RELAY_TIP_URL").and_then(|u| config_origin(&u)),
             kick_client_id: env("KICK_CLIENT_ID"),
             kick_client_secret: env("KICK_CLIENT_SECRET"),
             kick_id_url: env("KICK_ID_URL").unwrap_or_else(|| "https://id.kick.com".into()),
@@ -119,6 +118,8 @@ pub struct AppState {
     pub(crate) remote: Arc<remote::Runtime>,
     /// The Ferrocast bot for Discord (off without the `DISCORD_*` settings).
     pub(crate) discord: Arc<discord::Runtime>,
+    /// Facebook sign-in (off without `FACEBOOK_APP_ID` and `FACEBOOK_APP_SECRET`).
+    pub(crate) facebook: Arc<facebook::Runtime>,
     /// The weekly email (off without `BREVO_API_KEY`).
     pub(crate) mail: Arc<mail::Runtime>,
     /// The 24/7 cloud bot (Twitch off without `TWITCH_CLOUD_*`, Kick with the Kick app).
@@ -133,6 +134,8 @@ pub struct AppState {
     pub(crate) cloud: Arc<cloud::Runtime>,
     /// Guest cameras: the PCs' link sockets and the guests waiting for an answer.
     pub(crate) guests: Arc<guests::Runtime>,
+    /// Opt-in crash reports: their limits and counters.
+    pub(crate) crash: Arc<crash::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -156,6 +159,7 @@ impl AppState {
             smart: Arc::default(),
             remote: Arc::default(),
             discord: Arc::default(),
+            facebook: Arc::default(),
             mail: Arc::default(),
             bot: Arc::default(),
             tip_domains: Arc::default(),
@@ -163,10 +167,17 @@ impl AppState {
             accounts: Arc::default(),
             cloud: Arc::default(),
             guests: Arc::default(),
+            crash: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
         }
+    }
+
+    /// Facebook sign-in (`facebook::Config::from_env()` in production).
+    pub fn with_facebook(mut self, cfg: facebook::Config) -> AppState {
+        self.facebook = Arc::new(facebook::Runtime::new(cfg));
+        self
     }
 
     /// Billing settings (`billing::BillingConfig::from_env()` in production).
@@ -268,6 +279,12 @@ impl AppState {
         self
     }
 
+    /// Crash report limits (`crash::Limits::default()` in production, small ones in tests).
+    pub fn with_crash_limits(mut self, limits: crash::Limits) -> AppState {
+        self.crash = Arc::new(crash::Runtime::new(limits));
+        self
+    }
+
     /// Cloud mode (`cloud::CloudConfig::from_env()` in production).
     pub fn with_cloud(mut self, cfg: cloud::CloudConfig) -> AppState {
         self.cloud = Arc::new(cloud::Runtime::new(cfg));
@@ -363,6 +380,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/v1/installs", post(new_install))
         .route("/v1/link", get(link))
+        .route("/v1/facebook/oauth", post(facebook::oauth))
+        .route("/v1/facebook/callback", get(facebook::callback))
         .route("/v1/kick/oauth", post(kick_oauth))
         .route("/v1/kick/callback", get(kick_callback))
         .route("/v1/kick/refresh", post(kick_refresh))
@@ -384,6 +403,7 @@ pub fn router(state: AppState) -> Router {
         .merge(accounts::routes())
         .merge(cloud::routes())
         .merge(guests::routes())
+        .merge(crash::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
@@ -743,7 +763,7 @@ async fn kick_callback(State(st): State<AppState>, Query(q): Query<Callback>) ->
     }
     let payload = json!({
         "tokens": { "access_token": tokens.access_token, "refresh_token": tokens.refresh_token,
-                    "expires_at": now_ms() + tokens.expires_in.clamp(0, 86_400 * 30) * 1000 },
+                    "expires_at": now_ms() + tokens.expires_in.clamp(600, 86_400 * 30) * 1000 },
         "user": { "id": broadcaster, "name": user["name"], "avatar_url": user["profile_picture"] },
     });
     if st.enqueue(&install, "kick_connected", &payload).is_err() {
@@ -775,15 +795,26 @@ async fn kick_refresh(
         st.http.post(format!("{}/oauth/token", st.cfg.kick_id_url)).form(&form).send().await.map_err(|_| {
             ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Couldn't reach Kick. Try again.")
         })?;
+    // Kick refusing the refresh token (400 or 401) is a sign-out; Kick being down or busy, or a
+    // gateway in front of it answering 403, 404 or 408, is not.
+    if !res.status().is_success() && !matches!(res.status().as_u16(), 400 | 401) {
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
+    }
     if !res.status().is_success() {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign_in_needed", "Kick needs you to sign in again."));
+        // Kick answers a refused refresh token with an OAuth error in JSON; a gateway or proxy that
+        // answers 400/401 with anything else is not Kick's verdict.
+        let body = res.text().await.unwrap_or_default();
+        if serde_json::from_str::<Value>(&body).is_ok_and(|v| v.get("error").is_some()) {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign_in_needed", "Kick needs you to sign in again."));
+        }
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
     }
     let t: kick::TokenResponse = res
         .json()
         .await
         .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick sent a bad answer."))?;
     Ok(axum::Json(json!({ "access_token": t.access_token, "refresh_token": t.refresh_token,
-                          "expires_at": now_ms() + t.expires_in.clamp(0, 86_400 * 30) * 1000 }))
+                          "expires_at": now_ms() + t.expires_in.clamp(600, 86_400 * 30) * 1000 }))
     .into_response())
 }
 
@@ -850,3 +881,45 @@ mod lapse_tests;
 mod load_tests;
 #[cfg(test)]
 mod tests;
+
+/// The origin (`https://host:port`) of a configured web address, or None when it isn't an http(s)
+/// address. Only http and https are looked at: `Url::origin()` follows `blob:` URLs by calling
+/// itself once per prefix (RUSTSEC-2026-0592, a stack overflow in url before 2.5.9), so an
+/// address with thousands of them never reaches it.
+pub(crate) fn config_origin(raw: &str) -> Option<String> {
+    let u = reqwest::Url::parse(raw).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(u.origin().ascii_serialization()).filter(|o| o != "null")
+}
+
+#[cfg(test)]
+mod origin_guard_tests {
+    use super::*;
+
+    fn nested() -> String {
+        format!("{}https://example.com/", "blob:".repeat(20_000))
+    }
+
+    #[test]
+    fn a_configured_address_with_thousands_of_blob_prefixes_is_refused_not_a_crash() {
+        assert_eq!(config_origin(&nested()), None);
+        assert_eq!(config_origin("blob:https://example.com/"), None);
+        assert_eq!(config_origin("https://tip.example.com/a/b?x=1").as_deref(), Some("https://tip.example.com"));
+        assert_eq!(config_origin("ftp://example.com/"), None);
+        assert_eq!(config_origin("nonsense"), None);
+    }
+
+    #[test]
+    fn every_config_that_takes_an_origin_survives_the_nested_blob_address() {
+        let n = nested();
+        let cloud = cloud::CloudConfig::new(Some(&n), None, None);
+        assert!(cloud.overlay_origin.is_none());
+        let remote = remote::RemoteConfig::new(Some(&n), None, None).with_web(Some(&n), &[n.as_str()]);
+        assert!(remote.origin.is_none() && remote.web.is_none() && remote.aliases.is_empty());
+        // A good address still works.
+        let ok = remote::RemoteConfig::new(Some("https://r.example.com/x"), None, None);
+        assert_eq!(ok.origin.as_deref(), Some("https://r.example.com"));
+    }
+}

@@ -93,6 +93,10 @@ pub struct Origin {
     /// What it was made from: the template's name, the file's name.
     #[serde(default)]
     pub from: Option<String>,
+    /// An imported design's id inside its file: stays the same across versions of a Store
+    /// package, so an update finds the design it replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// One design. `kind` and `content` travel side by side (`{ "kind": "alert", "content": … }`).
@@ -1130,7 +1134,9 @@ impl WidgetContent {
         if serde_json::to_string(&self.config).map(|s| s.len()).unwrap_or(usize::MAX) > 16 * 1024 {
             return Err("content.config: the settings are too big.".into());
         }
-        layer::validate_widget_style(&self.style).map_err(|e| e.replacen("config.style", "content.style", 1))
+        layer::validate_widget_style(&self.style).map_err(|e| e.replacen("config.style", "content.style", 1))?;
+        crate::overlay::validate_widget_config(self.widget, &self.config)
+            .map_err(|e| e.replacen("config.", "content.config.", 1))
     }
 
     /// The widget config with the style folded in, as an overlay stores it.
@@ -1265,6 +1271,11 @@ fn paid_amount(event: &Event) -> Option<f64> {
 /// Fills `alert` (already rendered from the rule) with the design's look: text from the
 /// look's templates, its media, sound, length and CSS.
 pub fn render_onto(alert: &mut RenderedAlert, design: &Design, key: EventKey, v: &DesignVariation, event: &Event) {
+    // A rule's custom HTML/CSS look is the streamer's explicit choice for this alert: the
+    // overlay would draw the design over it, so the design stays off (as the editor preview shows).
+    if alert.custom.is_some() {
+        return;
+    }
     let vars = event_vars(event);
     let parts = |src: &str| {
         Template::parse(&with_plurals(src))
@@ -1412,7 +1423,7 @@ pub(crate) mod tests {
             pro: false,
             built_in: false,
             branded: false,
-            origin: Origin { kind: OriginKind::Scratch, from: None },
+            origin: Origin { kind: OriginKind::Scratch, from: None, source: None },
             content: DesignContent::Alert(AlertContent { events }),
             created_at: 0,
             updated_at: 0,
@@ -1567,7 +1578,11 @@ pub(crate) mod tests {
         d.built_in = true;
         d.branded = true;
         d.pro = true;
-        let mine = d.into_user("01abc".into(), Origin { kind: OriginKind::Duplicate, from: Some("Molten".into()) }, 7);
+        let mine = d.into_user(
+            "01abc".into(),
+            Origin { kind: OriginKind::Duplicate, from: Some("Molten".into()), source: None },
+            7,
+        );
         assert!(!mine.built_in && !mine.branded && !mine.pro);
         assert_eq!(mine.created_at, 7);
         mine.validate().unwrap();
@@ -1733,7 +1748,7 @@ pub(crate) mod tests {
             pro: false,
             built_in: true,
             branded: true,
-            origin: Origin { kind: OriginKind::BuiltIn, from: None },
+            origin: Origin { kind: OriginKind::BuiltIn, from: None, source: None },
             content: DesignContent::Theme(ThemeContent {
                 scenes: SCENE_KEYS.iter().map(|k| scene(k, "Starting soon")).collect(),
                 alert_design: Some("builtin.molten".into()),
@@ -1747,7 +1762,8 @@ pub(crate) mod tests {
     fn a_copy_of_a_built_in_theme_loses_its_mark_layers() {
         let t = theme();
         assert!(t.has_brand_layer());
-        let mine = t.clone().into_user("mine".into(), Origin { kind: OriginKind::Duplicate, from: None }, 0);
+        let mine =
+            t.clone().into_user("mine".into(), Origin { kind: OriginKind::Duplicate, from: None, source: None }, 0);
         assert!(!mine.has_brand_layer());
         mine.validate().unwrap();
         let mut sneaky = t;
@@ -1850,6 +1866,7 @@ pub(crate) mod tests {
             kinds: vec!["follow".into()],
             platforms: vec![],
             variations: vec![Variation::new("v", "{name} followed!")],
+            interrupt: false,
         };
         let a = render("a", &rule, &rule.variations[0], &e);
         assert!(a.design.is_none());
@@ -2060,5 +2077,22 @@ pub(crate) mod tests {
         j.as_object_mut().unwrap().remove("intensity");
         let back: AlertDesignView = serde_json::from_value(j).unwrap();
         assert!((back.intensity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_custom_look_is_not_overridden_by_the_active_design() {
+        let d = alert_design("d");
+        let e = live("tip", Platform::Twitch);
+        let (key, v) = pick(&d, &e).unwrap();
+        let mut rules = crate::alert::default_rules();
+        let rule = rules.iter_mut().find(|r| r.kinds.iter().any(|k| k == "tip")).unwrap();
+        rule.variations[0].custom_enabled = true;
+        rule.variations[0].html = "<p>{name}</p>".into();
+        let (rule, var) = select(&rules, &e).unwrap();
+        let mut a = render("a1", rule, var, &e);
+        assert!(a.custom.is_some());
+        render_onto(&mut a, &d, key, v, &e);
+        assert!(a.design.is_none(), "the overlay prefers a design, so a custom look must keep it off");
+        assert!(a.custom.is_some());
     }
 }

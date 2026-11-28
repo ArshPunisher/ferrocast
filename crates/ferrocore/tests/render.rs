@@ -393,10 +393,13 @@ fn adjust_sliders_do_what_they_say() {
     assert!(magenta[1] + 6 < magenta[0], "{magenta:?}");
 }
 
-/// OBS's Color Correction: contrast turns round mid-grey (the setting plus one, as OBS's v2).
-/// Before, it only scaled everything: more contrast just brightened the picture.
+/// OBS's v2 Color Correction contrast (`color_correction_filter_update_v2`): the colour times
+/// `1/(1 - c)` below 0 and `c + 1` above, no pivot, in the light the filter works in (linear, as
+/// the engine composes; the 8-bit values below are its sRGB encoding). An imported OBS scene looks
+/// as it does in OBS: v2 contrast -0.5 turns a linear 0.8 pixel (sRGB 231) into 0.533 (193) and a
+/// linear 0.2 pixel (124) into 0.133 (102).
 #[test]
-fn color_correction_contrast_turns_round_mid_grey() {
+fn color_correction_contrast_is_obs_v2_a_plain_multiply() {
     let Some(c) = gpu() else { return };
     let cc = |contrast: f32| ferrocore::Effect::ColorCorrection {
         gamma: 0.0,
@@ -408,11 +411,57 @@ fn color_correction_contrast_turns_round_mid_grey() {
         multiply: 0x00FF_FFFF,
         add: 0,
     };
-    let dark = through(&c, [60, 60, 60], cc(0.5));
-    let light = through(&c, [220, 220, 220], cc(0.5));
-    assert!(dark[0] < 60, "darks go darker: {dark:?}");
-    assert!(light[0] > 220, "lights go lighter: {light:?}");
     assert!(near(through(&c, [150, 150, 150], cc(0.0)), [150, 150, 150], 2), "0 changes nothing");
+    // +0.5 multiplies the light by 1.5: sRGB 60 → 74, 100 → 121 (every grey brighter, as OBS).
+    let (a, b) = (through(&c, [60, 60, 60], cc(0.5)), through(&c, [100, 100, 100], cc(0.5)));
+    assert!(near(a, [74, 74, 74], 2), "{a:?}");
+    assert!(near(b, [121, 121, 121], 2), "{b:?}");
+    // -0.5 multiplies it by 1/1.5: linear 0.8 → 0.533 (231 → 193), 0.2 → 0.133 (124 → 102).
+    let (l, d) = (through(&c, [231, 231, 231], cc(-0.5)), through(&c, [124, 124, 124], cc(-0.5)));
+    assert!(near(l, [193, 193, 193], 2), "0.8 → 0.533: {l:?}");
+    assert!(near(d, [102, 102, 102], 2), "0.2 → 0.133: {d:?}");
+    // Down to OBS's -4.0 (multiplier 0.2) it only darkens, never inverts.
+    for neg in [-2.0f32, -4.0] {
+        let (d, l) = (through(&c, [40, 40, 40], cc(neg)), through(&c, [220, 220, 220], cc(neg)));
+        assert!(d[0] < 40 && l[0] < 220 && d[0] < l[0], "contrast={neg}: d={d:?}, l={l:?}");
+    }
+}
+
+/// ChromaKey and ColorKey with smoothness/spill at 0 (avoiding 0/0 NaN) key out the key colour
+/// and preserve foreground pixels cleanly.
+#[test]
+fn chroma_and_color_key_zero_smoothness_stay_clean() {
+    let Some(c) = gpu() else { return };
+    let ck = ferrocore::Effect::ChromaKey {
+        key: [0, 255, 0],
+        similarity: 400.0,
+        smoothness: 0.0,
+        spill: 0.0,
+        opacity: 1.0,
+        contrast: 0.0,
+        brightness: 0.0,
+        gamma: 0.0,
+    };
+    let keyed = through(&c, [0, 255, 0], ck.clone());
+    let kept = through(&c, [200, 40, 40], ck);
+    assert_eq!(keyed[3], 0, "green keyed out cleanly at smoothness=0: {keyed:?}");
+    assert_eq!(kept[3], 255, "red foreground stays opaque at smoothness=0: {kept:?}");
+    assert!(kept[0] > 180, "red foreground stays clean (no NaN black): {kept:?}");
+
+    let col = ferrocore::Effect::ColorKey {
+        key: [0, 255, 0],
+        similarity: 80.0,
+        smoothness: 0.0,
+        opacity: 1.0,
+        contrast: 0.0,
+        brightness: 0.0,
+        gamma: 0.0,
+    };
+    let keyed2 = through(&c, [0, 255, 0], col.clone());
+    let kept2 = through(&c, [200, 40, 40], col);
+    assert_eq!(keyed2[3], 0, "ColorKey green keyed out at smoothness=0: {keyed2:?}");
+    assert_eq!(kept2[3], 255, "ColorKey red stays opaque at smoothness=0: {kept2:?}");
+    assert!(kept2[0] > 180, "ColorKey red stays clean: {kept2:?}");
 }
 
 /// Lifting the shadows on near-black camera noise brightens it as grey, not as a coloured
@@ -423,4 +472,52 @@ fn adjust_lifts_dark_noise_as_grey() {
     let got = through(&c, [3, 0, 0], with(|v| v[3] = 100.0));
     let spread = got[0].max(got[1]).max(got[2]) - got[0].min(got[1]).min(got[2]);
     assert!(spread <= 24, "a dark speck stays near grey: {got:?}");
+}
+
+/// The first use of each transition kind costs no more than the next ones: its shader pipeline is
+/// built when the Compositor is (a swipe and a slide used to build theirs mid-transition, a late
+/// frame and an 83 ms / 50 ms hole in the stream the first time each was used, 20 Nov). Checked
+/// as what that is, not by a clock (a slow or virtual graphics card, or a busy runner, stretches
+/// every time but not this): no transition pipeline is built by the first use of any kind.
+#[test]
+fn the_first_use_of_each_transition_costs_no_more_than_the_next() {
+    use ferrocore::{Direction, Transition, TransitionKind};
+    use std::time::Instant;
+    let luma = Picture::solid(16, 16, [128, 128, 128, 255]);
+    let kinds: Vec<(&str, TransitionKind)> = vec![
+        ("swipe", TransitionKind::Swipe { direction: Direction::Left, swipe_in: false }),
+        ("slide", TransitionKind::Slide(Direction::Left)),
+        ("fade", TransitionKind::Fade),
+        ("fade to colour", TransitionKind::FadeToColor { rgb: [0, 0, 0], switch_point: 0.5 }),
+        ("luma wipe", TransitionKind::LumaWipe { luma, invert: false, softness: 0.1 }),
+    ];
+    for (name, kind) in kinds {
+        let Some(c) = gpu() else { return };
+        let scene = |rgba| Scene {
+            width: 1280,
+            height: 720,
+            items: vec![item(Picture::solid(1280, 720, rgba), Placement::default())],
+        };
+        let mk =
+            |t: f32| Transition { kind: kind.clone(), t, from: scene([255, 0, 0, 255]), to: scene([0, 0, 255, 255]) };
+        // The engine has drawn frames before a transition: warm the scene drawing and the readback.
+        for _ in 0..3 {
+            let _ = c.render_transition_nv12(&Transition { kind: TransitionKind::Cut, t: 0.0, ..mk(0.0) });
+        }
+        let built = c.transition_pipeline_count();
+        assert!(built > 0, "{name}: the compositor builds the transitions' pipelines when it is made");
+        let t0 = Instant::now();
+        let _ = c.render_transition_nv12(&mk(0.3)).unwrap_or_else(|e| panic!("{e}"));
+        let first = t0.elapsed();
+        for i in 0..8 {
+            let _ = c.render_transition_nv12(&mk(0.35 + i as f32 * 0.05)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // For the log only: how long the first and a later one took here.
+        eprintln!("{name}: first {first:?}");
+        assert_eq!(
+            c.transition_pipeline_count(),
+            built,
+            "{name}: its first use built a pipeline (mid-transition, that is a late frame)"
+        );
+    }
 }

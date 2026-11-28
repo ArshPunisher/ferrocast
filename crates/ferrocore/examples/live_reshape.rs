@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         retry: Retry::default(),
         extra_audio: false,
         extra_video: false,
+        backup: None,
     };
     let pusher = rt.spawn(push::run(dest, hub.clone(), health_tx, stop));
 
@@ -62,6 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate: RateControl::Cbr,
         keyframe_secs: 2,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
+        bframes: false,
+        preset: None,
+        tune: None,
     };
     let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
     let e = Engine::new(config, video(1920, 1080, 60), audio)?;

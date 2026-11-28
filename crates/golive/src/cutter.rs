@@ -76,8 +76,7 @@ pub async fn run(
         }
         let Some((w, h)) = size else {
             state.send_replace(CutState::Failed {
-                reason: "OBS's stream didn't say its size, so Ferrocast can't cut it. Restart the stream in OBS."
-                    .into(),
+                reason: "Can't cut vertical: the stream didn't say its size. Restart it.".into(),
             });
             wait_for_end(&hub, &mut stop).await;
             continue;

@@ -179,7 +179,10 @@ impl Camera {
             track: 0,
             scaled_from: ((cw, ch) != size).then_some((size.0, size.1, Filter::Bicubic)),
             more_tracks: Vec::new(),
+            track_names: Vec::new(),
             video_tracks: Vec::new(),
+            // The camera shows the whole picture, whatever the stream and recording differ in.
+            audience: ferrocore::engine::Audience::Everyone,
         };
         let writers = Arc::new(Mutex::new(Writers {
             local: Writer::new(region),

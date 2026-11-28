@@ -1,18 +1,49 @@
 //! Helix requests: one place that adds auth, retries once after a 401 with a refreshed
 //! token, and turns 403/429 into errors the dashboard can explain (R-19).
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use ferrocast_connector::NativePollTally;
+use ferrocast_core::poll::PollLimits;
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{Auth, TwitchError};
 
+pub const TWITCH_POLL_LIMITS: PollLimits = PollLimits {
+    min_options: 2,
+    max_options: 5,
+    min_duration_s: 15,
+    max_duration_s: 1800,
+    supports_no_timer: true,
+    question_chars: 60,
+    option_chars: 25,
+};
+
+pub fn is_affiliate_or_partner(broadcaster_type: &str) -> bool {
+    matches!(broadcaster_type, "affiliate" | "partner")
+}
+
 #[derive(Debug, Clone)]
 pub struct Helix {
     pub(crate) auth: Arc<Auth>,
+    /// The ingest server last picked from Twitch's list, and when (see `nearest_ingest`).
+    pub(crate) ingest: Arc<Mutex<Option<(Instant, String)>>>,
+    /// How long a picked server is reused before the list is read again.
+    pub(crate) ingest_keep: Duration,
+    /// Cached `GET /users` `broadcaster_type` (`"affiliate"`, `"partner"`, or `""`).
+    pub(crate) broadcaster_type: Arc<Mutex<Option<String>>>,
+    /// Set if a live Helix poll request returned `MissingScope`.
+    pub(crate) poll_scope_missing: Arc<AtomicBool>,
 }
+
+/// A 429 that asks for this long or less is waited out and tried again; a longer one is told.
+const RETRY_UP_TO: Duration = Duration::from_secs(5);
+/// How many times one request is tried again after a 429.
+const RATE_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct User {
@@ -21,11 +52,58 @@ pub struct User {
     pub display_name: String,
     #[serde(default)]
     pub profile_image_url: String,
+    #[serde(default)]
+    pub broadcaster_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TwitchPoll {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub choices: Vec<TwitchPollChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TwitchPollChoice {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub votes: u64,
+}
+
+impl TwitchPoll {
+    pub fn into_tally(self) -> NativePollTally {
+        NativePollTally {
+            external_id: self.id,
+            counts: self.choices.into_iter().map(|c| c.votes).collect(),
+            ended: !self.status.eq_ignore_ascii_case("ACTIVE"),
+        }
+    }
 }
 
 impl Helix {
     pub fn new(auth: Arc<Auth>) -> Self {
-        Helix { auth }
+        Helix {
+            auth,
+            ingest: Arc::new(Mutex::new(None)),
+            ingest_keep: crate::ingest::INGEST_KEEP,
+            broadcaster_type: Arc::new(Mutex::new(None)),
+            poll_scope_missing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether a live poll call previously hit `MissingScope` on this connection.
+    #[must_use]
+    pub fn is_poll_scope_missing(&self) -> bool {
+        self.poll_scope_missing.load(Ordering::Relaxed)
+    }
+
+    /// How long a picked ingest server is reused (the default is an hour; zero reads the list each time).
+    #[must_use]
+    pub fn with_ingest_cache(mut self, keep: Duration) -> Self {
+        self.ingest_keep = keep;
+        self
     }
 
     /// Sends a request; on 401 refreshes the token once and tries again.
@@ -37,7 +115,8 @@ impl Helix {
         body: Option<Value>,
     ) -> Result<Value, TwitchError> {
         let mut token = self.auth.access().await?;
-        for attempt in 0..2 {
+        let (mut refreshed, mut limited) = (false, 0u32);
+        loop {
             let mut req = self
                 .auth
                 .http
@@ -49,19 +128,58 @@ impl Helix {
                 req = req.json(b);
             }
             let res = req.send().await.map_err(TwitchError::network)?;
-            if res.status().as_u16() == 401 && attempt == 0 {
+            if res.status().as_u16() == 401 && !refreshed {
+                // A missing scope is also a 401: refreshing wouldn't help, and each refresh spends
+                // Twitch's single-use refresh token (the M10 scan). Only an expired token is
+                // refreshed.
+                let err = TwitchError::from_response(res).await;
+                if matches!(err, TwitchError::MissingScope(_)) {
+                    return Err(err);
+                }
                 token = self.auth.refresh_after_401(&token).await?;
+                refreshed = true;
+                // A beat before using the new token: the API edge can take a moment to know it.
+                tokio::time::sleep(Duration::from_millis(400)).await;
                 continue;
+            }
+            if res.status().as_u16() == 401 && refreshed {
+                // Refused again with a token just issued. A missing scope says so (the permission
+                // to fix); otherwise the first times it is more likely the API edge catching up than
+                // the streamer being signed out, so it is said as a network trouble and the connector
+                // retries with its backoff; refused three times in a row, the sign-in no longer works.
+                let err = TwitchError::from_response(res).await;
+                if matches!(err, TwitchError::MissingScope(_)) {
+                    return Err(err);
+                }
+                if self.auth.note_fresh_refused() >= 3 {
+                    return Err(TwitchError::SignInNeeded);
+                }
+                return Err(TwitchError::Network("Twitch didn't accept a fresh sign-in yet".into()));
+            }
+            if res.status().as_u16() == 429 {
+                // The request wasn't done: waiting until the budget is back (Ratelimit-Reset) and
+                // sending it again is safe for any method, and a burst during a hype train is
+                // seconds. A longer wait is the person's to be told.
+                let err = TwitchError::from_response(res).await;
+                match err {
+                    TwitchError::RateLimited(wait) if wait <= RETRY_UP_TO && limited < RATE_RETRIES => {
+                        limited += 1;
+                        tracing::debug!(?wait, path, "Twitch asked for a pause; trying again");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    e => return Err(e),
+                }
             }
             if !res.status().is_success() {
                 return Err(TwitchError::from_response(res).await);
             }
+            self.auth.note_accepted();
             if res.status().as_u16() == 204 {
                 return Ok(Value::Null);
             }
             return res.json().await.map_err(TwitchError::network);
         }
-        Err(TwitchError::SignInNeeded)
     }
 
     pub async fn me(&self) -> Result<User, TwitchError> {
@@ -71,7 +189,93 @@ impl Helix {
             .and_then(|d| d.get(0))
             .cloned()
             .ok_or_else(|| TwitchError::Protocol("no user returned".into()))?;
-        serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))
+        let user: User = serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))?;
+        *self.broadcaster_type.lock().unwrap_or_else(|p| p.into_inner()) = Some(user.broadcaster_type.clone());
+        Ok(user)
+    }
+
+    /// Returns cached `broadcaster_type` (`"affiliate"`, `"partner"`, or `""`), fetching `/users` once if unset.
+    pub async fn broadcaster_type(&self) -> Result<String, TwitchError> {
+        if let Some(bt) = self.broadcaster_type.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Ok(bt);
+        }
+        Ok(self.me().await?.broadcaster_type)
+    }
+
+    pub fn mark_non_affiliate(&self) {
+        *self.broadcaster_type.lock().unwrap_or_else(|p| p.into_inner()) = Some(String::new());
+    }
+
+    /// Starts a Twitch Helix poll (`duration` clamped to 15..=1800s; No-timer uses 1800s and ends early).
+    pub async fn create_poll(
+        &self,
+        broadcaster: &str,
+        title: &str,
+        choices: &[String],
+        duration_s: u32,
+    ) -> Result<TwitchPoll, TwitchError> {
+        let choice_objs: Vec<Value> = choices.iter().map(|c| json!({ "title": c })).collect();
+        let body = json!({
+            "broadcaster_id": broadcaster,
+            "title": title,
+            "choices": choice_objs,
+            "duration": duration_s.clamp(15, 1800),
+        });
+        match self.call(Method::POST, "/polls", &[], Some(body)).await {
+            Ok(v) => {
+                self.poll_scope_missing.store(false, Ordering::Relaxed);
+                parse_poll_first(v)
+            }
+            Err(TwitchError::MissingScope(m)) => {
+                self.poll_scope_missing.store(true, Ordering::Relaxed);
+                Err(TwitchError::MissingScope(m))
+            }
+            Err(TwitchError::Refused(m)) => {
+                let lower = m.to_lowercase();
+                if lower.contains("affiliate") || lower.contains("partner") {
+                    self.mark_non_affiliate();
+                }
+                Err(TwitchError::Refused(m))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reads the current state of one Helix poll by id.
+    pub async fn get_poll(&self, broadcaster: &str, id: &str) -> Result<Option<TwitchPoll>, TwitchError> {
+        let v = self.call(Method::GET, "/polls", &[("broadcaster_id", broadcaster), ("id", id)], None).await?;
+        let Some(first) = v.get("data").and_then(|d| d.get(0)).cloned() else {
+            return Ok(None);
+        };
+        serde_json::from_value(first).map(Some).map_err(|e| TwitchError::Protocol(e.to_string()))
+    }
+
+    /// Ends an active Twitch Helix poll (`status: "TERMINATED"`) and returns its final counts.
+    pub async fn end_poll(&self, broadcaster: &str, id: &str) -> Result<Option<TwitchPoll>, TwitchError> {
+        let body = json!({
+            "broadcaster_id": broadcaster,
+            "id": id,
+            "status": "TERMINATED",
+        });
+        match self.call(Method::PATCH, "/polls", &[], Some(body)).await {
+            Ok(v) => {
+                self.poll_scope_missing.store(false, Ordering::Relaxed);
+                parse_poll_first(v).map(Some)
+            }
+            Err(TwitchError::MissingScope(m)) => {
+                self.poll_scope_missing.store(true, Ordering::Relaxed);
+                Err(TwitchError::MissingScope(m))
+            }
+            Err(TwitchError::Refused(m)) => {
+                if let Ok(Some(existing)) = self.get_poll(broadcaster, id).await
+                    && !existing.status.eq_ignore_ascii_case("ACTIVE")
+                {
+                    return Ok(Some(existing));
+                }
+                Err(TwitchError::Refused(m))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The game a channel last streamed (`game_name` of Get Channel Information), by login.
@@ -175,4 +379,31 @@ impl Helix {
             Err(e) => Err(e),
         }
     }
+
+    /// Concurrent viewer count for `broadcaster` from `GET /streams?user_id=<id>`.
+    /// Returns `Ok(None)` when offline or not currently `"live"`.
+    pub async fn stream_viewers(&self, broadcaster: &str) -> Result<Option<u64>, TwitchError> {
+        let v = self.call(Method::GET, "/streams", &[("user_id", broadcaster)], None).await?;
+        Ok(parse_stream_viewers(&v))
+    }
+}
+
+fn parse_poll_first(v: Value) -> Result<TwitchPoll, TwitchError> {
+    let first = v
+        .get("data")
+        .and_then(|d| d.get(0))
+        .cloned()
+        .ok_or_else(|| TwitchError::Protocol("no poll returned".into()))?;
+    serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))
+}
+
+/// Extracts `viewer_count` from a Helix `GET /streams` response when a stream is `"live"`.
+pub fn parse_stream_viewers(v: &Value) -> Option<u64> {
+    let items = v.get("data").and_then(Value::as_array)?;
+    items.iter().find_map(|s| {
+        if s.get("type").and_then(Value::as_str) != Some("live") {
+            return None;
+        }
+        s.get("viewer_count").and_then(Value::as_u64)
+    })
 }

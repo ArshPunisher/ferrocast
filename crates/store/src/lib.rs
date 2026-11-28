@@ -9,6 +9,7 @@ mod error;
 
 pub mod backup;
 pub mod designfile;
+pub mod durable;
 pub mod import;
 pub mod repo;
 
@@ -37,3 +38,4 @@ pub fn new_id() -> String {
     ulid::Ulid::generate().to_string().to_lowercase()
 }
 pub mod pack;
+pub mod studio_library;

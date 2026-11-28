@@ -18,6 +18,7 @@ use crate::extract::Body;
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/golive", get(view))
+        .route("/golive/quality-options", get(quality_options))
         .route("/golive/ingest", get(ingest))
         .route("/golive/destinations", put(order).post(add))
         .route("/golive/destinations/{id}", delete(remove))
@@ -26,6 +27,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/networks", get(networks))
         .route("/golive/destinations/{id}/light", put(light))
         .route("/golive/destinations/{id}/enhanced", put(enhanced))
+        .route("/golive/destinations/{id}/quality", put(quality))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
@@ -47,6 +49,11 @@ async fn view(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.golive_view().await))
 }
 
+/// `GET /golive/quality-options`: per-destination quality rungs, limits, sharing hints, and PC budget.
+async fn quality_options(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.golive_quality_options().await))
+}
+
 /// The local server and key, to type into OBS by hand. Never sent to a paired phone
 /// (not in the remote allow-list).
 async fn ingest(State(app): State<AppState>) -> ApiResult<Json<Value>> {
@@ -59,6 +66,12 @@ async fn ingest(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 #[serde(deny_unknown_fields)]
 struct OrderBody {
     destinations: Vec<OrderItem>,
+    /// Add a destination although the last upload check says it won't fit.
+    #[serde(default)]
+    confirm_upload: bool,
+    /// Stop sending to the last destination (the stream and the recording go on).
+    #[serde(default)]
+    confirm_last: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,8 +82,9 @@ struct OrderItem {
 }
 
 async fn order(State(app): State<AppState>, Body(b): Body<OrderBody>) -> ApiResult<Json<Value>> {
+    let confirm = ferrocast_engine::golive::DestinationConfirm { upload: b.confirm_upload, last: b.confirm_last };
     let order = b.destinations.into_iter().map(|d| (d.id, d.enabled)).collect();
-    Ok(Json(json!(app.engine.set_golive_destinations(order).await?)))
+    Ok(Json(json!(app.engine.set_golive_destinations_checked(order, confirm).await?)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +96,9 @@ struct AddBody {
     /// `vertical` for a server that takes OBS's vertical canvas.
     #[serde(default)]
     canvas: ferrocast_engine::golive::Canvas,
+    /// `x`, `instagram` or `facebook`: a server and key pasted from that platform's own app.
+    #[serde(default)]
+    brand: Option<String>,
 }
 
 /// "Test connection" on a saved destination → `{ ok, rtt_ms?, message, srt_latency_ms? }`.
@@ -108,7 +125,7 @@ async fn test_address(State(app): State<AppState>, Body(b): Body<TestBody>) -> A
 }
 
 async fn add(State(app): State<AppState>, Body(b): Body<AddBody>) -> ApiResult<Response> {
-    let d = app.engine.add_golive_destination(&b.name, &b.url, &b.key, b.canvas).await?;
+    let d = app.engine.add_golive_destination_branded(&b.name, &b.url, &b.key, b.canvas, b.brand.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(json!(d))).into_response())
 }
 
@@ -131,6 +148,35 @@ async fn enhanced(
     Body(b): Body<OnBody>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.set_golive_enhanced(&id, b.on).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum QualityBody {
+    SameAsMain {},
+    Custom { width: u32, height: u32, fps: u32, kbps: u32, codec: Option<ferrocast_engine::golive::VideoCodec> },
+}
+
+impl From<QualityBody> for ferrocast_engine::golive::DestinationQuality {
+    fn from(b: QualityBody) -> Self {
+        match b {
+            QualityBody::SameAsMain {} => Self::SameAsMain,
+            QualityBody::Custom { width, height, fps, kbps, codec } => {
+                Self::Custom(ferrocast_engine::golive::CustomQuality { width, height, fps, kbps, codec })
+            }
+        }
+    }
+}
+
+/// `PUT /golive/destinations/{id}/quality`: set per-destination quality (`same_as_main` or `custom`).
+async fn quality(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Body(b): Body<QualityBody>,
+) -> ApiResult<Json<Value>> {
+    let quality = ferrocast_engine::golive::DestinationQuality::from(b);
+    app.engine.set_golive_quality(&id, quality).await?;
+    Ok(Json(json!(app.engine.golive_view().await)))
 }
 
 async fn remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {

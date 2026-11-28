@@ -90,8 +90,9 @@ ssh "$host" "sudo mkdir -p $dir && sudo chmod 755 $dir"
 ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-compose.yml" < "$repo/deploy/docker-compose.yml"
 # Pro's Razorpay settings (RAZORPAY_*, PRO_SALES_OPEN, PRO_EMAIL_KEY), the vault key
 # (RELAY_VAULT_KEY) and the Ferrocast voices key and cap (GOOGLE_TTS_KEY,
-# TTS_GLOBAL_MONTHLY_CHARS) live only on the server, written there by razorpay-keys.sh,
-# vault-key.sh or by hand: they're carried over from the current relay.env on the server
+# TTS_GLOBAL_MONTHLY_CHARS) and the Facebook app keys (FACEBOOK_APP_ID, FACEBOOK_APP_SECRET:
+# the app secret never leaves the relay) live only on the server, written there by
+# razorpay-keys.sh, vault-key.sh or by hand: they're carried over from the current relay.env on the server
 # itself, so they never travel to this Mac and a config update can't wipe them.
 {
   printf 'RELAY_PUBLIC_URL=https://ferrocast-relay.clearcraftlabs.com\n'
@@ -113,7 +114,7 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
 } | ssh "$host" "sudo sh -c 'umask 077 && cat > $dir/relay.env.new &&
-    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|RELAY_REMOTE_PEPPER|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS|DISCORD_[A-Z_]+|BREVO_API_KEY|MAIL_FROM|MAIL_TOKEN_KEY|MAIL_DAILY_BUDGET|TWITCH_CLOUD_[A-Z_]+|YOUTUBE_CLOUD_[A-Z_]+|CF_SAAS_TOKEN|CF_ZONE_ID|RELAY_ADMIN_TOKEN|RELAY_GOOGLE_CLIENT_ID|RELAY_GOOGLE_CLIENT_SECRET|RELAY_REMOTE_LOGIN|CLOUDFLARE_AI_ACCOUNT_ID|CLOUDFLARE_AI_TOKEN|GEMINI_API_KEY|SMART_[A-Z_]+)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
+    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|RELAY_REMOTE_PEPPER|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS|DISCORD_[A-Z_]+|BREVO_API_KEY|MAIL_FROM|MAIL_TOKEN_KEY|MAIL_DAILY_BUDGET|TWITCH_CLOUD_[A-Z_]+|YOUTUBE_CLOUD_[A-Z_]+|CF_SAAS_TOKEN|CF_ZONE_ID|RELAY_ADMIN_TOKEN|RELAY_GOOGLE_CLIENT_ID|RELAY_GOOGLE_CLIENT_SECRET|RELAY_REMOTE_LOGIN|CLOUDFLARE_AI_ACCOUNT_ID|CLOUDFLARE_AI_TOKEN|GEMINI_API_KEY|SMART_[A-Z_]+|FACEBOOK_APP_ID|FACEBOOK_APP_SECRET)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
     chown $owner:$owner $dir/relay.env.new && chmod 600 $dir/relay.env.new && mv $dir/relay.env.new $dir/relay.env'"
 # Builds go up as dated releases and switch with one rename (dashboard-swap.sh).
 release="$(date -u +%Y%m%d%H%M%S)"

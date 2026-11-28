@@ -7,6 +7,8 @@ use serde::Serialize;
 
 /// Looks kept (two seconds apart: the last ten seconds).
 const KEEP: usize = 6;
+/// Frames drawn with none sent for this long (ms) is a stalled stream.
+const STALL_AFTER_MS: u64 = 5_000;
 
 /// The counters at one look (running totals since the stream started, except the "now" ones).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -19,6 +21,8 @@ pub struct Sample {
     pub skipped: u64,
     /// Frames sent, and dropped on the way out (the Studio's own sender).
     pub sent: u64,
+    /// Bytes the sender has delivered (a stall shows here; frames drawn keep counting).
+    pub sent_bytes: u64,
     pub dropped: u64,
     /// Packets the platforms' senders dropped (all told).
     pub net_dropped: u64,
@@ -43,6 +47,9 @@ pub struct Health {
     /// What costs the most, in words (None at 100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// What to do about it, behind an (i) (None with the reason).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// The score's memory: the last few looks.
@@ -86,58 +93,87 @@ impl HealthMeter {
         let d = |a: u64, b: u64| a.saturating_sub(b);
         // Each trouble costs points (the worst named): 1% of frames late, skipped or dropped
         // costs 4, up to 40 each.
-        let mut costs: Vec<(f64, String)> = vec![
+        // (points lost, what it is in a few words, what to do about it)
+        let mut costs: Vec<(f64, String, &str)> = vec![
             (
                 (share(d(s.lagged, first.lagged), d(s.frames, first.frames)) * 400.0).min(40.0),
                 if self.encoder_late_share() >= 0.5 {
-                    "frames are late: the video encoder can't keep up (a lower resolution or frame rate helps)".into()
+                    "the encoder can't keep up".into()
                 } else {
-                    "frames are drawn late: the computer is busy (fewer sources or a lower frame rate helps)".into()
+                    "the computer is busy".into()
+                },
+                if self.encoder_late_share() >= 0.5 {
+                    "Lower the resolution or the frame rate."
+                } else {
+                    "Use fewer sources or a lower frame rate."
                 },
             ),
             (
                 (share(d(s.skipped, first.skipped), d(s.encoded, first.encoded)) * 400.0).min(40.0),
-                "the encoder is falling behind (the hardware encoder or a lower quality helps)".into(),
+                "the encoder is behind".into(),
+                "Use the hardware encoder, or a lower quality.",
             ),
             (
                 (share(d(s.dropped, first.dropped), d(s.sent, first.sent)) * 400.0).min(40.0),
-                "frames are dropped on the way out: the upload is struggling".into(),
+                "the upload is struggling".into(),
+                "Frames are being dropped on the way out. Lower the bitrate, or use a wired connection.",
             ),
             (
                 (share(d(s.net_dropped, first.net_dropped), d(s.sent, first.sent)) * 400.0).min(40.0),
-                "a platform is losing packets: the upload is struggling".into(),
+                "a platform is losing packets".into(),
+                "The upload is struggling. Lower the bitrate, or use a wired connection.",
             ),
         ];
         if s.reconnecting {
-            costs.push((50.0, "the stream is reconnecting".into()));
+            costs.push((50.0, "the stream is reconnecting".into(), "Check your internet connection."));
+        }
+        // Frames are still being drawn but the stream's own sender has delivered none for several
+        // seconds: the stream (and a recording sharing its encoder) has silently stopped (a stall seen
+        // after 26 minutes of a soak, with Health still 100).
+        let span = s.at_ms.saturating_sub(first.at_ms);
+        if span >= STALL_AFTER_MS
+            && first.sent_bytes > 0
+            && s.sent_bytes == first.sent_bytes
+            && d(s.frames, first.frames) >= 60
+        {
+            costs.push((
+                60.0,
+                "the stream has stopped sending".into(),
+                "Frames are drawn but none are being sent. Stop and start the stream again.",
+            ));
         }
         if s.paused {
-            costs.push((20.0, "a platform is paused to keep the others smooth".into()));
+            costs.push((
+                20.0,
+                "a platform is paused".into(),
+                "Upload protection paused it to keep the others smooth. It comes back by itself.",
+            ));
         }
         if s.quality_pct < 100 {
             costs.push((
                 f64::from(100 - s.quality_pct) / 3.0,
-                format!("quality is lowered to {}% to stay smooth", s.quality_pct),
+                format!("quality is at {}%", s.quality_pct),
+                "Auto quality lowered it to keep the stream smooth. It goes back up by itself.",
             ));
         }
         if s.cpu > 85.0 {
-            costs.push(((s.cpu - 85.0).min(15.0), "the computer is nearly at its limit".into()));
+            costs.push(((s.cpu - 85.0).min(15.0), "the computer is nearly at its limit".into(), "Close other apps."));
         }
-        let lost: f64 = costs.iter().map(|(c, _)| c).sum();
+        let lost: f64 = costs.iter().map(|(c, ..)| c).sum();
         let score = (100.0 - lost).round().clamp(0.0, 100.0) as u8;
-        let reason = costs
+        let (reason, detail) = costs
             .into_iter()
-            .filter(|(c, _)| *c >= 1.0)
+            .filter(|(c, ..)| *c >= 1.0)
             .max_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, why)| why)
-            .filter(|_| score < 100);
+            .filter(|_| score < 100)
+            .map_or((None, None), |(_, why, fix)| (Some(why), Some(fix.to_string())));
         let verdict = match score {
             90.. => "great",
             75.. => "good",
             50.. => "shaky",
             _ => "poor",
         };
-        Health { score, verdict, reason }
+        Health { score, verdict, reason, detail }
     }
 }
 
@@ -165,7 +201,8 @@ mod tests {
         // 1 in 60 late, 3 in 60 skipped by the encoder: about 7 + 20.
         let h = m.push(Sample { lagged: 1, skipped: 3, ..at(1) });
         assert_eq!((h.score, h.verdict), (73, "shaky"));
-        assert!(h.reason.unwrap().contains("encoder"));
+        assert!(h.reason.clone().unwrap().contains("encoder"));
+        assert!(h.detail.unwrap().contains("hardware encoder"), "what to do is the detail");
         // Reconnecting outweighs it.
         let h = m.push(Sample { lagged: 1, skipped: 3, reconnecting: true, ..at(2) });
         assert!(h.reason.unwrap().contains("reconnecting"));
@@ -174,6 +211,29 @@ mod tests {
             m.push(Sample { lagged: 1, skipped: 3, ..at(n) });
         }
         assert_eq!(m.push(Sample { lagged: 1, skipped: 3, ..at(10) }).score, 100);
+    }
+
+    #[test]
+    fn a_stream_that_stops_sending_while_frames_are_drawn_is_not_great() {
+        let mut m = HealthMeter::default();
+        let at = |n: u64, bytes: u64| Sample { sent_bytes: bytes, at_ms: n * 1_000, ..at(n) };
+        let mut last = None;
+        // Sending for 3 s, then drawing on with nothing sent.
+        for n in 0..4 {
+            last = Some(m.push(at(n, n * 60)));
+        }
+        assert_eq!(last.clone().unwrap().score, 100);
+        for n in 4..12 {
+            last = Some(m.push(at(n, 180)));
+        }
+        let h = last.clone().unwrap();
+        assert!(h.score <= 40, "score {}", h.score);
+        assert!(h.reason.unwrap().contains("stopped sending"));
+        // It resumes: the window clears.
+        for n in 12..20 {
+            last = Some(m.push(at(n, 180 + (n - 11) * 60)));
+        }
+        assert_eq!(last.unwrap().score, 100);
     }
 
     #[test]
@@ -203,7 +263,7 @@ mod tests {
             m.push(look(0, 0, 0));
             m.push(look(1, 30, busy)).reason.unwrap_or_default()
         };
-        assert!(late(1800).contains("video encoder"), "{}", late(1800));
+        assert!(late(1800).contains("the encoder can't keep up"), "{}", late(1800));
         assert!(late(400).contains("the computer is busy"), "{}", late(400));
         // Late frames from a busy computer aren't the encoder's because it's busy afterwards.
         let mut m = HealthMeter::default();

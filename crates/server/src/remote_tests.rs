@@ -218,9 +218,18 @@ async fn a_phone_reaches_this_pc_through_the_relay() {
     let lan = !json!(w.engine.settings())["lan_access"].as_bool().unwrap();
     let (s, v) = w.phone(Method::PUT, "/r/api/v1/settings", &owner, Some(json!({ "lan_access": lan }))).await;
     assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{v}");
+    // Nor can it agree to automatic crash reports; going back to asking is fine.
+    let (s, v) = w.phone(Method::PUT, "/r/api/v1/settings", &owner, Some(json!({ "crash_reports": "always" }))).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{v}");
+    assert_eq!(w.engine.settings().crash_reports, "ask");
+    let (s, v) = w.phone(Method::PUT, "/r/api/v1/settings", &owner, Some(json!({ "crash_reports": "never" }))).await;
+    assert_eq!((s, v["crash_reports"].as_str()), (200, Some("never")), "{v}");
     // Refused on the relay before reaching the PC.
     for (token, method, path) in [
         (&moder, Method::GET, "/r/api/v1/settings"),
+        (&moder, Method::GET, "/r/api/v1/golive/quality-options"),
+        (&moder, Method::PUT, "/r/api/v1/golive/destinations/kick/quality"),
+        (&owner, Method::PUT, "/r/api/v1/golive/destinations/kick/quality"),
         (&owner, Method::GET, "/r/api/v1/accounts"),
         (&owner, Method::POST, "/r/api/v1/pro/remote/codes"),
         (&owner, Method::POST, "/r/api/v1/session/pair-code"),
@@ -228,6 +237,10 @@ async fn a_phone_reaches_this_pc_through_the_relay() {
         let (s, v) = w.phone(method, path, token, Some(json!({}))).await;
         assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{path}: {v}");
     }
+    // Paired owner phone can read Go live quality options (PC-only PUT stayed refused above).
+    let (s, v) = w.phone(Method::GET, "/r/api/v1/golive/quality-options", &owner, None).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(v["destinations"].is_object(), "{v}");
     // Unknown routes are this PC's own 404.
     let (s, v) = w.phone(Method::GET, "/r/api/v1/nothing-here", &owner, None).await;
     assert_eq!((s, v["error"]["code"].as_str()), (404, Some("no_route")), "{v}");
@@ -326,6 +339,7 @@ async fn handler() -> (crate::remote::Handler, tempfile::TempDir) {
         engine: engine.clone(),
         sessions: Arc::new(auth::Sessions::new()),
         guard: auth::Guard { port: 47999, lan: false, dev_origins: vec![] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
     };
     (crate::remote::Handler::new(router(state), engine, 47999), dir)
 }
@@ -341,6 +355,39 @@ async fn ask(h: &crate::remote::Handler, role: &str, method: &str, path: &str, b
     };
     let res = h.handle(r).await;
     (res.status, serde_json::from_slice(&res.body).unwrap_or(Value::Null))
+}
+
+/// Custom alert code is installed on the PC only, like plugins: a paired phone may edit
+/// everything else about a rule but cannot add or change its custom HTML or fields.
+#[tokio::test]
+async fn a_phone_cannot_add_or_change_custom_alert_code() {
+    let (h, _dir) = handler().await;
+    let (s, rules) = ask(&h, "owner", "GET", "/api/v1/alert-rules", "").await;
+    assert_eq!(s, 200);
+    let mut rule = rules[0].clone();
+    let id = rule["id"].as_str().unwrap().to_string();
+    // Unchanged custom parts (none) round-trip: a phone can still tune a rule.
+    rule["variations"][0]["volume"] = json!(55);
+    let (s, v) = ask(&h, "owner", "PUT", &format!("/api/v1/alert-rules/{id}"), &rule.to_string()).await;
+    assert_eq!(s, 200, "{v}");
+    // Adding custom code is refused with a plain reason.
+    for change in [
+        json!({ "custom_enabled": true }),
+        json!({ "html": "<p>{name}</p>" }),
+        json!({ "fields": [{ "key": "tag", "label": "Tag", "type": "text", "default": "x" }] }),
+    ] {
+        let mut bad = rule.clone();
+        for (k, val) in change.as_object().unwrap() {
+            bad["variations"][0][k] = val.clone();
+        }
+        let (s, v) = ask(&h, "owner", "PUT", &format!("/api/v1/alert-rules/{id}"), &bad.to_string()).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{change}: {v}");
+    }
+    let mut create = rule.clone();
+    create["id"] = json!("");
+    create["variations"][0]["html"] = json!("<p>x</p>");
+    let (s, v) = ask(&h, "owner", "POST", "/api/v1/alert-rules", &create.to_string()).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{v}");
 }
 
 #[tokio::test]
@@ -453,6 +500,14 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/obs",
         "/obs/detect",
         "/session/pair",
+        "/diagnostics/preview",
+        "/diagnostics/report",
+        "/diagnostics/report.zip",
+        "/diagnostics/pending-report",
+        "/diagnostics/pending-report/send",
+        "/store/catalog",
+        "/store/installed",
+        "/store/install",
     ];
     for path in paths {
         for method in ["GET", "POST", "PUT", "DELETE", "PATCH"] {
@@ -573,4 +628,26 @@ async fn a_phone_may_look_at_the_tip_address_but_never_change_it() {
     assert!(!relay::allowed(relay::Role::Owner, "PUT", "/pro/tips/domain"));
     assert!(!relay::allowed(relay::Role::Owner, "DELETE", "/pro/tips/domain"));
     assert!(!relay::allowed(relay::Role::Mod, "GET", "/pro/tips/domain"));
+}
+
+#[tokio::test]
+async fn remote_owner_and_mod_are_refused_diagnostics_end_to_end() {
+    let (h, _dir) = handler().await;
+    for role in ["owner", "mod"] {
+        for (method, path, body) in [
+            ("GET", "/api/v1/diagnostics/preview", ""),
+            ("POST", "/api/v1/diagnostics/report", r#"{"folder":"/tmp"}"#),
+            ("POST", "/api/v1/diagnostics/report.zip", "{}"),
+            ("GET", "/api/v1/diagnostics/pending-report", ""),
+            ("POST", "/api/v1/diagnostics/pending-report/send", "{}"),
+            ("DELETE", "/api/v1/diagnostics/pending-report", ""),
+        ] {
+            let (s, v) = ask(&h, role, method, path, body).await;
+            assert_eq!(
+                (s, v["error"]["code"].as_str()),
+                (403, Some("not_allowed_for_role")),
+                "expected 403 not_allowed_for_role for {role} {method} {path}: {v}"
+            );
+        }
+    }
 }
