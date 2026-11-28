@@ -5,6 +5,26 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.8.1
+
+A smoother Studio when you resize, clearer frame stats, and an optional way to send us a crash
+report.
+
+- **Resizing the window**: both pictures, the main one and the vertical one, stay in their
+  places while you drag the window or a panel divider, and settle at once when you let go. No
+  more black strip, no picture drawn over the other one, and the vertical picture no longer
+  disappears. Fullscreen, a second monitor and projector windows resize cleanly too.
+- **Frame rate in Stats**: the last minute comes first, so an old hiccup no longer keeps it red.
+  It says why frames were missed (window resize, drawing fell behind, encoder overloaded or upload
+  too slow), shows a small graph of the last minute, and turns red only while it is still
+  happening.
+- **Crash reports, only if you say yes**: if Ferrocast closes unexpectedly, the next start asks
+  whether to send a report. "See what's sent" shows the exact text first. Stream keys,
+  passwords, tokens and emails are stripped before it's sent, and memory dumps are never sent. Settings > Privacy has Ask, Always or Never.
+- **Go live**: the "places · Mbps · encodes" line at the bottom of the Go live list is gone. The
+  totals are in Your platforms.
+- **Fixes**: the vertical picture now shows in Go live's phone preview.
+
 ## 3.8.0
 
 Pick the quality for each platform, see who is watching, run real polls, let chat talk, and a
