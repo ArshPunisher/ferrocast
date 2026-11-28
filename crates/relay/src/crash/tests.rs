@@ -681,7 +681,27 @@ async fn the_list_and_detail_have_exactly_the_contract_shapes() {
     let d = w.get(&format!("/{SIG_A}")).await;
     let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["count", "first_seen_ms", "installs", "kind", "last_seen_ms", "reports", "signature", "title"]);
+    assert_eq!(
+        keys,
+        [
+            "count",
+            "first_seen_ms",
+            "installs",
+            "kind",
+            "last_seen_ms",
+            "os",
+            "reports",
+            "signature",
+            "title",
+            "versions"
+        ]
+    );
+    // The Control Center shows these in the drawer: the same values as the list row, most
+    // recently seen first (it showed "Unknown" when the detail left them out).
+    assert_eq!(d["versions"], a["versions"]);
+    assert_eq!(d["versions"], json!(["3.8.2", "3.8.1"]));
+    assert_eq!(d["os"], a["os"]);
+    assert_eq!(d["os"], json!(["macos 15", "windows 11"]));
     let reports = d["reports"].as_array().unwrap();
     assert_eq!(reports.len(), 2);
     assert_eq!(reports[0]["id"], last["id"], "newest first");

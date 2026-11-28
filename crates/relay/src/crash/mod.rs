@@ -697,6 +697,8 @@ async fn detail(
         return Err(not_found("crash signature"));
     }
     let s = st.db.crash_signature(&signature).map_err(ApiError::db)?.ok_or_else(|| not_found("crash signature"))?;
+    let versions = st.db.crash_facet_values(&signature, "version").map_err(ApiError::db)?;
+    let os = st.db.crash_facet_values(&signature, "os").map_err(ApiError::db)?;
     let reports: Vec<Value> = st
         .db
         .crash_reports_of(&signature, 50)
@@ -725,6 +727,9 @@ async fn detail(
         "installs": s.installs,
         "first_seen_ms": s.first_seen,
         "last_seen_ms": s.last_seen,
+        // Over every report of the signature (not just the 50 below), as in the list.
+        "versions": versions,
+        "os": os,
         "reports": reports,
     }))
 }

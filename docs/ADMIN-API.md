@@ -559,9 +559,11 @@ token, 60 a minute). Reads need no `X-Admin-Email`; `DELETE` takes it when sent 
 
 ### `GET /admin/v1/crash-reports/{signature}`
 
-`{ signature, kind, title, count, installs, first_seen_ms, last_seen_ms, reports: [{ id,
-received_ms, version, os, arch, kind, cause_codes: [string], message, size_bytes,
-install_hash }] }`, the newest 50 reports. `install_hash` is a 64-character hex HMAC-SHA256 of
+`{ signature, kind, title, count, installs, first_seen_ms, last_seen_ms, versions: [string],
+os: [string], reports: [{ id, received_ms, version, os, arch, kind, cause_codes: [string],
+message, size_bytes, install_hash }] }`, the newest 50 reports. `versions` and `os` are the
+same as in the list row (every value seen for the signature, most recently seen first, at
+most 50), not only those of the 50 reports shown. `install_hash` is a 64-character hex HMAC-SHA256 of
 the install id under a key only the relay has: the same install always gives the same value,
 the id is never shown or stored with a report. Every string is client-supplied: show it as
 text, never as HTML. `message` may hold line breaks.
