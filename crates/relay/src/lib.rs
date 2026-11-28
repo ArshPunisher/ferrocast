@@ -19,6 +19,7 @@ pub mod billing;
 pub mod blob;
 pub mod bot;
 pub mod cloud;
+pub mod crash;
 pub mod db;
 pub mod discord;
 pub mod facebook;
@@ -133,6 +134,8 @@ pub struct AppState {
     pub(crate) cloud: Arc<cloud::Runtime>,
     /// Guest cameras: the PCs' link sockets and the guests waiting for an answer.
     pub(crate) guests: Arc<guests::Runtime>,
+    /// Opt-in crash reports: their limits and counters.
+    pub(crate) crash: Arc<crash::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -164,6 +167,7 @@ impl AppState {
             accounts: Arc::default(),
             cloud: Arc::default(),
             guests: Arc::default(),
+            crash: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -272,6 +276,12 @@ impl AppState {
     /// Accounts (`accounts::AccountsConfig::from_env()` in production).
     pub fn with_accounts(mut self, cfg: accounts::AccountsConfig) -> AppState {
         self.accounts = Arc::new(accounts::Runtime::new(cfg));
+        self
+    }
+
+    /// Crash report limits (`crash::Limits::default()` in production, small ones in tests).
+    pub fn with_crash_limits(mut self, limits: crash::Limits) -> AppState {
+        self.crash = Arc::new(crash::Runtime::new(limits));
         self
     }
 
@@ -393,6 +403,7 @@ pub fn router(state: AppState) -> Router {
         .merge(accounts::routes())
         .merge(cloud::routes())
         .merge(guests::routes())
+        .merge(crash::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))

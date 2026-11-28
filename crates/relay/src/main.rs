@@ -330,6 +330,14 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
+    let crash = state.clone();
+    tokio::spawn(async move {
+        // Crash reports: bundles after 90 days, everything after a year.
+        loop {
+            ferrocast_relay::crash::sweep(&crash).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     let bot_timers = state.clone();
     // The cloud bot: timers while it's on duty, and the hourly sign-in check and lapse sweep.
     tokio::spawn(ferrocast_relay::bot::run(bot_timers));

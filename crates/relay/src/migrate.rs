@@ -70,6 +70,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         sql: &[crate::cloud::SCHEMA],
     },
     Migration { version: 17, name: "Guest cameras: invites", sql: &[crate::guests::SCHEMA] },
+    Migration { version: 18, name: "Opt-in crash reports", sql: &[crate::crash::SCHEMA] },
 ];
 
 pub(crate) fn latest() -> i64 {

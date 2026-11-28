@@ -514,3 +514,72 @@ emails and weekly reports) against `MAIL_DAILY_BUDGET` (default 270, under Brevo
 **What the owner runs**: `deploy/pro-keys.sh --ai` on the server (deploy/README.md, "smart
 features"); Google verification for YouTube (docs/GOOGLE-VERIFICATION.md). No migration: 1.4's
 Pro features store only counters (`quota_usage`) and reuse existing tables.
+
+## Crash reports (3.8.1)
+
+Opt-in crash and error reports from the app (`POST /v1/crash-reports`, install auth; the
+app's side is docs/API.md § "Crash reports") and the owner's read side for the Control Center.
+Code: `crates/relay/src/crash/`. Same guard as every admin route (Docker network only, bearer
+token, 60 a minute). Reads need no `X-Admin-Email`; `DELETE` takes it when sent (it goes to
+`admin_audit`) but doesn't require it.
+
+**Decisions the contract left open**
+
+- `signature` is **lowercase hex**, 8 to 128 characters (the app sends 32). Safe in a URL and
+  in the Control Center's id validator.
+- Ids: a report id is `cr_` + 32 lowercase hex characters. `latest_report_id` is a report id
+  (or `null` when a signature has none).
+- All times are Unix milliseconds integers (`*_ms`), like the contract, not RFC 3339.
+- An unknown or malformed signature or report id is **404** with `{error:{code:"not_found",…}}`.
+- A report whose bundle was removed (only the newest 3 per signature are kept, 90 days; also
+  evicted at the 2 GB storage cap) still shows in the detail; its `/text` and `/bundle` answer
+  **404** `{error:{code:"bundle_removed",…}}`. A bundle that can't be unpacked is **422**
+  `bundle_unreadable` (download the raw one).
+- **Cursor** (`next` / `before`): `"<last_seen_ms>:<signature>"` of the last item of the page;
+  opaque to the Control Center, tie-safe (same millisecond orders by signature). Items are
+  newest `last_seen_ms` first, then signature descending. `next` is `null` on the last page.
+- `totals`: `reports` is every report ever counted (the sum of `count`), `signatures` how many
+  there are, `bytes` the bundles kept now. They are not affected by the filters.
+- `installs`: how many different installs sent that signature (counted from keyed hashes).
+- `versions` and `os` list the values seen, most recently seen first (at most 50).
+- `q` matches the title (case-insensitive) or the exact signature text.
+- Bad `kind`, `limit` (1 to 200, default 50) or `before` is 400 `bad_query`.
+- Extra route not in the contract: `GET /admin/v1/crash-reports/reports/{id}/bundle`, the raw
+  stored gzip as `application/octet-stream` with `Content-Disposition: attachment`.
+
+### `GET /admin/v1/crash-reports?kind=&version=&q=&limit=50&before=`
+
+```json
+{ "items": [{ "signature": "0123…", "kind": "crash|error|unclean_exit|hang",
+              "title": "first line of the first report's message", "count": 5, "installs": 3,
+              "first_seen_ms": 1, "last_seen_ms": 2, "versions": ["3.8.2", "3.8.1"],
+              "os": ["windows 11"], "latest_report_id": "cr_…" }],
+  "next": "1700000000000:0123…" , "totals": { "reports": 9, "signatures": 4, "bytes": 123456 } }
+```
+
+### `GET /admin/v1/crash-reports/{signature}`
+
+`{ signature, kind, title, count, installs, first_seen_ms, last_seen_ms, reports: [{ id,
+received_ms, version, os, arch, kind, cause_codes: [string], message, size_bytes,
+install_hash }] }`, the newest 50 reports. `install_hash` is a 64-character hex HMAC-SHA256 of
+the install id under a key only the relay has: the same install always gives the same value,
+the id is never shown or stored with a report. Every string is client-supplied: show it as
+text, never as HTML. `message` may hold line breaks.
+
+### `GET /admin/v1/crash-reports/reports/{id}/text[?download=1]`
+
+The bundle as readable text (`SUMMARY`, `report.json`, the trace and the logs, with section
+headers): `200 text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`, `no-store`, a
+`Content-Security-Policy: default-src 'none'; sandbox`, cut at 2 MB (a marker line says so; a
+decompression bomb costs 2 MB, never more). With `?download=1` also `Content-Disposition:
+attachment; filename="<id>.txt"`.
+
+### `DELETE /admin/v1/crash-reports/{signature}`
+
+→ 204: the signature, its counts, its report rows and its bundle files. 404 `not_found` if
+there is none.
+
+### The app's upload, for reference: `POST /v1/crash-reports`
+
+See docs/API.md. Retention: bundles 90 days, metadata 1 year (hourly sweep). Storage: 2 GB of
+bundles, oldest first out. New tables only (migration 18); no new env vars.
