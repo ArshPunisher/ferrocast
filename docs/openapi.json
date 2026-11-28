@@ -32885,7 +32885,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Render a PNG thumbnail of a scene.",
+        "summary": "Render a PNG thumbnail of a scene (the main canvas's shape, 9:16 for a vertical scene).",
         "tags": [
           "Studio Engine"
         ],

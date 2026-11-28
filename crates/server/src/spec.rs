@@ -717,7 +717,7 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         "GET",
         "/studio/engine/scenes/{scene}/thumbnail",
         "Studio Engine",
-        "Render a PNG thumbnail of a scene.",
+        "Render a PNG thumbnail of a scene (the main canvas's shape, 9:16 for a vertical scene).",
         None,
         None,
     ),

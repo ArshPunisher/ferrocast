@@ -3619,8 +3619,8 @@ impl Stage {
 
     // ------------------------------------------------------------------ pictures
 
-    /// A small picture of a scene as it looks now (`width` pixels wide, the canvas's shape), as
-    /// a PNG data URL: the Scenes grid's tiles.
+    /// A small picture of a scene (main or vertical) as it looks now (`width` pixels wide, its
+    /// canvas's shape), as a PNG data URL: the Scenes grid's tiles.
     pub fn thumbnail(&self, scene: &str, width: u32) -> Result<String, StudioError> {
         let (px, w, h) = self.thumbnail_pixels(scene, width)?;
         crate::collection::png_data_url(&px, w, h, scene)
@@ -3807,6 +3807,21 @@ impl Stage {
         self.thumbnail_job(scene, width)?()
     }
 
+    /// The canvas a thumbnail of `scene` is drawn from and the picture's size: `width` wide
+    /// (64 to 640), in the shape of that scene's canvas.
+    #[allow(clippy::type_complexity)]
+    fn thumbnail_size(&self, scene: &str, width: u32) -> Result<((u32, u32), (u32, u32)), StudioError> {
+        // A vertical scene is drawn on the vertical canvas (9:16), not the main one's.
+        if !self.vertical_order().iter().any(|n| n == scene) {
+            self.scene_index(scene)?;
+        }
+        let (cw, ch) = self.canvas_of(scene);
+        let (cw, ch) = (cw.max(1), ch.max(1));
+        let w = width.clamp(64, 640);
+        let h = ((u64::from(w) * u64::from(ch)) / u64::from(cw)).max(1) as u32;
+        Ok(((cw, ch), (w, h)))
+    }
+
     /// [`Self::thumbnail_pixels`] in two, as [`Self::source_picture_job`].
     #[allow(clippy::type_complexity)]
     pub fn thumbnail_job(
@@ -3814,10 +3829,7 @@ impl Stage {
         scene: &str,
         width: u32,
     ) -> Result<impl FnOnce() -> Result<(Vec<u8>, u32, u32), StudioError> + Send + 'static + use<>, StudioError> {
-        self.scene_index(scene)?;
-        let (cw, ch) = (self.canvas.width.max(1), self.canvas.height.max(1));
-        let w = width.clamp(64, 640);
-        let h = ((u64::from(w) * u64::from(ch)) / u64::from(cw)).max(1) as u32;
+        let ((cw, ch), (w, h)) = self.thumbnail_size(scene, width)?;
         let e = self.engine()?;
         let scene = scene.to_string();
         Ok(move || {
@@ -8350,6 +8362,27 @@ mod tests {
         assert_eq!(s.current(), "Three", "the first scene goes on air instead");
         ok(s.remove_scene("Main"));
         assert!(s.remove_scene("Three").is_err(), "one scene is always kept");
+    }
+
+    /// A vertical scene's thumbnail is the vertical canvas's shape (9:16), not a refusal and not
+    /// the main canvas's 16:9: the page shows it in the tall picture's place while the window is
+    /// resized, and a missing one left that picture empty for the whole drag.
+    #[test]
+    fn a_vertical_scenes_thumbnail_is_as_tall_as_its_canvas() {
+        let s = stage();
+        ok(s.start_vertical("Tall"));
+        assert_eq!(ok(s.thumbnail_size("Main", 360)), ((1920, 1080), (360, 202)));
+        assert_eq!(ok(s.thumbnail_size("Tall", 360)), ((1080, 1920), (360, 640)));
+        // Widths stay within 64 to 640 for both.
+        assert_eq!(ok(s.thumbnail_size("Tall", 9999)).1, (640, 1137));
+        assert!(s.thumbnail_size("Nope", 360).is_err(), "an unknown scene is still refused");
+        // With a graphics engine, the picture comes out tall.
+        if s.engine().is_ok() {
+            assert!(s.thumbnail_job("Tall", 360).is_ok());
+            let (px, w, h) = ok(s.thumbnail_pixels("Tall", 360));
+            assert_eq!((w, h), (360, 640));
+            assert_eq!(px.len(), 360 * 640 * 4);
+        }
     }
 
     #[test]
