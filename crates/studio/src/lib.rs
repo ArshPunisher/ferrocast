@@ -925,6 +925,49 @@ pub struct EngineStats {
     /// Counts and recovery hint shown behind Stats' `(i)` tooltip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missed_detail: Option<String>,
+    /// Missed and skipped frames in the last 60 s, by cause (Stats' Frame rate panel colours and
+    /// explains itself from these; the totals above count since the engine started).
+    pub missed_recent: MissedRecent,
+}
+
+/// The last minute of missed frames, by cause: what Stats' Frame rate panel shows first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissedRecent {
+    /// How many seconds this covers (60).
+    pub window_s: u32,
+    /// Frames missed because drawing fell behind.
+    pub render: u64,
+    /// Frames missed while the encoders held the frame loop back.
+    pub encode: u64,
+    /// Frames an encoder left out (its queue was full).
+    pub skipped: u64,
+    /// Of `render + encode`, the frames missed while a window or divider was being resized.
+    pub resize: u64,
+    /// Missed plus skipped frames in each of the last 60 seconds, oldest first, now last.
+    pub per_second: Vec<u32>,
+    /// The upload struggled in the last 60 s (set by the engine, which sees the platforms; false
+    /// here).
+    pub upload_trouble: bool,
+}
+
+impl Default for MissedRecent {
+    fn default() -> Self {
+        ferrocore::miss_window::RecentMisses::default().into()
+    }
+}
+
+impl From<ferrocore::miss_window::RecentMisses> for MissedRecent {
+    fn from(r: ferrocore::miss_window::RecentMisses) -> Self {
+        Self {
+            window_s: ferrocore::miss_window::WINDOW_S as u32,
+            render: r.render,
+            encode: r.held,
+            skipped: r.skipped,
+            resize: r.resize,
+            per_second: r.per_second.to_vec(),
+            upload_trouble: false,
+        }
+    }
 }
 
 /// Builds a short Stats explanation and `(i)` detail for missed/skipped frames.

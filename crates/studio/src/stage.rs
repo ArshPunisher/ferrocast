@@ -4459,6 +4459,7 @@ impl Stage {
     pub fn stats(&self) -> crate::EngineStats {
         let (cpu, memory_mb) = crate::system::usage();
         let s = self.engine.borrow().as_ref().map(|e| e.engine.stats()).unwrap_or_default();
+        let missed_recent = self.engine.borrow().as_ref().map(|e| e.engine.recent_misses()).unwrap_or_default().into();
         // Frames the encoders left out (FFmpeg's queue full, VideoToolbox's drops), apart from the
         // frames the engine didn't draw in time (`lagged`): the health meter names the encoder
         // from these. Never more than the frames given to them (a new engine counts from 0 again).
@@ -4489,6 +4490,7 @@ impl Stage {
             missed_encode,
             missed_reason,
             missed_detail,
+            missed_recent,
         }
     }
 

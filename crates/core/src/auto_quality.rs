@@ -78,6 +78,12 @@ impl AutoQuality {
         at - self.last_trouble < RECENT_MS
     }
 
+    /// Whether the upload struggled at any look in the last `ms` (as of `at`, ms): Stats'
+    /// "Upload too slow" for the last minute's missed frames.
+    pub fn struggled_within(&self, at: i64, ms: i64) -> bool {
+        at - self.last_trouble < ms
+    }
+
     /// Whether `s` shows the upload in trouble since the look before.
     fn trouble(last: &Signals, s: &Signals) -> bool {
         if s.feed_dropped > last.feed_dropped || (s.paused && !last.paused) {
@@ -198,6 +204,17 @@ mod tests {
             assert_eq!(q.tick(at, s.clone()), None, "at {at}");
             at += 2_000;
         }
+    }
+
+    #[test]
+    fn trouble_is_remembered_for_the_last_minute() {
+        let mut q = AutoQuality::default();
+        assert!(!q.struggled_within(1_000_000, 60_000), "no trouble yet");
+        quiet(&mut q, 0, 12_000, &all([0, 0, 0]));
+        assert_eq!(q.tick(12_000, all([5, 5, 5])), Some(85));
+        assert!(q.struggled_within(40_000, 60_000));
+        assert!(!q.struggling(40_000), "the status bar's 10 s have passed");
+        assert!(!q.struggled_within(72_000, 60_000), "a minute later it is forgotten");
     }
 
     #[test]

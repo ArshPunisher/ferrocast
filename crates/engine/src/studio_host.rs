@@ -2912,6 +2912,19 @@ impl Engine {
             .any(|a| a.struggling(now_ts));
         let struggling =
             group_struggling || self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(now_ts);
+        // The same, over the last minute the Frame rate panel looks at: a burst of frames the
+        // encoder held back while the upload struggled is the upload's, not the encoder's.
+        let upload_trouble_60s = self
+            .studio()
+            .group_auto_quality
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|a| a.struggled_within(now_ts, 60_000))
+            || self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggled_within(now_ts, 60_000);
+        if let Some(m) = v.pointer_mut("/engine/missed_recent").and_then(Value::as_object_mut) {
+            m.insert("upload_trouble".into(), Value::Bool(upload_trouble_60s));
+        }
         // The stream delay: what it holds while live, or how long its tail still has to go after Stop.
         let drain = self.studio_host().ok().and_then(|h| h.delay_drain());
         let held_mb = v.pointer("/stream/delay_mb").and_then(Value::as_f64).unwrap_or(0.0);
@@ -4716,6 +4729,32 @@ mod tests {
         assert!(!fake.discarded.load(std::sync::atomic::Ordering::SeqCst));
         e.studio_stream_stop(true).await.unwrap();
         assert!(fake.discarded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The Frame rate panel's last minute says whether the upload struggled in it, so a burst the
+    /// encoder held back during an upload squeeze is blamed on the upload.
+    #[tokio::test]
+    async fn the_recent_missed_frames_say_whether_the_upload_struggled() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        let recent = serde_json::json!({ "engine": { "missed_recent": { "window_s": 60, "encode": 4, "upload_trouble": false } } });
+        *fake.stats.lock().unwrap() = Some(recent.clone());
+        assert_eq!(e.studio_stats().await.unwrap()["engine"]["missed_recent"]["upload_trouble"], false);
+        // The Studio's own sender fell behind 20 s ago (after the stream's first seconds).
+        let now = crate::now().0;
+        {
+            let mut q = e.studio().auto_quality.lock().unwrap();
+            q.observe(now - 40_000, ferrocast_core::auto_quality::Signals::default());
+            q.observe(now - 20_000, ferrocast_core::auto_quality::Signals { feed_dropped: 7, ..Default::default() });
+        }
+        *fake.stats.lock().unwrap() = Some(recent);
+        let v = e.studio_stats().await.unwrap();
+        assert_eq!(v["engine"]["missed_recent"]["upload_trouble"], true);
+        assert_eq!(v["stream"]["upload_struggling"], serde_json::Value::Null, "no stream in these stats");
+        // A fake that sends no engine block gets none made up.
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({}));
+        assert!(e.studio_stats().await.unwrap().pointer("/engine").is_none());
     }
 
     /// Twitch Enhanced Broadcasting's plan belongs to the Studio stream that fetched it: gone

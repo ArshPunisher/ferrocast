@@ -3749,7 +3749,24 @@ fn studio_stats_schemas() -> Map<String, Value> {
                         "missed_render": { "type": "integer" },
                         "missed_encode": { "type": "integer" },
                         "missed_reason": { "type": ["string", "null"] },
-                        "missed_detail": { "type": ["string", "null"] }
+                        "missed_detail": { "type": ["string", "null"] },
+                        "missed_recent": {
+                            "type": "object",
+                            "description": "Missed and skipped frames in the last 60 s by cause (the totals above count since the engine started). Stats colours and explains its Frame rate panel from these.",
+                            "properties": {
+                                "window_s": { "type": "integer", "description": "How many seconds this covers (60)." },
+                                "render": { "type": "integer", "description": "Frames missed because drawing fell behind." },
+                                "encode": { "type": "integer", "description": "Frames missed while the encoders held the frame loop back." },
+                                "skipped": { "type": "integer", "description": "Frames an encoder left out (its queue was full)." },
+                                "resize": { "type": "integer", "description": "Of render + encode, the frames missed while a window or divider was being resized." },
+                                "per_second": {
+                                    "type": "array",
+                                    "items": { "type": "integer" },
+                                    "description": "Missed plus skipped frames in each of the last 60 seconds, oldest first, now last."
+                                },
+                                "upload_trouble": { "type": "boolean", "description": "The upload struggled at some point in the last 60 s (platforms behind, the Studio's sender behind, or a platform paused)." }
+                            }
+                        }
                     }
                 },
                 "scene": { "type": ["string", "null"] },

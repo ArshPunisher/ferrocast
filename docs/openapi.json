@@ -3537,6 +3537,43 @@
                   "null"
                 ]
               },
+              "missed_recent": {
+                "description": "Missed and skipped frames in the last 60 s by cause (the totals above count since the engine started). Stats colours and explains its Frame rate panel from these.",
+                "properties": {
+                  "encode": {
+                    "description": "Frames missed while the encoders held the frame loop back.",
+                    "type": "integer"
+                  },
+                  "per_second": {
+                    "description": "Missed plus skipped frames in each of the last 60 seconds, oldest first, now last.",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "render": {
+                    "description": "Frames missed because drawing fell behind.",
+                    "type": "integer"
+                  },
+                  "resize": {
+                    "description": "Of render + encode, the frames missed while a window or divider was being resized.",
+                    "type": "integer"
+                  },
+                  "skipped": {
+                    "description": "Frames an encoder left out (its queue was full).",
+                    "type": "integer"
+                  },
+                  "upload_trouble": {
+                    "description": "The upload struggled at some point in the last 60 s (platforms behind, the Studio's sender behind, or a platform paused).",
+                    "type": "boolean"
+                  },
+                  "window_s": {
+                    "description": "How many seconds this covers (60).",
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
               "missed_render": {
                 "type": "integer"
               },
