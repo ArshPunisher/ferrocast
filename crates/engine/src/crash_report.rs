@@ -607,8 +607,10 @@ impl Engine {
         if self.load_pending().is_some_and(|p| now().0.saturating_sub(p.created_ms) > PENDING_TTL_MS) {
             match self.drop_pending() {
                 Ok(_) => tracing::info!("an old unanswered crash report was removed"),
+                // Kept for the next start to try again, but never sent in the meantime.
                 Err(e) => tracing::warn!(error = %e, "couldn't remove an old crash report"),
             }
+            return;
         }
         // Looked at again with the lock held: the person may have changed it meanwhile.
         if self.settings().crash_reports != "always" {
