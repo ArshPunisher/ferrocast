@@ -5,7 +5,7 @@
 //! (`present`), or read back (`render_preview`) for tests and screenshots.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::compose::Target;
 use crate::{AvError, Compositor, Scene, Transition};
@@ -116,6 +116,41 @@ pub struct PendingResize {
     live_resizing: AtomicBool,
 }
 
+/// Previews now being live-resized, and when that last changed (ns): so Stats can tell a burst of
+/// missed frames from a window or divider drag (`live_resize_recent`).
+static LIVE_RESIZERS: AtomicU32 = AtomicU32::new(0);
+static LIVE_RESIZE_CHANGED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// A drag that ended this recently (ns) still counts: the surface is re-made when it ends.
+const LIVE_RESIZE_GRACE_NS: u64 = 2_000_000_000;
+/// A drag that never says it ended (its preview went away) is believed this long (ns) at most.
+const LIVE_RESIZE_MAX_NS: u64 = 60_000_000_000;
+
+fn note_live_resize(active: bool) {
+    if active {
+        LIVE_RESIZERS.fetch_add(1, Ordering::AcqRel);
+    } else {
+        let _ = LIVE_RESIZERS.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+    LIVE_RESIZE_CHANGED_NS.store(crate::engine::now_ns(), Ordering::Release);
+}
+
+/// Whether a window or divider was being resized at `now_ns`, or stopped a moment ago.
+pub fn live_resize_recent(now_ns: u64) -> bool {
+    let since = now_ns.saturating_sub(LIVE_RESIZE_CHANGED_NS.load(Ordering::Acquire));
+    (LIVE_RESIZERS.load(Ordering::Acquire) > 0 && since < LIVE_RESIZE_MAX_NS)
+        || (LIVE_RESIZE_CHANGED_NS.load(Ordering::Acquire) != 0 && since < LIVE_RESIZE_GRACE_NS)
+}
+
+impl Drop for PendingResize {
+    fn drop(&mut self) {
+        // A preview that goes away mid-drag never says the drag ended.
+        if self.live_resizing.load(Ordering::Acquire) {
+            note_live_resize(false);
+        }
+    }
+}
+
 impl PendingResize {
     pub fn new() -> Self {
         Self::default()
@@ -139,7 +174,9 @@ impl PendingResize {
 
     /// Marks whether an OS live-resize drag is active.
     pub fn set_live_resizing(&self, active: bool) {
-        self.live_resizing.store(active, Ordering::Release);
+        if self.live_resizing.swap(active, Ordering::AcqRel) != active {
+            note_live_resize(active);
+        }
     }
 
     /// Whether an OS live-resize drag is active.
@@ -1033,6 +1070,28 @@ pub(crate) mod tests {
         );
         drop(layer_b);
         drop(layer_a);
+    }
+
+    #[test]
+    fn a_live_resize_is_noticed_while_it_lasts_and_for_a_moment_after() {
+        // The counters are the process's: run alone (nextest does).
+        let start = crate::engine::now_ns();
+        assert!(!live_resize_recent(start + 3_000_000_000), "nothing resized yet");
+        let a = PendingResize::new();
+        a.set_live_resizing(true);
+        a.set_live_resizing(true); // the same state again counts once
+        let t = crate::engine::now_ns();
+        assert!(live_resize_recent(t));
+        assert!(live_resize_recent(t + 30_000_000_000), "still dragging half a minute on");
+        a.set_live_resizing(false);
+        let ended = crate::engine::now_ns();
+        assert!(live_resize_recent(ended + 1_000_000_000), "the surface is re-made as it ends");
+        assert!(!live_resize_recent(ended + 3_000_000_000));
+        // A preview that goes away mid-drag lets it go.
+        let b = PendingResize::new();
+        b.set_live_resizing(true);
+        drop(b);
+        assert!(!live_resize_recent(crate::engine::now_ns() + 3_000_000_000));
     }
 
     #[test]

@@ -579,6 +579,8 @@ type Seen = Mutex<Shown>;
 #[derive(Debug, Default)]
 struct Shown {
     stats: Stats,
+    /// The last minute's missed frames by cause (see `Engine::recent_misses`).
+    miss_window: crate::miss_window::MissWindow,
     /// What stopped each output (by id): one output's fault is its own, never another's.
     errors: Vec<(u64, String)>,
     /// Each output's recording and encoder.
@@ -602,6 +604,7 @@ impl Shown {
     fn of(st: &State) -> Self {
         Self {
             stats: st.stats,
+            miss_window: st.miss_monitor.window.clone(),
             errors: st.errors.iter().map(|(id, e)| (*id, e.clone())).collect(),
             outputs: st.outputs.iter().map(|(id, pipe, ..)| (*id, record_state(pipe), pipe.encoder())).collect(),
             output_encode_ms: st.encode_ms.iter().map(|(&id, &ms)| (id, ms)).collect(),
@@ -781,6 +784,8 @@ struct FrameMissMonitor {
     pending_encode_held: u64,
     pending_encode_skipped: u64,
     last_log_ns: Option<u64>,
+    /// The last minute's misses by cause, second by second (Stats' Frame rate panel).
+    window: crate::miss_window::MissWindow,
 }
 
 impl FrameMissMonitor {
@@ -821,6 +826,10 @@ impl FrameMissMonitor {
         let encode_skipped_delta = enc_skipped_total.saturating_sub(self.prev_enc_skipped);
         self.prev_enc_skipped = enc_skipped_total;
 
+        if render_delta > 0 || encode_held_delta > 0 || encode_skipped_delta > 0 {
+            let resizing = render_delta + encode_held_delta > 0 && crate::preview::live_resize_recent(now_ns);
+            self.window.add(now_ns, render_delta, encode_held_delta, encode_skipped_delta, resizing);
+        }
         self.pending_render += render_delta;
         self.pending_encode_held += encode_held_delta;
         self.pending_encode_skipped += encode_skipped_delta;
@@ -3868,6 +3877,13 @@ impl Engine {
     /// As of the loop's last frame (it never waits for the frame being made).
     pub fn stats(&self) -> Stats {
         self.seen.lock().unwrap_or_else(|p| p.into_inner()).stats
+    }
+
+    /// The last 60 s of missed frames by cause (drawing, encoder held the loop back, encoder
+    /// skipped, and those missed during a window resize), aged to now: a loop that has stopped
+    /// drawing still lets old misses fall out.
+    pub fn recent_misses(&self) -> crate::miss_window::RecentMisses {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).miss_window.recent(now_ns())
     }
 
     /// What stopped the loop or an output, if anything did (as of its last frame).
@@ -12494,6 +12510,31 @@ mod tests {
         assert_eq!(second.why, "encoder fell behind");
         assert_eq!((second.render_missed, second.encode_held, second.encode_skipped), (0, 2, 5));
         assert_eq!((second.total_missed, second.total_encode_skipped), (5, 5));
+    }
+
+    #[test]
+    fn frame_miss_monitor_keeps_the_last_minute_by_cause() {
+        let frame_ns = 33_333_333u64;
+        let sec = 1_000_000_000u64;
+        let mut mon = FrameMissMonitor::default();
+        let mut st = Stats { encode_ms: 1.0, ..Default::default() };
+        // Drawing: 3 frames at 100 s.
+        assert!(mon.record(100 * sec, 3, frame_ns, &mut st, 0).is_some());
+        // The encoder stalls: the frame before it was mostly encoding, then 2 missed and 4
+        // frames skipped by an encoder at 130 s.
+        st.encoding_us += 80_000;
+        st.encode_ms = 30.0;
+        mon.record(129 * sec, 0, frame_ns, &mut st, 0);
+        mon.record(130 * sec, 2, frame_ns, &mut st, 4);
+        let r = mon.window.recent(130 * sec);
+        assert_eq!((r.render, r.held, r.skipped), (3, 2, 4));
+        assert_eq!(r.per_second[crate::miss_window::WINDOW_S - 1], 6);
+        // 30 s later the drawing burst (at 100 s) has fallen out; the encoder's has not.
+        let later = mon.window.recent(160 * sec);
+        assert_eq!((later.render, later.held, later.skipped), (0, 2, 4));
+        // Calm frames add nothing.
+        assert_eq!(mon.record(131 * sec, 0, frame_ns, &mut st, 4), None);
+        assert_eq!(mon.window.recent(131 * sec).held, 2);
     }
 
     // `DROPPED_TEST_LOCK` and the tests that read `dropped_frames` are Unix only.

@@ -58,6 +58,7 @@ pub mod flv;
 pub mod fonts;
 pub mod level;
 pub mod lut;
+pub mod miss_window;
 pub mod mix;
 pub mod mkv;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
