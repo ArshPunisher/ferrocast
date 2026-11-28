@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 
 use crate::afx::{AudioEffect, AudioFilter, SoundPlugin};
 use crate::level::Ducking;
-use crate::mix::{BLOCK, Block, Mixer, OutputCapture, SourceSettings, push_tap_interleaved};
+use crate::mix::{BLOCK, Block, Levels, Mixer, OutputCapture, SourceSettings, push_tap_interleaved};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::monitor::Feeder;
 use crate::rt::{AtomicLevels, AudioClock, AudioConsumer, PopError, SystemClock};
@@ -442,22 +442,31 @@ impl<C: AudioClock> AudioRunner<C> {
         self.blocks_scratch.clear();
         self.mixer.mix_until_into(now, &mut self.blocks_scratch);
 
-        if !self.blocks_scratch.is_empty() {
-            for (id, atom) in &self.levels {
-                if let Some(lvl) = self.mixer.levels(*id) {
+        // Every source is stamped on every step, so a reader can tell meters that are kept from
+        // ones nobody writes any more. A source the mixer does not have reads as silence.
+        let mixed = !self.blocks_scratch.is_empty();
+        for (id, atom) in &self.levels {
+            atom.touch(now);
+            match self.mixer.levels(*id) {
+                Some(lvl) if mixed => {
                     atom.store(&lvl);
+                    if let Some(fast) = self.mixer.levels_over(*id, crate::mix::METER_FAST_BLOCKS) {
+                        atom.store_fast(&fast);
+                    }
                 }
-                if let Some(fast) = self.mixer.levels_over(*id, crate::mix::METER_FAST_BLOCKS) {
-                    atom.store_fast(&fast);
+                Some(_) => {}
+                None => {
+                    atom.store(&Levels::default());
+                    atom.store_fast(&Levels::default());
                 }
             }
-            if !self.master_taps.is_empty() {
-                self.master_taps.retain(|w| w.strong_count() > 0);
-                for w in &self.master_taps {
-                    if let Some(buf) = w.upgrade() {
-                        for b in &self.blocks_scratch {
-                            push_tap_interleaved(&buf, &b.tracks[0], self.rate);
-                        }
+        }
+        if mixed && !self.master_taps.is_empty() {
+            self.master_taps.retain(|w| w.strong_count() > 0);
+            for w in &self.master_taps {
+                if let Some(buf) = w.upgrade() {
+                    for b in &self.blocks_scratch {
+                        push_tap_interleaved(&buf, &b.tracks[0], self.rate);
                     }
                 }
             }
@@ -1660,5 +1669,148 @@ mod tests {
             }
         }
         assert!(!looped, "failed rate must not re-loop MakeResampler requests");
+    }
+
+    /// A loud 440 Hz piece for source 1's ring, 20 ms long, starting at `at_ns`.
+    fn loud_piece(prod: &mut crate::rt::AudioProducer, at_ns: u64, phase: &mut usize) {
+        let mut pcm = [0.0f32; 960 * 2];
+        for (i, f) in pcm.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let v = ((*phase + i) as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 0.5;
+            f[0] = v;
+            f[1] = v;
+        }
+        *phase += 960;
+        prod.push(&pcm, 2, RATE, at_ns).unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
+    /// A source whose sound stops (a device pulled out, an app closed) reads as silence once it
+    /// has been quiet longer than the meter window, and real sound brings the levels straight back.
+    #[test]
+    fn a_source_whose_sound_stops_reads_silence_and_comes_back_with_the_sound() {
+        let clock = SimClock::at(10_000_000_000);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let mut runner = AudioRunner::new(
+            clock.clone(),
+            RATE,
+            40_000_000,
+            cmd_rx,
+            recycle_rx,
+            None,
+            None,
+            AudioFilter::effect_needs_plugin,
+        );
+        let levels = AtomicLevels::shared();
+        let (mut prod, cons) = SpscAudioRing::for_seconds(3, RATE, 2, 480);
+        cmd_tx.send(AudioCmd::EnsureSource { id: 1, levels: levels.clone() }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::AttachRing { id: 1, consumer: cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([1]))).unwrap_or_else(|e| panic!("{e}"));
+
+        let (mut next_piece, mut phase) = (clock.now_ns(), 0usize);
+        let mut sound_for = |runner: &mut AudioRunner<SimClock>, ticks: usize, from_now: bool| {
+            if from_now {
+                next_piece = clock.now_ns();
+            }
+            for _ in 0..ticks {
+                while next_piece <= clock.now_ns() {
+                    loud_piece(&mut prod, next_piece, &mut phase);
+                    next_piece += 20_000_000;
+                }
+                runner.tick();
+            }
+        };
+        sound_for(&mut runner, 30, false);
+        let live = levels.load_fresh(clock.now_ns());
+        assert!(live.peak[0] > -12.0 && live.rms[0] > -12.0, "real sound reads live: {live:?}");
+        assert!(levels.load_fast_fresh(clock.now_ns()).peak[0] > -12.0);
+
+        // The sound stops. Past the timeout the meters read silence: peak, magnitude and input.
+        let timeout_ticks = (crate::rt::METER_FRESH_NS / STEP_NS) as usize + 2;
+        for _ in 0..timeout_ticks {
+            runner.tick();
+        }
+        for l in [levels.load_fresh(clock.now_ns()), levels.load_fast_fresh(clock.now_ns())] {
+            assert_eq!(l, Levels::default(), "a source with no sound reads silence");
+        }
+
+        // The sound returns: live levels at once, no wait.
+        sound_for(&mut runner, 8, true);
+        assert!(levels.load_fresh(clock.now_ns()).peak[0] > -12.0, "back with the sound");
+    }
+
+    /// The mixing thread itself stops (stalled or gone): nothing refreshes the meters, so they
+    /// read silence after the timeout rather than the last loud block, and recover when it runs.
+    #[test]
+    fn meters_nobody_refreshes_read_silence_after_the_timeout() {
+        let clock = SimClock::at(10_000_000_000);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let mut runner = AudioRunner::new(
+            clock.clone(),
+            RATE,
+            40_000_000,
+            cmd_rx,
+            recycle_rx,
+            None,
+            None,
+            AudioFilter::effect_needs_plugin,
+        );
+        let levels = AtomicLevels::shared();
+        let (mut prod, cons) = SpscAudioRing::for_seconds(3, RATE, 2, 480);
+        cmd_tx.send(AudioCmd::EnsureSource { id: 1, levels: levels.clone() }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::AttachRing { id: 1, consumer: cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([1]))).unwrap_or_else(|e| panic!("{e}"));
+        let (mut next_piece, mut phase) = (clock.now_ns(), 0usize);
+        for _ in 0..30 {
+            while next_piece <= clock.now_ns() {
+                loud_piece(&mut prod, next_piece, &mut phase);
+                next_piece += 20_000_000;
+            }
+            runner.tick();
+        }
+        let now = clock.now_ns();
+        assert!(levels.load_fresh(now).peak[0] > -12.0);
+        assert!(levels.load_fresh(now + crate::rt::METER_FRESH_NS / 2).peak[0] > -12.0, "a short gap is not silence");
+        let later = now + crate::rt::METER_FRESH_NS + 100_000_000;
+        assert_eq!(levels.load_fresh(later), Levels::default());
+        assert_eq!(levels.load_fast_fresh(later), Levels::default());
+        // The raw read is what was last written, as before.
+        assert!(levels.load().peak[0] > -12.0);
+        runner.step();
+        assert!(
+            levels.load_fresh(clock.now_ns()).peak[0] > -12.0
+                || levels.load_fresh(clock.now_ns()).peak[0].is_infinite()
+        );
+    }
+
+    /// A meter the thread keeps for an id the mixer does not have shows silence, not the last
+    /// values written for an earlier source of that id.
+    #[test]
+    fn a_meter_for_a_source_the_mixer_does_not_have_is_silent() {
+        let clock = SimClock::at(10_000_000_000);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let mut runner = AudioRunner::new(
+            clock.clone(),
+            RATE,
+            40_000_000,
+            cmd_rx,
+            recycle_rx,
+            None,
+            None,
+            AudioFilter::effect_needs_plugin,
+        );
+        let levels = AtomicLevels::shared();
+        let loud = Levels { peak: [-3.0; 2], rms: [-9.0; 2], input_peak: [-3.0; 2], gated: false, speech: true };
+        levels.store(&loud);
+        levels.store_fast(&loud);
+        cmd_tx
+            .send(AudioCmd::SetEffects { id: 9, effects: Vec::new(), levels: Some(levels.clone()) })
+            .unwrap_or_else(|e| panic!("{e}"));
+        for _ in 0..5 {
+            runner.tick();
+        }
+        assert_eq!(levels.load(), Levels::default());
+        assert_eq!(levels.load_fast(), Levels::default());
     }
 }

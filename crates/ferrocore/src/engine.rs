@@ -2615,15 +2615,18 @@ impl Engine {
         crate::mix::Tap(buf)
     }
 
-    /// A source's sound levels over the last block (for meters), wait-free via [`AtomicLevels`].
+    /// A source's sound levels over the last ~300 ms (for meters), wait-free via [`AtomicLevels`].
+    /// A source the mixer has not looked at for half a second reads as silence.
     pub fn levels(&self, id: u64) -> Option<crate::mix::Levels> {
-        self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load())
+        let now = now_ns();
+        self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load_fresh(now))
     }
 
     /// A source's levels over the last few blocks only (about 43 ms), wait-free: the dashboard's
     /// meters, which smooth the fall themselves. [`Engine::levels`] keeps its 300 ms window.
     pub fn levels_fast(&self, id: u64) -> Option<crate::mix::Levels> {
-        self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load_fast())
+        let now = now_ns();
+        self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load_fast_fresh(now))
     }
 
     #[cfg(test)]
@@ -10960,6 +10963,31 @@ mod tests {
 
         e.remove_source(1);
         assert!(e.levels(1).is_none());
+    }
+
+    /// A source nobody keeps meters for (its device gone, its sound stopped being mixed) reads
+    /// as silence from the engine, in both windows; the thread writing again brings it back.
+    #[test]
+    fn engine_levels_of_a_source_nobody_refreshes_read_silence() {
+        let Some(e) = engine() else { return };
+        let atom = crate::rt::AtomicLevels::shared();
+        let loud =
+            crate::mix::Levels { peak: [-3.0; 2], rms: [-9.0; 2], input_peak: [-3.0; 2], gated: false, speech: true };
+        atom.store(&loud);
+        atom.store_fast(&loud);
+        e.levels.write().unwrap_or_else(|x| x.into_inner()).insert(4242, Arc::clone(&atom));
+
+        atom.touch(now_ns());
+        assert_eq!(e.levels(4242), Some(loud), "just written: live");
+        assert_eq!(e.levels_fast(4242), Some(loud));
+
+        atom.touch(now_ns().saturating_sub(crate::rt::METER_FRESH_NS + 100_000_000));
+        assert_eq!(e.levels(4242), Some(crate::mix::Levels::default()), "not written for over 500 ms: silence");
+        assert_eq!(e.levels_fast(4242), Some(crate::mix::Levels::default()));
+
+        atom.touch(now_ns());
+        assert_eq!(e.levels(4242), Some(loud), "written again: live at once");
+        e.levels.write().unwrap_or_else(|x| x.into_inner()).remove(&4242);
     }
 
     #[test]

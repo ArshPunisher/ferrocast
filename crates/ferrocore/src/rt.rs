@@ -293,7 +293,12 @@ pub struct AtomicLevels {
     gated: std::sync::atomic::AtomicBool,
     speech: std::sync::atomic::AtomicBool,
     fast_speech: std::sync::atomic::AtomicBool,
+    /// When the mixing thread last looked at this source (host clock, ns; 0: never).
+    seen_ns: AtomicU64,
 }
+
+/// How long a source's meters may go unwritten before a reader takes them as silence (ns).
+pub const METER_FRESH_NS: u64 = 500_000_000;
 
 fn pair(v: [f32; 2]) -> u64 {
     u64::from(v[0].to_bits()) | (u64::from(v[1].to_bits()) << 32)
@@ -316,6 +321,7 @@ impl Default for AtomicLevels {
             gated: std::sync::atomic::AtomicBool::new(false),
             speech: std::sync::atomic::AtomicBool::new(false),
             fast_speech: std::sync::atomic::AtomicBool::new(false),
+            seen_ns: AtomicU64::new(0),
         }
     }
 }
@@ -354,6 +360,31 @@ impl AtomicLevels {
             gated: self.gated.load(Ordering::Relaxed),
             speech: self.fast_speech.load(Ordering::Relaxed),
         }
+    }
+
+    /// Records that the mixing thread looked at this source at `now_ns`, whether or not a block
+    /// was mixed for it. A reader that finds this old knows the meters are no longer being kept.
+    pub fn touch(&self, now_ns: u64) {
+        self.seen_ns.store(now_ns, Ordering::Relaxed);
+    }
+
+    fn is_fresh(&self, now_ns: u64) -> bool {
+        let seen = self.seen_ns.load(Ordering::Relaxed);
+        seen != 0 && now_ns.saturating_sub(seen) <= METER_FRESH_NS
+    }
+
+    /// [`AtomicLevels::load`], or silence when the mixing thread has not looked at this source
+    /// for [`METER_FRESH_NS`] (its sound stopped or the source is no longer mixed: the last loud
+    /// block must not stay on a meter). Live levels are back with the next write.
+    #[must_use]
+    pub fn load_fresh(&self, now_ns: u64) -> Levels {
+        if self.is_fresh(now_ns) { self.load() } else { Levels::default() }
+    }
+
+    /// [`AtomicLevels::load_fast`] with the same freshness rule as [`AtomicLevels::load_fresh`].
+    #[must_use]
+    pub fn load_fast_fresh(&self, now_ns: u64) -> Levels {
+        if self.is_fresh(now_ns) { self.load_fast() } else { Levels::default() }
     }
 
     /// The levels last published: three atomic loads.
@@ -638,6 +669,29 @@ mod tests {
             assert!(got == l.peak || got == a.peak || got == b.peak, "a pair that was never written: {got:?}");
         }
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn meters_nobody_writes_read_as_silence_until_they_are_written_again() {
+        let m = AtomicLevels::shared();
+        let loud = Levels { peak: [-3.0; 2], rms: [-9.0; 2], input_peak: [-3.0; 2], gated: true, speech: true };
+        m.store(&loud);
+        m.store_fast(&loud);
+        let t = 5_000_000_000;
+        assert_eq!(m.load_fresh(t), Levels::default(), "never looked at: silence");
+        m.touch(t);
+        assert_eq!(m.load_fresh(t + METER_FRESH_NS), loud, "inside the timeout");
+        assert_eq!(m.load_fast_fresh(t + METER_FRESH_NS), loud);
+        assert_eq!(
+            m.load_fresh(t + METER_FRESH_NS + 1),
+            Levels::default(),
+            "past it: silence, whatever was last written"
+        );
+        assert_eq!(m.load_fast_fresh(t + METER_FRESH_NS + 1), Levels::default());
+        assert_eq!(m.load(), loud, "the raw read is untouched");
+        m.touch(t + 2 * METER_FRESH_NS);
+        assert_eq!(m.load_fresh(t + 2 * METER_FRESH_NS), loud, "live again as soon as it is written");
+        assert_eq!(m.load_fresh(t), loud, "a read from before the last write is never stale");
     }
 
     #[test]
