@@ -135,6 +135,9 @@ pub(crate) mod mac {
         /// The box the page asked for, in the parent's coordinates: the view is that box
         /// rounded out to whole device pixels, and the page's holes are measured from the box.
         wanted: std::cell::Cell<Option<NSRect>>,
+        /// How far the view reaches past `wanted` on each side, from when it was placed: the
+        /// rounding only, never the distance the view has moved since.
+        overhang: std::cell::Cell<crate::Overhang>,
     }
 
     impl std::fmt::Debug for PassIvars {
@@ -261,9 +264,14 @@ pub(crate) mod mac {
     /// often are) left a row of the GL surface undrawn, a black line along the stage.
     fn snapped(parent: &NSView, r: NSRect) -> NSRect {
         let s = parent.window().map(|w| w.backingScaleFactor()).filter(|s| *s > 0.0).unwrap_or(1.0);
-        let (x0, y0) = ((r.origin.x * s).floor() / s, (r.origin.y * s).floor() / s);
-        let (x1, y1) = (((r.origin.x + r.size.width) * s).ceil() / s, ((r.origin.y + r.size.height) * s).ceil() / s);
-        NSRect::new(NSPoint::new(x0, y0), NSSize::new(x1 - x0, y1 - y0))
+        let (x, y, w, h) = crate::snap_out((r.origin.x, r.origin.y, r.size.width, r.size.height), s);
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// How far `view` reaches past the box `want` asked for, as placed (see `crate::overhang_of`).
+    fn overhang(parent: &NSView, want: NSRect, view: NSRect) -> crate::Overhang {
+        let t = |r: NSRect| (r.origin.x, r.origin.y, r.size.width, r.size.height);
+        crate::overhang_of(t(want), t(view), parent.isFlipped())
     }
 
     /// The Mac cursor for a CSS one, from AppKit's public cursors: macOS 15's frame-resize
@@ -336,9 +344,11 @@ pub(crate) mod mac {
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
         let pass = PassView::alloc(mtm).set_ivars(PassIvars::default());
         let box_asked = wanted(parent, None, x, y, w, h, vh);
+        let frame = snapped(parent, box_asked);
         // SAFETY: NSView's designated initialiser on a freshly allocated PassView.
-        let pass: Retained<PassView> = unsafe { msg_send![super(pass), initWithFrame: snapped(parent, box_asked)] };
+        let pass: Retained<PassView> = unsafe { msg_send![super(pass), initWithFrame: frame] };
         pass.ivars().wanted.set(Some(box_asked));
+        pass.ivars().overhang.set(overhang(parent, box_asked, frame));
         let view: Retained<NSView> = Retained::into_super(pass.clone());
         view.setWantsLayer(true);
         // Kept the same distance from the top when the window's height changes: unflipped,
@@ -432,8 +442,10 @@ pub(crate) mod mac {
             // SAFETY: on the main thread (checked above); `superview` only reads the view tree.
             if let Some(parent) = unsafe { self.view.superview() } {
                 let box_asked = wanted(&parent, Some(&self.view), x, y, w, h, vh);
+                let frame = snapped(&parent, box_asked);
                 self.pass.ivars().wanted.set(Some(box_asked));
-                self.view.setFrame(snapped(&parent, box_asked));
+                self.pass.ivars().overhang.set(overhang(&parent, box_asked, frame));
+                self.view.setFrame(frame);
             }
         }
 
@@ -516,21 +528,9 @@ pub(crate) mod mac {
             let b = self.view.bounds();
             // The page measures holes from its box; the view is that box rounded out to whole
             // device pixels (see `crate::fit_holes`).
-            let flipped = self.view.isFlipped();
             let holes = match self.pass.ivars().wanted.get() {
                 Some(want) => {
-                    let f = self.view.frame();
-                    let (before, after) =
-                        (want.origin.y - f.origin.y, f.origin.y + f.size.height - want.origin.y - want.size.height);
-                    // The overhang is under a point: more is the window mid-resize, not rounding.
-                    let ok = |v: f64| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
-                    let over = crate::Overhang {
-                        left: ok(want.origin.x - f.origin.x),
-                        right: ok(f.origin.x + f.size.width - want.origin.x - want.size.width),
-                        top: ok(if flipped { before } else { after }),
-                        bottom: ok(if flipped { after } else { before }),
-                    };
-                    crate::fit_holes(holes, over, want.size.width, want.size.height)
+                    crate::fit_holes(holes, self.pass.ivars().overhang.get(), want.size.width, want.size.height)
                 }
                 None => holes.to_vec(),
             };

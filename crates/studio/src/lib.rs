@@ -193,6 +193,40 @@ pub(crate) struct Overhang {
     pub bottom: f64,
 }
 
+/// A box (x, y, w, h) on whole device pixels at `scale`, covering it: a frame on a half pixel
+/// left a row of the GL surface undrawn, a black line along the stage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn snap_out(r: (f64, f64, f64, f64), scale: f64) -> (f64, f64, f64, f64) {
+    let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let (x0, y0) = ((r.0 * s).floor() / s, (r.1 * s).floor() / s);
+    let (x1, y1) = (((r.0 + r.2) * s).ceil() / s, ((r.1 + r.3) * s).ceil() / s);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// How far `view` (a box made by [`snap_out`] from `want`, both x, y, w, h in the parent's
+/// coordinates) reaches past `want` on each side. Worked out when the view is placed, from the
+/// box the page asked for and the frame it was given, never from the view's frame later: the
+/// parent's own autoresizing moves the view without changing what was asked, and a move is not
+/// rounding. `flipped`: the parent counts y down from the top.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn overhang_of(want: (f64, f64, f64, f64), view: (f64, f64, f64, f64), flipped: bool) -> Overhang {
+    // Float noise from adding a position to a size is not overhang: under a millionth of a
+    // point is none.
+    let ok = |v: f64| if v.is_finite() && v > 1e-6 { v.min(1.0) } else { 0.0 };
+    // Whole edges are compared, not an origin plus a size less the other's pieces.
+    let (want_right, view_right) = (want.0 + want.2, view.0 + view.2);
+    let (want_high, view_high) = (want.1 + want.3, view.1 + view.3);
+    // Lower y is the top when flipped, the bottom when not.
+    let low = want.1 - view.1;
+    let high = view_high - want_high;
+    Overhang {
+        left: ok(want.0 - view.0),
+        right: ok(view_right - want_right),
+        top: ok(if flipped { low } else { high }),
+        bottom: ok(if flipped { high } else { low }),
+    }
+}
+
 /// The page's holes (x, y, w, h, corner radius, in points from the asked-for box's top left) as
 /// the snapped view needs them, from the view's own top left. A hole is measured against the
 /// box the page asked for, but the view is that box rounded out to whole device pixels: a hole
@@ -853,6 +887,49 @@ mod tests {
         assert_eq!((x, y), (0.5, 0.5));
         assert!((x + w - 400.7).abs() < 1e-9, "the right reaches the view's edge: {w}");
         assert!((y + h - 299.8).abs() < 1e-9, "the bottom keeps its gap: {h}");
+    }
+
+    #[test]
+    fn equal_edges_have_no_overhang_whatever_the_float_noise() {
+        // The right edges are both 500.5 at 2x; summed in another order they differ by noise.
+        let want = (400.4, 20.0, 100.1, 40.0);
+        let view = (400.4, 20.0, 100.1, 40.0);
+        assert_eq!(overhang_of(want, view, false), Overhang::default());
+        assert_eq!(overhang_of(want, view, true), Overhang::default());
+        let noisy = (want.0, want.1, want.2 + 1e-12, want.3 - 1e-12);
+        assert_eq!(overhang_of(want, noisy, false), Overhang::default());
+        // A real half point still counts.
+        let wide = (want.0, want.1, want.2 + 0.5, want.3);
+        assert_eq!(overhang_of(want, wide, false).right, 0.5);
+    }
+
+    #[test]
+    fn the_overhang_is_the_rounding_of_the_asked_box_not_where_the_view_is_now() {
+        // A box on half points at 2x: snapped out a half point or less on every side.
+        let want = (10.25, 100.5, 400.5, 200.25);
+        let view = snap_out(want, 2.0);
+        assert_eq!(view, (10.0, 100.5, 401.0, 200.5));
+        let up = overhang_of(want, view, false);
+        assert!(up.left == 0.25 && up.right == 0.25 && up.top == 0.25 && up.bottom == 0.0, "{up:?}");
+        // Counting from the top, the vertical sides swap: nothing moves with the parent's
+        // autoresizing, which changes the frame but not the rounding.
+        let (x, y, w, h) = (10.25, 100.2, 400.5, 200.25);
+        let down = overhang_of((x, y, w, h), snap_out((x, y, w, h), 2.0), true);
+        assert!(down.top > 0.0 && down.top < 0.5 && down.bottom >= 0.0 && down.bottom < 0.5, "{down:?}");
+        // The same box moved a long way (the window grew) and snapped again: the same overhang,
+        // so an interior hole stays where it was drawn.
+        let moved = (x, y + 100.0, w, h);
+        let again = overhang_of(moved, snap_out(moved, 2.0), true);
+        assert_eq!(again.left, down.left);
+        assert!((again.top - down.top).abs() < 1e-9 && (again.bottom - down.bottom).abs() < 1e-9, "{again:?}");
+        let hole = [(50.0, 40.0, 100.0, 80.0, 0.0)];
+        let fit = fit_holes(&hole, again, w, h)[0];
+        assert!((fit.1 - (40.0 + again.top)).abs() < 1e-9, "an interior hole moves by the rounding only: {fit:?}");
+        // A whole-pixel box has none at all.
+        assert_eq!(
+            overhang_of((10.0, 20.0, 30.0, 40.0), snap_out((10.0, 20.0, 30.0, 40.0), 2.0), true),
+            Overhang::default()
+        );
     }
 
     #[test]
