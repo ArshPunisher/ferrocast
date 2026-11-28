@@ -17,6 +17,9 @@ mod cloud_bot;
 mod cloud_sync;
 #[cfg(test)]
 mod cloud_sync_tests;
+mod crash_report;
+#[cfg(test)]
+mod crash_report_tests;
 #[cfg(test)]
 mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
@@ -235,6 +238,9 @@ struct Inner {
     stream_health: Mutex<diagnostics::ActiveStreamHealth>,
     /// Serializes support diagnostics bundle creation so concurrent requests don't spike I/O/CPU.
     diagnostics_busy: tokio::sync::Mutex<()>,
+    /// One crash-report step at a time (build, preview, send, discard) and the once-per-run start.
+    crash_report_op: tokio::sync::Mutex<()>,
+    crash_report_started: AtomicBool,
     /// Short-lived cache of slow OS/GPU/audio hardware enumeration for repeated diagnostics calls.
     hardware_probe_cache: diagnostics::HardwareProbeCache,
     /// Avoids repeating `/channels` handle discovery when a legacy YouTube account has no `@handle`.
@@ -274,6 +280,8 @@ impl Engine {
         .await?;
         engine.init_safe_mode(data_dir, safe_mode_flag);
         engine.mark_unclean_stream_health().await;
+        // After a crash: the report for a yes (or sent on its own when the person said always).
+        engine.spawn_crash_report_startup();
         // OBS's own settings file in its usual place (`start_with` leaves this empty so
         // tests never read the developer's real OBS).
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
@@ -409,6 +417,8 @@ impl Engine {
                 labels: Mutex::new(Default::default()),
                 stream_health: Mutex::new(Default::default()),
                 diagnostics_busy: tokio::sync::Mutex::new(()),
+                crash_report_op: tokio::sync::Mutex::new(()),
+                crash_report_started: AtomicBool::new(false),
                 hardware_probe_cache: Default::default(),
                 youtube_handle_checked: AtomicBool::new(false),
                 last_pushed_next_stream_at: Mutex::new(None),

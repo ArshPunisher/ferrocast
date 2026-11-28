@@ -337,7 +337,7 @@ impl Engine {
         Ok(WrittenReport { path: dest.display().to_string(), filename: actual_filename, size_bytes, report })
     }
 
-    async fn gather_diagnostics(
+    pub(crate) async fn gather_diagnostics(
         &self,
         include_artifacts: bool,
     ) -> Result<(DiagnosticInput, Vec<String>, Vec<String>, Vec<(String, String)>, Vec<(String, Vec<u8>)>), EngineError>

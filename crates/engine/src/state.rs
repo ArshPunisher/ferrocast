@@ -49,6 +49,10 @@ pub struct EngineSettings {
     /// Who can watch a YouTube broadcast Ferrocast makes (main and vertical): `public`,
     /// `unlisted` or `private`. Public unless chosen, as before.
     pub youtube_privacy: String,
+    /// Send a redacted crash report to Ferrocast's relay after a crash: `ask` (the person
+    /// is asked each time), `always` or `never`. Never changes by a pack, an API key or a phone
+    /// to `always` (docs/API.md).
+    pub crash_reports: String,
 }
 
 impl Default for EngineSettings {
@@ -69,6 +73,7 @@ impl Default for EngineSettings {
             language: "en".into(),
             currency: currency_for_locale(sys_locale::get_locale().as_deref().unwrap_or("")).into(),
             youtube_privacy: "public".into(),
+            crash_reports: "ask".into(),
         }
     }
 }
@@ -148,6 +153,7 @@ impl EngineSettings {
         )?;
         one_of("reduced_motion", &self.reduced_motion, &["system", "on", "off"])?;
         one_of("youtube_privacy", &self.youtube_privacy, &["public", "unlisted", "private"])?;
+        one_of("crash_reports", &self.crash_reports, &["ask", "always", "never"])?;
         if self.currency.len() != 3 || !self.currency.bytes().all(|b| b.is_ascii_uppercase()) {
             return Err("currency: a three-letter code like INR or USD.".into());
         }
