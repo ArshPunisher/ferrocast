@@ -970,7 +970,12 @@ impl WindowResizeState {
         let mut out = ResizeActions::default();
         self.reconcile_sessions(os_in_live_resize, now, &mut out);
         if self.drag.is_none() && self.fullscreen_started.is_none() && !self.awaiting_settle {
-            self.hidden = false;
+            // Ending a hold whose end notification never came: the views already held are
+            // parked and hidden still, so the caller must bring them back (a view made now
+            // starts shown, the old ones would otherwise stay invisible until the next put).
+            if std::mem::take(&mut self.hidden) {
+                out.restore_and_unpark = true;
+            }
             self.disarm_timer();
         }
         (self.is_live_resizing(), out)
@@ -9492,6 +9497,29 @@ mod import_tests {
         assert!(put_act.restore_and_unpark);
         assert_eq!(put_act.emit.len(), 1);
         assert!(!put_act.emit[0].0);
+    }
+
+    #[test]
+    fn a_drag_that_ended_silently_is_cleared_and_the_held_views_brought_back_when_a_view_is_made() {
+        use super::WindowResizeState;
+
+        let t0 = std::time::Instant::now();
+        let mut st = WindowResizeState::default();
+        assert!(st.on_live_resize_at(true, t0).hide_and_park, "the held views are hidden and parked");
+        // The OS has long ended the drag but never said so; a view is being made (a sync).
+        let (hide_new_view, actions) = st.reconcile_for_sync_at(false, t0 + std::time::Duration::from_millis(100));
+        assert!(!hide_new_view, "the new view starts shown");
+        assert!(actions.restore_and_unpark, "and the views already held, still hidden, are restored");
+        assert_eq!(actions.emit.len(), 1);
+        assert!(!actions.emit[0].0, "the page is told the drag is over");
+        // Nothing left to restore the second time.
+        let (_, again) = st.reconcile_for_sync_at(false, t0 + std::time::Duration::from_millis(200));
+        assert!(!again.restore_and_unpark);
+        // A real drag, still going: nothing is restored.
+        let mut live = WindowResizeState::default();
+        live.on_live_resize_at(true, t0);
+        let (hide, actions) = live.reconcile_for_sync_at(true, t0 + std::time::Duration::from_millis(100));
+        assert!(hide && !actions.restore_and_unpark);
     }
 
     #[test]
