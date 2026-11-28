@@ -167,13 +167,13 @@ impl Db {
         )
     }
 
-    /// The oldest kept bundles first: `(id, blob_key)`.
-    pub(crate) fn crash_oldest_bundles(&self, limit: i64) -> rusqlite::Result<Vec<(String, String)>> {
+    /// The oldest kept bundles first: `(id, blob_key, size)`.
+    pub(crate) fn crash_oldest_bundles(&self, limit: i64) -> rusqlite::Result<Vec<(String, String, i64)>> {
         let c = self.c();
         let mut st = c.prepare(
-            "SELECT id, blob_key FROM crash_reports WHERE blob_key IS NOT NULL ORDER BY received_ms, id LIMIT ?1",
+            "SELECT id, blob_key, size_bytes FROM crash_reports WHERE blob_key IS NOT NULL ORDER BY received_ms, id LIMIT ?1",
         )?;
-        let rows = st.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
     }
 
@@ -266,11 +266,12 @@ impl Db {
             .optional()
     }
 
-    /// The bundle keys of one signature.
-    pub(crate) fn crash_signature_bundles(&self, signature: &str) -> rusqlite::Result<Vec<String>> {
+    /// The bundles of one signature: `(id, blob_key)`.
+    pub(crate) fn crash_signature_bundles(&self, signature: &str) -> rusqlite::Result<Vec<(String, String)>> {
         let c = self.c();
-        let mut st = c.prepare("SELECT blob_key FROM crash_reports WHERE signature = ?1 AND blob_key IS NOT NULL")?;
-        let rows = st.query_map([signature], |r| r.get(0))?;
+        let mut st =
+            c.prepare("SELECT id, blob_key FROM crash_reports WHERE signature = ?1 AND blob_key IS NOT NULL")?;
+        let rows = st.query_map([signature], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
 
@@ -283,7 +284,12 @@ impl Db {
     pub(crate) fn crash_prune_metadata(&self, before: i64) -> rusqlite::Result<()> {
         let c = self.c();
         c.execute("DELETE FROM crash_reports WHERE received_ms < ?1 AND blob_key IS NULL", [before])?;
-        c.execute("DELETE FROM crash_signatures WHERE last_seen < ?1", [before])?;
+        // Never one that still has a bundle: its key is the only way to delete the file.
+        c.execute(
+            "DELETE FROM crash_signatures WHERE last_seen < ?1 AND NOT EXISTS (
+                SELECT 1 FROM crash_reports r WHERE r.signature = crash_signatures.signature AND r.blob_key IS NOT NULL)",
+            [before],
+        )?;
         c.execute("DELETE FROM crash_rate WHERE at < ?1", [before.max(0)])?;
         Ok(())
     }

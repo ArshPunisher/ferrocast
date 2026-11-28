@@ -289,9 +289,18 @@ async fn a_sender_that_stalls_mid_body_is_cut_off_with_408() {
     );
     s.write_all(head.as_bytes()).await.unwrap();
     // …and never sends the rest.
-    let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf)).await.unwrap().unwrap();
-    let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+    // A read can end mid-reply: collect until the error code shows (or the time runs out).
+    let mut reply = String::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut buf = vec![0u8; 4096];
+        while !reply.contains("request_timeout") {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reply.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    })
+    .await;
     assert!(reply.starts_with("HTTP/1.1 408"), "{reply}");
     assert!(reply.contains("request_timeout"), "{reply}");
 }
@@ -353,10 +362,11 @@ async fn a_blob_that_can_not_be_deleted_does_not_hang_the_storage_cap() {
         )
         .await;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        // Never a hang: it answers (the new file may not be writable here either).
+        // Never a hang, and never past the cap: it is refused (503), the old file stays.
         let (s, ..) = res.expect("the upload must not hang");
-        assert!(s == 201 || s == 503, "{s}");
+        assert_eq!(s, 503);
         assert!(w.blob_exists(&first));
+        assert_eq!(w.st.db.crash_totals().unwrap().0, 1, "only the first report was kept");
     }
     #[cfg(not(unix))]
     let _ = first;
@@ -488,6 +498,32 @@ async fn bundles_go_after_90_days_and_everything_after_a_year() {
     assert!(w.st.db.crash_report(&id).unwrap().is_none());
     assert!(w.st.db.crash_signature(SIG_A).unwrap().is_none());
     assert_eq!(w.st.db.crash_totals().unwrap(), (0, 0, 0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bundle_that_can_not_be_deleted_keeps_its_signature_for_the_next_try() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(limits()).await;
+    let (auth, _) = w.install();
+    let (_, _, v) = w.post(&auth, &good(SIG_A)).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    let dir = w.dir.path().join("blobs/crash-reports");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // Retention can't delete the file: the signature and its key stay.
+    sweep_at(&w.st, now_ms() + 400 * DAY).await;
+    assert!(w.st.db.crash_signature(SIG_A).unwrap().is_some());
+    assert!(w.st.db.crash_report(&id).unwrap().unwrap().blob_key.is_some());
+    // And the admin delete says so instead of pretending.
+    let (s, _, b) = w.admin("DELETE", &format!("/{SIG_A}")).await;
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!((s, v["error"]["code"].as_str()), (503, Some("storage")));
+    assert!(w.st.db.crash_signature(SIG_A).unwrap().is_some());
+    // The disk recovers: the next sweep finishes the job.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    sweep_at(&w.st, now_ms() + 400 * DAY).await;
+    assert!(w.st.db.crash_signature(SIG_A).unwrap().is_none());
+    assert!(!w.blob_exists(&id));
 }
 
 #[tokio::test]

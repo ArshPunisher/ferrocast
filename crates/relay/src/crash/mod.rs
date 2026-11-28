@@ -415,20 +415,23 @@ async fn upload(
     }
     let up = check(&buf, max)?;
     drop(buf);
-    let (id, signature) = store_report(&st, &pass, up, now).await?;
-    let mut res = (StatusCode::CREATED, axum::Json(json!({ "id": id, "signature": signature, "received_ms": now })))
-        .into_response();
+    let (id, signature, received) = store_report(&st, &pass, up).await?;
+    let mut res =
+        (StatusCode::CREATED, axum::Json(json!({ "id": id, "signature": signature, "received_ms": received })))
+            .into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(res)
 }
 
-async fn store_report(st: &AppState, pass: &Pass, up: Upload, now: i64) -> Result<(String, String), ApiError> {
+async fn store_report(st: &AppState, pass: &Pass, up: Upload) -> Result<(String, String, i64), ApiError> {
     let blobs = st.blobs()?;
     let l = &st.crash.limits;
     // One upload at a time past this point, so the storage cap and the counts stay true.
     let _one = st.crash.ingest.lock().await;
     // Two uploads at once can both pass the check before the body: count again, alone.
-    check_rates(st, &pass.install_hash, now_ms())?;
+    // The time of acceptance: for the check, the stored rows and the answer alike.
+    let now = now_ms();
+    check_rates(st, &pass.install_hash, now)?;
     let size = i64::try_from(up.bundle.len()).unwrap_or(i64::MAX);
     make_room(st, blobs, size).await?;
     let id = new_id();
@@ -473,37 +476,50 @@ async fn store_report(st: &AppState, pass: &Pass, up: Upload, now: i64) -> Resul
             break;
         }
         match st.db.crash_stalest_signature(&up.signature) {
-            Ok(Some(old)) => delete_signature(st, blobs, &old).await,
+            Ok(Some(old)) => {
+                if !delete_signature(st, blobs, &old).await {
+                    break;
+                }
+            }
             _ => break,
         }
     }
-    Ok((id, up.signature))
+    Ok((id, up.signature, now))
 }
 
-/// Removes the oldest bundles until `incoming` more bytes fit under the storage cap.
+/// Removes the oldest bundles until `incoming` more bytes fit under the storage cap, and no
+/// more than that. 503 when nothing can be removed (the store refuses deletes): better to
+/// refuse a report than to grow past the cap.
 async fn make_room(st: &AppState, blobs: &dyn BlobStore, incoming: i64) -> Result<(), ApiError> {
     let cap = st.crash.limits.storage_cap;
-    loop {
-        let used = st.db.crash_bytes().map_err(ApiError::db)?;
-        if used + incoming <= cap {
-            return Ok(());
-        }
+    let mut need = st.db.crash_bytes().map_err(ApiError::db)? + incoming - cap;
+    while need > 0 {
         let oldest = st.db.crash_oldest_bundles(20).map_err(ApiError::db)?;
         if oldest.is_empty() {
-            return Ok(());
+            // Nothing kept to remove: the new one is bigger than the whole cap.
+            return Err(too_large(usize::try_from(cap).unwrap_or(0)));
         }
         let mut gone = 0;
-        for (id, key) in oldest {
+        for (id, key, size) in oldest {
             if remove_bundle(st, blobs, &id, &key).await {
                 gone += 1;
+                need -= size;
+                if need <= 0 {
+                    break;
+                }
             }
         }
-        // The disk or the database refuses: store anyway rather than loop for ever.
         if gone == 0 {
             tracing::error!("crash bundles can't be removed to make room");
-            return Ok(());
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+                "Ferrocast's servers couldn't store that just now.",
+            )
+            .hint("Ferrocast keeps the report on this PC."));
         }
     }
+    Ok(())
 }
 
 /// Deletes one bundle's file, then forgets its key (the row, with its metadata, stays).
@@ -525,20 +541,30 @@ async fn remove_bundle(st: &AppState, blobs: &dyn BlobStore, id: &str, key: &str
     }
 }
 
-/// A signature with its bundles and rows.
-async fn delete_signature(st: &AppState, blobs: &dyn BlobStore, signature: &str) {
-    match st.db.crash_signature_bundles(signature) {
-        Ok(keys) => {
-            for key in keys {
-                if let Err(e) = blobs.delete(&key).await {
-                    tracing::warn!(error = %e, "couldn't delete a crash bundle");
-                }
-            }
+/// A signature with its bundles and rows. `false` (and nothing lost) when a bundle couldn't
+/// be removed: the rows that still point at one stay, so a later try can finish. The caller
+/// holds the ingest lock.
+async fn delete_signature(st: &AppState, blobs: &dyn BlobStore, signature: &str) -> bool {
+    let bundles = match st.db.crash_signature_bundles(signature) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list a signature's crash bundles");
+            return false;
         }
-        Err(e) => tracing::warn!(error = %e, "couldn't list a signature's crash bundles"),
+    };
+    let mut all_gone = true;
+    for (id, key) in bundles {
+        all_gone &= remove_bundle(st, blobs, &id, &key).await;
     }
-    if let Err(e) = st.db.crash_delete_signature(signature) {
-        tracing::warn!(error = %e, "couldn't delete a crash signature");
+    if !all_gone {
+        return false;
+    }
+    match st.db.crash_delete_signature(signature) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't delete a crash signature");
+            false
+        }
     }
 }
 
@@ -561,7 +587,17 @@ pub(crate) async fn sweep_at(st: &AppState, now: i64) {
         match st.db.crash_signatures_before(now - l.metadata_days * DAY_MS) {
             Ok(old) => {
                 for sig in old {
-                    delete_signature(st, blobs, &sig).await;
+                    // Alone, and looked at again: a report may have come in since the list.
+                    let _one = st.crash.ingest.lock().await;
+                    let still_old = st
+                        .db
+                        .crash_signature(&sig)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| s.last_seen < now - l.metadata_days * DAY_MS);
+                    if still_old {
+                        delete_signature(st, blobs, &sig).await;
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "couldn't list old crash signatures"),
@@ -703,11 +739,19 @@ async fn remove(
     if !signature_ok(&signature) || st.db.crash_signature(&signature).map_err(ApiError::db)?.is_none() {
         return Err(not_found("crash signature"));
     }
-    match st.blobs() {
+    // Not while an upload is being stored.
+    let _one = st.crash.ingest.lock().await;
+    let done = match st.blobs() {
         Ok(blobs) => delete_signature(&st, blobs, &signature).await,
-        Err(_) => {
-            st.db.crash_delete_signature(&signature).map_err(ApiError::db)?;
-        }
+        Err(_) => st.db.crash_delete_signature(&signature).map_err(ApiError::db)?,
+    };
+    if !done {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage",
+            "Some of this signature's files couldn't be removed.",
+        )
+        .hint("Nothing was lost; try again."));
     }
     // Who asked, if the Control Center says (not required: it isn't a Pro change).
     let actor = headers.get("x-admin-email").and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
