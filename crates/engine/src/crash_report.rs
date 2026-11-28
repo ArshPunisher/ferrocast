@@ -49,6 +49,12 @@ const MAX_BODY: usize = 900_000;
 /// Tries to send on its own while `always`.
 const MAX_AUTO_ATTEMPTS: u32 = 3;
 const DAY_MS: i64 = 86_400_000;
+/// The whole upload may take this long (the body is up to ~900 KB; the usual relay call's 15 s
+/// timed out on a slow uplink, and the report then looked like `relay_unavailable`).
+pub(crate) const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A report nobody answered (Esc, or the prompt never opened) is dropped after this long, so
+/// picking "Always" weeks later never sends an old report the person had put aside.
+const PENDING_TTL_MS: i64 = 7 * DAY_MS;
 const NO_PANIC: &str = "Ferrocast closed unexpectedly (no panic was recorded).";
 
 /// The one report waiting for a yes (or for the next start, when `always`).
@@ -184,6 +190,17 @@ pub(crate) fn previous_session(logs: &str) -> &str {
     }
 }
 
+/// The version in a session's own start line (`Ferrocast starting version="3.8.0" pid=1`),
+/// when the session text begins with one.
+pub(crate) fn session_start_version(session: &str) -> Option<String> {
+    let line = session.lines().find(|l| l.contains(" INFO ") && l.contains("Ferrocast starting"))?;
+    let rest = line.split_once("version=")?.1;
+    let rest = rest.trim_start_matches('"');
+    let v: String =
+        rest.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')).collect();
+    (!v.is_empty()).then_some(v)
+}
+
 /// The last error line of a session, as plain text after the level (for a kill with no panic).
 fn last_error_line(text: &str) -> Option<String> {
     text.lines().rev().find_map(|l| {
@@ -246,6 +263,9 @@ pub(crate) struct Parts<'a> {
     pub secrets: &'a [&'a str],
     pub users: &'a [&'a str],
     pub now_ms: i64,
+    /// The version the run that ended badly was (from the marker it left); `None` for a marker
+    /// from before it was recorded.
+    pub crashed_version: Option<&'a str>,
 }
 
 fn gzip(text: &str) -> Vec<u8> {
@@ -313,7 +333,10 @@ pub(crate) fn compose(parts: &Parts<'_>) -> Pending {
         .take(8)
         .collect();
     let os_name = format!("{} {}", parts.report.os.name, parts.report.os.version);
-    let version = token(&parts.report.app.version, &['.', '-', '_', '+'], 32);
+    // The report is built on the next start, which may be an update: the version that crashed
+    // is the one its marker (or, from an older marker, its start line in the log) names.
+    let crashed = parts.crashed_version.map(str::to_string).or_else(|| session_start_version(session));
+    let version = token(crashed.as_deref().unwrap_or(&parts.report.app.version), &['.', '-', '_', '+'], 32);
     let arch = token(&parts.report.app.arch, &['-', '_'], 16);
     let os = {
         let s = one_line(&os_name, 64);
@@ -419,6 +442,7 @@ impl Engine {
             &s_refs,
             &u_refs,
         );
+        let crashed_version = self.inner.safe_mode.lock().unwrap_or_else(|e| e.into_inner()).previous_version.clone();
         let with_times: Vec<(String, Vec<u8>, Option<i64>)> = crash_files
             .into_iter()
             .map(|(name, bytes)| {
@@ -435,12 +459,13 @@ impl Engine {
             secrets: &s_refs,
             users: &u_refs,
             now_ms: now().0,
+            crashed_version: crashed_version.as_deref(),
         }))
     }
 
     /// `GET /api/v1/diagnostics/pending-report`.
     pub async fn pending_crash_report(&self) -> Value {
-        // No lock: the file is replaced whole, and a send in flight (up to 15 s) must not
+        // No lock: the file is replaced whole, and a send in flight (up to a minute) must not
         // make the dashboard wait to look.
         match self.load_pending() {
             Some(p) => json!({
@@ -523,7 +548,7 @@ impl Engine {
             return Outcome::Failed { reason: "too_large", terminal: true };
         }
         let res = self
-            .relay_http()
+            .relay_http_with_timeout(UPLOAD_TIMEOUT)
             .post(format!("{url}/v1/crash-reports"))
             .bearer_auth(auth)
             .header("content-type", "application/json")
@@ -578,6 +603,13 @@ impl Engine {
             }
         }
         let _one = self.inner.crash_report_op.lock().await;
+        // A report left unanswered for a week goes, whatever the setting is now.
+        if self.load_pending().is_some_and(|p| now().0.saturating_sub(p.created_ms) > PENDING_TTL_MS) {
+            match self.drop_pending() {
+                Ok(_) => tracing::info!("an old unanswered crash report was removed"),
+                Err(e) => tracing::warn!(error = %e, "couldn't remove an old crash report"),
+            }
+        }
         // Looked at again with the lock held: the person may have changed it meanwhile.
         if self.settings().crash_reports != "always" {
             return;

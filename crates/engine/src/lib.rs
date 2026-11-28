@@ -744,6 +744,12 @@ impl Engine {
         let current = serde_json::to_value(self.settings()).map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut merged = current.clone();
         for (k, v) in patch {
+            // The consent to send crash reports changes only by a save that is about nothing
+            // else: a stale settings form (another tab, a tablet on the LAN) saves every field
+            // it loaded, and must not put back a choice the person has since changed.
+            if k == "crash_reports" && patch.len() > 1 {
+                continue;
+            }
             let Some(slot) = merged.get_mut(k) else { continue }; // unknown keys are ignored
             let mut one = current.clone();
             one[k.as_str()] = v.clone();

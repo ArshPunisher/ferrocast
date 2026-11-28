@@ -73,7 +73,13 @@ impl Engine {
     }
 
     pub(crate) fn relay_http(&self) -> reqwest::Client {
-        reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap_or_default()
+        self.relay_http_with_timeout(Duration::from_secs(15))
+    }
+
+    /// The relay client with its own total time limit, for a call that sends a big body (a
+    /// crash report is up to ~900 KB: on a slow uplink 15 s is not enough).
+    pub(crate) fn relay_http_with_timeout(&self, total: Duration) -> reqwest::Client {
+        reqwest::Client::builder().timeout(total).build().unwrap_or_default()
     }
 
     /// The install's `id.secret`, registering with the relay the first time.

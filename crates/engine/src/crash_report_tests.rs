@@ -249,6 +249,62 @@ async fn a_kill_without_a_panic_is_an_unclean_exit() {
     assert!(pending_text(&v).contains("no panic was recorded"));
 }
 
+/// A data folder whose last run (3.7.9) was killed and which has now been started by this build.
+fn killed_on(dir: &std::path::Path, marker_version: Option<&str>) {
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::write(
+        dir.join("logs/ferrocast.log"),
+        "T INFO ferrocast: Ferrocast starting version=\"3.7.9\" pid=1\nT INFO working\n\
+         T INFO ferrocast: Ferrocast starting version=\"9.9.9\" pid=2\n",
+    )
+    .unwrap();
+    let marker = match marker_version {
+        Some(v) => json!({ "pid": 1, "started_at_ms": 1, "version": v }),
+        None => json!({ "pid": 1, "started_at_ms": 1 }),
+    };
+    std::fs::write(dir.join("running.json"), marker.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn a_crash_is_reported_under_the_version_that_crashed_not_the_one_that_sends() {
+    // The marker the crashed run left names its version.
+    let dir = tempfile::tempdir().unwrap();
+    killed_on(dir.path(), Some("3.7.5"));
+    let e = start_in(dir.path(), Arc::new(MemorySecrets::default()), None).await;
+    // The desktop's start reads the marker the crashed run left (`start_with` alone doesn't).
+    e.init_safe_mode(dir.path(), false);
+    e.crash_report_startup().await;
+    let p = e.load_pending_for_test().unwrap();
+    assert_eq!(p.version, "3.7.5");
+    assert!(p.text.contains("version: 3.7.5\n"), "the preview header shows it too");
+    assert_ne!(p.version, env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn a_marker_from_before_versions_were_recorded_falls_back_to_the_start_line_in_the_log() {
+    // 3.8.0 wrote markers with no version: the usual "crashed on 3.8.0, updated" case.
+    let dir = tempfile::tempdir().unwrap();
+    killed_on(dir.path(), None);
+    let e = start_in(dir.path(), Arc::new(MemorySecrets::default()), None).await;
+    e.init_safe_mode(dir.path(), false);
+    e.crash_report_startup().await;
+    assert_eq!(e.load_pending_for_test().unwrap().version, "3.7.9");
+}
+
+#[test]
+fn a_session_start_line_names_its_version_quoted_or_not() {
+    assert_eq!(
+        session_start_version("T INFO ferrocast: Ferrocast starting version=\"3.8.0\" pid=4\n").as_deref(),
+        Some("3.8.0")
+    );
+    assert_eq!(
+        session_start_version("T INFO Ferrocast starting version=3.8.1-beta.2 pid=4").as_deref(),
+        Some("3.8.1-beta.2")
+    );
+    assert_eq!(session_start_version("T INFO Ferrocast starting v=1"), None);
+    assert_eq!(session_start_version("no start here"), None);
+}
+
 #[tokio::test]
 async fn a_clean_start_makes_no_report() {
     let dir = tempfile::tempdir().unwrap();
@@ -435,6 +491,81 @@ async fn delete_means_dont_send_and_it_stays_deleted() {
     assert!(!d.path().join("crash-report/pending.json").exists());
     assert!(!e.discard_pending_crash_report().await.unwrap(), "nothing left to delete");
     assert!(rel.lock().unwrap().bodies.is_empty());
+}
+
+#[tokio::test]
+async fn a_slow_uplink_gets_longer_than_the_usual_relay_call_to_finish_the_upload() {
+    // The relay takes 17 s to answer: more than the 15 s of other relay calls, well under the
+    // upload's minute.
+    let app = axum::Router::new()
+        .route("/v1/installs", post(|| async { Json(json!({ "install_id": "i1", "install_secret": "s1" })) }))
+        .route(
+            "/v1/crash-reports",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(17)).await;
+                (StatusCode::CREATED, Json(json!({ "id": "cr_x" })))
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let (e, _d) = crashed(Some(url), "ask").await;
+    e.crash_report_startup().await;
+    assert_eq!(e.send_pending_crash_report(None).await.unwrap(), json!({ "sent": true }));
+}
+
+#[tokio::test]
+async fn a_stale_settings_save_can_not_put_back_a_changed_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = start_in(dir.path(), Arc::new(MemorySecrets::default()), None).await;
+    // A second tab loaded Settings while it said "always"...
+    set_mode(&e, "always").await;
+    let stale = serde_json::to_value(e.settings()).unwrap();
+    // ...the person then picked "never" in the first tab...
+    set_mode(&e, "never").await;
+    // ...and the second tab saves an unrelated change with everything it loaded.
+    let mut body = stale.as_object().unwrap().clone();
+    body.insert("keep_chat_days".into(), json!(9));
+    let saved = e.patch_settings(&body).await.unwrap();
+    assert_eq!(saved.keep_chat_days, 9, "the rest of the save still applies");
+    assert_eq!(saved.crash_reports, "never", "the consent is untouched");
+    assert_eq!(e.settings().crash_reports, "never");
+    // A save about the consent alone is the person's choice.
+    set_mode(&e, "ask").await;
+    assert_eq!(e.settings().crash_reports, "ask");
+}
+
+#[tokio::test]
+async fn a_report_put_aside_for_a_week_is_never_sent_when_always_is_picked_later() {
+    let (url, rel) = relay(201).await;
+    // Made by a crash, then left unanswered (Esc): "ask" keeps it on disk.
+    let (e, d) = crashed(Some(url.clone()), "ask").await;
+    e.crash_report_startup().await;
+    let mut p = e.load_pending_for_test().unwrap();
+    assert!(d.path().join("crash-report/pending.json").exists());
+    // Eight days later the person picks Always; this start was clean.
+    p.created_ms -= 8 * 86_400_000;
+    e.save_pending_for_test(&p);
+    set_mode(&e, "always").await;
+    let e2 = start_in(d.path(), Arc::new(MemorySecrets::default()), Some(url.clone())).await;
+    set_mode(&e2, "always").await;
+    e2.set_safe_mode_for_test(false, false);
+    e2.crash_report_startup().await;
+    assert!(rel.lock().unwrap().bodies.is_empty(), "an old dismissed report must not be sent");
+    assert!(!d.path().join("crash-report/pending.json").exists(), "and it is removed");
+
+    // A day-old one still goes (the person may only have been away).
+    let (e3, d3) = crashed(Some(url.clone()), "ask").await;
+    e3.crash_report_startup().await;
+    let mut p = e3.load_pending_for_test().unwrap();
+    p.created_ms -= 86_400_000;
+    e3.save_pending_for_test(&p);
+    set_mode(&e3, "always").await;
+    let e4 = start_in(d3.path(), Arc::new(MemorySecrets::default()), Some(url)).await;
+    set_mode(&e4, "always").await;
+    e4.set_safe_mode_for_test(false, false);
+    e4.crash_report_startup().await;
+    assert_eq!(rel.lock().unwrap().bodies.len(), 1);
 }
 
 // ── The three settings ───────────────────────────────────────────────────────────────

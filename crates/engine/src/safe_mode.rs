@@ -18,6 +18,10 @@ use crate::{Engine, EngineError};
 struct RunningMarker {
     pid: u32,
     started_at_ms: i64,
+    /// The app version that wrote it: after a crash this is the version that crashed (the next
+    /// start may be an update). Markers from 3.8.0 and before don't have it.
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// Safe Mode state exposed through `GET /api/v1/status` and `GET /api/v1/studio/engine`.
@@ -58,6 +62,9 @@ pub(crate) struct SafeModeState {
     pub(crate) status: SafeModeStatus,
     pub(crate) locked_by_flag: bool,
     pub(crate) marker_dir: Option<PathBuf>,
+    /// The version recorded in the marker the last run left behind (an unclean exit), for the
+    /// crash report: it names the version that crashed, not the one that sends the report.
+    pub(crate) previous_version: Option<String>,
     pub(crate) on_enable_normal: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -67,6 +74,7 @@ impl fmt::Debug for SafeModeState {
             .field("status", &self.status)
             .field("locked_by_flag", &self.locked_by_flag)
             .field("marker_dir", &self.marker_dir)
+            .field("previous_version", &self.previous_version)
             .field("has_normal_hook", &self.on_enable_normal.is_some())
             .finish()
     }
@@ -93,7 +101,15 @@ pub fn has_unclean_exit(data_dir: &Path) -> bool {
 /// Records the running marker for the current process and computes the initial Safe Mode state.
 pub(crate) fn begin_session_marker(data_dir: &Path, explicit_safe_mode: bool, started_at_ms: i64) -> SafeModeState {
     let unclean_exit = has_unclean_exit(data_dir);
-    let marker = RunningMarker { pid: std::process::id(), started_at_ms };
+    // Read before it is overwritten: the version the run that left it was.
+    let previous_version = if unclean_exit {
+        ferrocast_store::durable::load_json_with_backup::<RunningMarker>(&running_marker_path(data_dir), |_| true)
+            .and_then(|l| l.value.version)
+    } else {
+        None
+    };
+    let marker =
+        RunningMarker { pid: std::process::id(), started_at_ms, version: Some(env!("CARGO_PKG_VERSION").to_string()) };
     if let Err(e) = ferrocast_store::durable::save_json_pretty(&running_marker_path(data_dir), &marker) {
         tracing::warn!(error = %e, "couldn't write running marker");
     }
@@ -126,6 +142,7 @@ pub(crate) fn begin_session_marker(data_dir: &Path, explicit_safe_mode: bool, st
         status,
         locked_by_flag: explicit_safe_mode,
         marker_dir: Some(data_dir.to_path_buf()),
+        previous_version,
         on_enable_normal: None,
     }
 }
