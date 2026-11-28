@@ -141,14 +141,18 @@ pub(crate) fn find_panic(text: &str) -> Option<Panic> {
     let at = text.rfind("panicked at ")? + "panicked at ".len();
     let rest = &text[at..];
     let mut lines = rest.lines();
-    let first = lines.next().unwrap_or("").trim();
+    // The desktop logs `info=<panic> trace=<backtrace>` as one event, so the message line
+    // continues into ` trace=   0: <frame>`; the frames differ by system and build and must
+    // never reach the message or the signature.
+    let before_trace = |l: &str| l.split(" trace=").next().unwrap_or("").trim().to_string();
+    let first = before_trace(lines.next().unwrap_or(""));
     if let Some(quoted) = first.strip_prefix('\'')
         && let Some((msg, loc)) = quoted.rsplit_once("', ")
     {
         return Some(Panic { location: loc.trim().to_string(), message: msg.trim().to_string() });
     }
     let location = first.trim_end_matches(':').trim().to_string();
-    let message = lines.next().unwrap_or("").trim().chars().take(300).collect();
+    let message = before_trace(lines.next().unwrap_or("")).chars().take(300).collect();
     Some(Panic { location, message })
 }
 

@@ -284,6 +284,9 @@ impl Db {
     pub(crate) fn crash_prune_metadata(&self, before: i64) -> rusqlite::Result<()> {
         let c = self.c();
         c.execute("DELETE FROM crash_reports WHERE received_ms < ?1 AND blob_key IS NULL", [before])?;
+        // Install hashes, versions and systems seen long ago go too, even while a signature
+        // keeps being hit: the one-year retention covers them as well.
+        c.execute("DELETE FROM crash_facets WHERE last_seen < ?1", [before])?;
         // Never one that still has a bundle: its key is the only way to delete the file.
         c.execute(
             "DELETE FROM crash_signatures WHERE last_seen < ?1 AND NOT EXISTS (

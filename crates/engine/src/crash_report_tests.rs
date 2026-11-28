@@ -45,6 +45,26 @@ fn numbers_paths_and_addresses_do_not_split_one_bug_into_many() {
 }
 
 #[test]
+fn the_backtrace_on_the_same_log_line_never_reaches_the_message_or_the_signature() {
+    // The desktop logs `info=<panic> trace=<backtrace>` as one event (apps/desktop main.rs).
+    let line = |frame0: &str| {
+        format!(
+            "T ERROR ferrocast: Ferrocast stopped unexpectedly info=panicked at src/studio.rs:12:5:\n\
+             index 7 out of range for 5 trace={frame0}\n   1: std::rt::lang_start\n"
+        )
+    };
+    let a = find_panic(&line("   0: std::backtrace_rs::backtrace::libunwind::trace")).unwrap();
+    let b = find_panic(&line("   0: <core::result::Result as Foo>::bar at /rustc/abc/library/x.rs:1")).unwrap();
+    assert_eq!(a.message, "index 7 out of range for 5");
+    assert!(!a.message.contains("trace="));
+    let sig = |p: &Panic| signature_of("crash", &file_of(&p.location), &normalise(&p.message));
+    assert_eq!(sig(&a), sig(&b), "frame 0 differs by system; the bug is the same");
+    // The older one-line form with a trace after it.
+    let old = find_panic("panicked at 'boom 5', src/a.rs:10:5 trace=   0: frame\n").unwrap();
+    assert_eq!((old.location.as_str(), old.message.as_str()), ("src/a.rs:10:5", "boom 5"));
+}
+
+#[test]
 fn the_older_panic_format_is_read_too() {
     let p = find_panic("thread 'main' panicked at 'boom 5', src/a.rs:10:5\n").unwrap();
     assert_eq!((p.location.as_str(), p.message.as_str()), ("src/a.rs:10:5", "boom 5"));
@@ -130,8 +150,7 @@ fn plant(dir: &std::path::Path) {
          2026-11-27T10:00:01Z WARN connecting rtmp://live.twitch.tv/app/{SECRET_KEY}\n\
          2026-11-27T10:00:02Z ERROR user=secret.email@fixture.example ip=198.51.100.42 token={SECRET_TOKEN}\n\
          2026-11-27T10:05:00Z ERROR ferrocast: Ferrocast stopped unexpectedly info=panicked at /Users/secretHomeUser99/ferrocast/crates/engine/src/studio.rs:120:9:\n\
-         index 77 out of range for 5 path=C:\\Users\\WinFixtureUser\\Videos\\out.mkv\n\
-         stack backtrace:\n   0: ferrocast::studio::run\n   1: std::rt::lang_start\n\
+         index 77 out of range for 5 path=C:\\Users\\WinFixtureUser\\Videos\\out.mkv trace=   0: ferrocast::studio::run\n   1: std::rt::lang_start\n\
          2026-11-28T09:00:00Z INFO Ferrocast starting version=\"3.8.0\"\n\
          2026-11-28T09:00:01Z INFO a fine line from this session\n"
     );
@@ -166,7 +185,7 @@ async fn the_report_has_the_sections_and_no_dump_and_no_secret() {
         assert!(text.contains(section), "missing {section}");
     }
     assert!(text.contains("CRASH NOTE panic-note.txt"), "the text crash note is in");
-    assert!(text.contains("stack backtrace") && text.contains("index 77 out of range"), "the trace is in");
+    assert!(text.contains("1: std::rt::lang_start") && text.contains("index 77 out of range"), "the trace is in");
     // Never the binary dump, in any form.
     assert!(!text.contains(DUMP_MARKER), "dump bytes leaked");
     assert!(!text.contains("MDMP"), "dump header leaked");

@@ -527,6 +527,23 @@ async fn a_bundle_that_can_not_be_deleted_keeps_its_signature_for_the_next_try()
 }
 
 #[tokio::test]
+async fn install_hashes_are_forgotten_after_the_retention_even_while_the_signature_lives() {
+    let w = world(limits()).await;
+    let (a1, _) = w.install();
+    let (a2, _) = w.install();
+    w.post(&a1, &good(SIG_A)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let cut = now_ms();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    w.post(&a2, &good(SIG_A)).await;
+    assert_eq!(w.st.db.crash_signature(SIG_A).unwrap().unwrap().installs, 2);
+    // A retention that ends between the two: the first install's hash is gone, the signature stays.
+    w.st.db.crash_prune_metadata(cut).unwrap();
+    let s = w.st.db.crash_signature(SIG_A).unwrap().unwrap();
+    assert_eq!((s.installs, s.count), (1, 2));
+}
+
+#[tokio::test]
 async fn signatures_can_not_be_minted_without_bound() {
     let w = world(Limits { max_signatures: 2, ..limits() }).await;
     let mut ids = Vec::new();
