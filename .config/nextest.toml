@@ -1,0 +1,5 @@
+# A test that has not finished after half an hour is stuck, not slow (the longest soak test takes
+# about ten minutes on a Windows runner): stop it so the run fails with the test's name instead of
+# holding the job until the runner's own limit cancels it.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 30 }
