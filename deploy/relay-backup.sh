@@ -116,9 +116,12 @@ assert ok == "ok", ok
   cp "$DIR/relay.env" "$work/relay.env"
   SRC="$work" rclone copy /src "box:db/$day"
   # Blobs mirror the relay's own deletions (no folder yet: nothing stored so far).
+  # Crash report bundles (blobs/crash-reports/) are NOT mirrored: they hold redacted logs the
+  # person agreed to send for fixing a crash, with a 90 day life, and a copy here would outlive
+  # the relay's own deletes (and --delete-excluded removes any copy made before this).
   if docker run --rm -v "$vol:/data:ro" "$PY_IMAGE" test -d /data/blobs; then
     docker run --rm -v "$vol:/data:ro" -v "$CONF:/config/rclone/rclone.conf:ro" "$RCLONE_IMAGE" \
-      sync /data/blobs box:blobs --create-empty-src-dirs
+      sync /data/blobs box:blobs --create-empty-src-dirs --exclude "crash-reports/**" --delete-excluded
   fi
   rclone delete box:db --min-age "${KEEP_DAYS}d"
   rclone rmdirs box:db --leave-root
