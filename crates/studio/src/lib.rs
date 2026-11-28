@@ -212,12 +212,20 @@ pub(crate) fn fit_holes(
         .iter()
         .map(|&(x, y, w, h, r)| {
             let (x1, y1) = (x + w, y + h);
-            let nx0 = if x <= NEAR { (x + over.left).min(0.0) } else { x + over.left };
-            let ny0 = if y <= NEAR { (y + over.top).min(0.0) } else { y + over.top };
-            let nx1 =
-                if x1 >= box_w - NEAR { (x1 + over.left).max(box_w + over.left + over.right) } else { x1 + over.left };
-            let ny1 =
-                if y1 >= box_h - NEAR { (y1 + over.top).max(box_h + over.top + over.bottom) } else { y1 + over.top };
+            // A side is only reached out to when the view reaches past the box there: with none,
+            // the page's own gap (a half point at 2x is a device pixel) stays as it was sent.
+            let nx0 = if x <= NEAR && over.left > 0.0 { (x + over.left).min(0.0) } else { x + over.left };
+            let ny0 = if y <= NEAR && over.top > 0.0 { (y + over.top).min(0.0) } else { y + over.top };
+            let nx1 = if x1 >= box_w - NEAR && over.right > 0.0 {
+                (x1 + over.left).max(box_w + over.left + over.right)
+            } else {
+                x1 + over.left
+            };
+            let ny1 = if y1 >= box_h - NEAR && over.bottom > 0.0 {
+                (y1 + over.top).max(box_h + over.top + over.bottom)
+            } else {
+                y1 + over.top
+            };
             (nx0, ny0, nx1 - nx0, ny1 - ny0, r)
         })
         .collect()
@@ -823,6 +831,28 @@ mod tests {
         assert!(x + w >= 401.1 && y + h >= 300.8, "{x} {y} {w} {h}");
         // No overhang (a box already on whole pixels) changes nothing.
         assert_eq!(fit_holes(&whole, Overhang::default(), 400.4, 300.3), whole.to_vec());
+    }
+
+    #[test]
+    fn a_near_edge_hole_keeps_its_gap_on_a_side_with_no_overhang() {
+        // Half a point from the left and top, and from the right and bottom, with nothing to
+        // reach out to: the gaps the page sent stay (at 2x each is one device pixel).
+        let near = [(0.5, 0.5, 399.4, 299.3, 0.0)];
+        assert_eq!(fit_holes(&near, Overhang::default(), 400.4, 300.3), near.to_vec());
+        let small = [(0.5, 40.0, 100.0, 80.0, 0.0)];
+        assert_eq!(fit_holes(&small, Overhang::default(), 400.4, 300.3), small.to_vec());
+        // Each side on its own: the left reaches out, the others keep their gap.
+        let over = Overhang { left: 0.4, ..Overhang::default() };
+        let (x, y, w, h, _) = fit_holes(&near, over, 400.4, 300.3)[0];
+        assert_eq!(x, 0.0, "the side with overhang reaches the view's edge");
+        assert_eq!(y, 0.5, "the side without keeps its gap");
+        assert!((x + w - 399.9 - 0.4).abs() < 1e-9 && (y + h - 299.8).abs() < 1e-9, "{x} {y} {w} {h}");
+        // And the far sides the same way.
+        let over = Overhang { right: 0.3, bottom: 0.0, ..Overhang::default() };
+        let (x, y, w, h, _) = fit_holes(&near, over, 400.4, 300.3)[0];
+        assert_eq!((x, y), (0.5, 0.5));
+        assert!((x + w - 400.7).abs() < 1e-9, "the right reaches the view's edge: {w}");
+        assert!((y + h - 299.8).abs() < 1e-9, "the bottom keeps its gap: {h}");
     }
 
     #[test]
