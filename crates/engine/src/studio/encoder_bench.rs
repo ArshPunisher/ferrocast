@@ -2692,7 +2692,7 @@ mod tests {
     use crate::studio_host::{StudioAct, StudioHost};
     use async_trait::async_trait;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     #[derive(Debug)]
     struct BenchMockHost {
@@ -2708,6 +2708,8 @@ mod tests {
         record_stats_override: Mutex<Option<Result<Value, String>>>,
         delay_drain_val: Mutex<Option<(f64, f64)>>,
         settings_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+        /// How many `settings()` calls have reached the barrier (waiting there or released).
+        settings_at_barrier: AtomicUsize,
     }
 
     impl Default for BenchMockHost {
@@ -2725,6 +2727,7 @@ mod tests {
                 record_stats_override: Mutex::new(None),
                 delay_drain_val: Mutex::new(None),
                 settings_barrier: Mutex::new(None),
+                settings_at_barrier: AtomicUsize::new(0),
             }
         }
     }
@@ -2811,6 +2814,7 @@ mod tests {
         async fn settings(&self) -> StudioSettings {
             let barrier = self.settings_barrier.lock().unwrap().clone();
             if let Some(b) = barrier {
+                self.settings_at_barrier.fetch_add(1, Ordering::SeqCst);
                 b.wait().await;
             }
             self.settings.lock().unwrap().clone()
@@ -2871,6 +2875,16 @@ mod tests {
         while !cond() {
             assert!(Instant::now() < deadline, "gave up waiting for {what}");
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Awaits `fut`, failing the test with `what` if it takes longer than 30 s. Every wait on
+    /// something another task must do (a barrier, a spawned task) goes through this, so a lost
+    /// wake-up fails the test quickly instead of holding the test run until the CI job is cancelled.
+    async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(Duration::from_secs(30), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!("gave up after 30 s waiting for {what}"),
         }
     }
 
@@ -3324,8 +3338,8 @@ mod tests {
         // Release whichever task(s) are waiting on the 2-party barrier without deadlocking if serialized.
         let _ = tokio::time::timeout(Duration::from_millis(100), barrier.wait()).await;
 
-        let bench_res = bench_handle.await.unwrap();
-        let rec_res = rec_handle.await.unwrap();
+        let bench_res = within("the benchmark task", bench_handle).await.unwrap();
+        let rec_res = within("the record task", rec_handle).await.unwrap();
         assert!(
             !(bench_res.is_ok() && rec_res.is_ok()),
             "TOCTOU race: both benchmark ({bench_res:?}) and studio_record(true) ({rec_res:?}) succeeded!"
@@ -3944,26 +3958,27 @@ mod tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         *host.settings_barrier.lock().unwrap() = Some(barrier.clone());
 
-        // Let the confirm_timeout (180 ms in fast_test) expire so TimeoutOffline enters `host.settings()`.
-        tokio::time::sleep(Duration::from_millis(240)).await;
+        // Wait until the 180 ms confirm timeout has fired and the rollback is parked inside
+        // `host.settings()`. Waiting for that fact, not for a sleep, keeps the race the same on a
+        // loaded runner: a timer that fires late must not leave the barrier without its second party.
+        wait_for("the timeout rollback to reach host.settings()", || {
+            host.settings_at_barrier.load(Ordering::SeqCst) >= 1
+        })
+        .await;
 
+        // The rollback has claimed the state, so Keep must be refused and must not undo it.
         let keep_res = engine.auto_config_keep();
+        assert!(
+            matches!(keep_res, Err(EngineError::Conflict(_))),
+            "Keep during an in-flight timeout rollback must be refused: {keep_res:?}"
+        );
         *host.settings_barrier.lock().unwrap() = None;
-        barrier.wait().await;
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        let st = engine.auto_config_status();
-        if keep_res.is_ok() {
-            assert_ne!(
-                st.state,
-                AutoConfigStateKind::RolledBack,
-                "Keep succeeded so Timeout must not roll back or report RolledBack"
-            );
-            assert_eq!(host.settings.lock().unwrap().video_kbps, 6400);
-        } else {
-            assert_eq!(st.state, AutoConfigStateKind::RolledBack);
-            assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
-        }
+        within("the parked rollback to be released", barrier.wait()).await;
+        wait_for("the timeout rollback to finish", || {
+            engine.auto_config_status().state == AutoConfigStateKind::RolledBack
+        })
+        .await;
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
     }
 
     #[tokio::test]
