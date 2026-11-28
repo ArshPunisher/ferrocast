@@ -3737,6 +3737,26 @@ fn clear_none_preview_slots(h: &mut Held, drop_preview: bool, drop_program: bool
     }
 }
 
+/// Places the boxes that came (preview, Studio Mode's picture of what's on air, vertical), each
+/// one whatever happens to the others: a picture that can't be made now (the first one, say)
+/// must not leave the others at their old place, where a view from before the resize is left
+/// over, or never made, until the page happens to send again. Each box's place is kept for the
+/// next time a view is made; the first error is the one returned.
+fn apply_previews(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    (preview, program, vertical): (Option<PreviewRect>, Option<PreviewRect>, Option<PreviewRect>),
+    scale: f64,
+    hide_for_resize: bool,
+) -> Result<(), String> {
+    let main = if preview.is_some() { apply_main_preview(ctx, h, preview, scale, hide_for_resize) } else { Ok(()) };
+    let on_air =
+        if program.is_some() { apply_program_preview(ctx, h, program, scale, hide_for_resize) } else { Ok(()) };
+    let tall =
+        if vertical.is_some() { apply_vertical_preview(ctx, h, vertical, scale, hide_for_resize) } else { Ok(()) };
+    main.and(on_air).and(tall)
+}
+
 fn set_previews_with<F>(
     h: &mut Held,
     preview: Option<PreviewRect>,
@@ -4622,24 +4642,18 @@ impl StudioHost for DesktopStudio {
     ) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
-            set_previews_with(h, preview, program, vertical, |h, preview, program, vertical| {
-                let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-                let scale = window.scale_factor().unwrap_or(1.0);
-                let (hide_for_resize, actions) = prepare_preview_put(&app);
-                let res = ferrocast_studio::batch_preview_updates(|| -> Result<(), String> {
-                    if preview.is_some() {
-                        apply_main_preview(ViewCtx::App(&app), h, preview, scale, hide_for_resize)?;
-                    }
-                    if program.is_some() {
-                        apply_program_preview(ViewCtx::App(&app), h, program, scale, hide_for_resize)?;
-                    }
-                    if vertical.is_some() {
-                        apply_vertical_preview(ViewCtx::App(&app), h, vertical, scale, hide_for_resize)?;
-                    }
-                    Ok(())
-                });
-                apply_resize_window_effects(&app, actions);
-                res
+            // One transaction for all of it, the removal of a box that went as well as the
+            // placing of the others, so a picture never shows between the two.
+            ferrocast_studio::batch_preview_updates(|| {
+                set_previews_with(h, preview, program, vertical, |h, preview, program, vertical| {
+                    let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    let (hide_for_resize, actions) = prepare_preview_put(&app);
+                    let res =
+                        apply_previews(ViewCtx::App(&app), h, (preview, program, vertical), scale, hide_for_resize);
+                    apply_resize_window_effects(&app, actions);
+                    res
+                })
             })
         })
         .await?
@@ -9484,6 +9498,42 @@ mod import_tests {
         assert_eq!(reset.emit.len(), 1);
         assert!(!reset.emit[0].0);
         assert!(!st.is_live_resizing());
+    }
+
+    fn sample_rect(x: f64) -> ferrocast_engine::studio_host::PreviewRect {
+        ferrocast_engine::studio_host::PreviewRect {
+            x,
+            y: 20.0,
+            w: 640.0,
+            h: 360.0,
+            vh: 800.0,
+            canvas: None,
+            bg: None,
+            stripe: None,
+            holes: Vec::new(),
+            opacity: None,
+            shade: None,
+        }
+    }
+
+    #[test]
+    fn every_preview_is_placed_even_when_one_of_them_fails() {
+        use super::{Held, ViewCtx, apply_previews};
+
+        // No collection is loaded, so no view can be made: each box still has its place kept
+        // (to make the view from when it can be), and the first error is what comes back.
+        let mut h = Held::default();
+        let res = apply_previews(
+            ViewCtx::Test,
+            &mut h,
+            (Some(sample_rect(10.0)), Some(sample_rect(300.0)), Some(sample_rect(700.0))),
+            2.0,
+            false,
+        );
+        assert!(res.is_err());
+        assert_eq!(h.preview_at.map(|(r, _)| r.x), Some(10.0));
+        assert_eq!(h.program_at.map(|(r, _)| r.x), Some(300.0), "the failure of the first didn't skip this one");
+        assert_eq!(h.vertical.at.map(|(r, _)| r.x), Some(700.0), "nor this one");
     }
 
     #[test]
