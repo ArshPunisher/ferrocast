@@ -739,6 +739,16 @@ pub fn audit_path(path: &str) -> String {
         .map_or_else(|| "/(unknown)".to_string(), |r| r.rel_path.to_string())
 }
 
+/// Whether `patch` moves `crash_reports` to `always` (from anything else). Going back to
+/// `ask` or `never` is always fine.
+pub fn crash_reports_to_always(
+    engine: &ferrocast_engine::Engine,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    patch.get("crash_reports").and_then(serde_json::Value::as_str) == Some("always")
+        && engine.settings().crash_reports != "always"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +794,9 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/diagnostics/pending-report"),
+            ("POST", "/diagnostics/pending-report/send"),
+            ("DELETE", "/diagnostics/pending-report"),
             ("GET", "/clips"),
             ("GET", "/clips/jobs"),
             ("DELETE", "/clips/a.mp4"),
@@ -910,6 +923,9 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/diagnostics/pending-report"),
+            ("POST", "/diagnostics/pending-report/send"),
+            ("DELETE", "/diagnostics/pending-report"),
             ("GET", "/clips"),
             ("GET", "/clips/jobs"),
             ("DELETE", "/clips/a.mp4"),

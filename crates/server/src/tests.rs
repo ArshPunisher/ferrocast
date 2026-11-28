@@ -2137,6 +2137,36 @@ async fn diagnostics_routes_export_redacted_zip_and_enforce_validation() {
 }
 
 #[tokio::test]
+async fn the_pending_crash_report_routes_answer_on_this_pc() {
+    let r = start().await;
+    assert_eq!(
+        r.anonymous(reqwest::Method::GET, "/api/v1/diagnostics/pending-report").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let v: Value = r.get("/api/v1/diagnostics/pending-report").await.json().await.unwrap();
+    assert_eq!(v, json!({ "pending": false, "kind": null, "created_ms": null, "preview_text": null }));
+    // Nothing to send: 404 with the app's error shape.
+    let res = r.post("/api/v1/diagnostics/pending-report/send", json!({})).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "no_pending_report");
+    // Delete with nothing there is still a clean 204.
+    let res = r
+        .client
+        .delete(format!("{}/api/v1/diagnostics/pending-report", r.base))
+        .bearer_auth(&r.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // The setting is in /settings with its default.
+    let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
+    assert_eq!(s["crash_reports"], "ask");
+    let bad = r.put("/api/v1/settings", json!({ "crash_reports": "maybe" })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn diagnostics_routes_reject_non_loopback_peers_and_expose_content_disposition() {
     use axum::extract::ConnectInfo;
     use std::net::SocketAddr;
@@ -2164,6 +2194,9 @@ async fn diagnostics_routes_reject_non_loopback_peers_and_expose_content_disposi
         ("GET", "/api/v1/diagnostics/preview", String::new()),
         ("POST", "/api/v1/diagnostics/report", serde_json::json!({ "folder": out_folder.path() }).to_string()),
         ("POST", "/api/v1/diagnostics/report.zip", "{}".into()),
+        ("GET", "/api/v1/diagnostics/pending-report", String::new()),
+        ("POST", "/api/v1/diagnostics/pending-report/send", "{}".into()),
+        ("DELETE", "/api/v1/diagnostics/pending-report", String::new()),
     ] {
         let mut req = axum::http::Request::builder()
             .method(method)

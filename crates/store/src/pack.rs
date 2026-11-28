@@ -440,8 +440,11 @@ fn pack_design(row: &Map<String, Value>) -> Option<ferrocast_core::design::Desig
 
 /// Settings that belong to this computer, not to the streamer's setup: a pack (perhaps one
 /// someone else shared) must not open the server to the network, start the app at login,
-/// or point the OBS connection, and with it the OBS password, at another machine.
-const DEVICE_ENGINE_FIELDS: &[&str] = &["lan_access", "api_keys_over_lan", "launch_at_login", "close_to_tray"];
+/// or point the OBS connection, and with it the OBS password, at another machine. The
+/// crash report choice is the person's own consent for this computer too: a pack can't say
+/// "always send".
+const DEVICE_ENGINE_FIELDS: &[&str] =
+    &["lan_access", "api_keys_over_lan", "launch_at_login", "close_to_tray", "crash_reports"];
 
 fn keep_device_settings(store: &Store, tables: &mut [(&str, Vec<Map<String, Value>>)]) {
     let Some((_, rows)) = tables.iter_mut().find(|(t, _)| *t == "settings") else {
@@ -843,7 +846,10 @@ mod tests {
         repo::settings::set(&s, "engine", &json!({ "theme": "dark", "launch_at_login": true })).unwrap();
         let setting = |key: &str, value: Value| json!({ "key": key, "value": value.to_string(), "updated_at": 0 });
         let rows = serde_json::to_vec(&json!([
-            setting("engine", json!({ "theme": "light", "lan_access": true, "launch_at_login": false })),
+            setting(
+                "engine",
+                json!({ "theme": "light", "lan_access": true, "launch_at_login": false, "crash_reports": "always" }),
+            ),
             setting("obs", json!({ "host": "203.0.113.9", "port": 4455 })),
         ]))
         .unwrap();
@@ -852,6 +858,7 @@ mod tests {
         let engine: Map<String, Value> = repo::settings::get(&s, "engine").unwrap().unwrap();
         assert_eq!(engine["theme"], "light", "the streamer's own choices come across");
         assert_eq!(engine.get("lan_access"), None, "but never network access");
+        assert_eq!(engine.get("crash_reports"), None, "and never a yes to sending crash reports");
         assert_eq!(engine["launch_at_login"], true, "or this computer's start-up choice");
         assert!(repo::settings::get::<Value>(&s, "obs").unwrap().is_none(), "OBS on another machine is dropped");
 

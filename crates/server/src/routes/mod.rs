@@ -166,6 +166,11 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/diagnostics/preview", get(diagnostics::preview))
         .route("/diagnostics/report", post(diagnostics::write_report))
         .route("/diagnostics/report.zip", post(diagnostics::download_zip))
+        .route(
+            "/diagnostics/pending-report",
+            get(diagnostics::pending_report).delete(diagnostics::discard_pending_report),
+        )
+        .route("/diagnostics/pending-report/send", post(diagnostics::send_pending_report))
         .route("/themes", get(app::themes))
         .route("/stats/session", get(app::session_stats))
         .route("/recap", get(recap::recap))

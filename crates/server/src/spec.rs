@@ -1964,6 +1964,30 @@ const PLUGINS_AND_DIAGNOSTICS: &[RouteDoc] = &[
         None,
     ),
     doc("POST", "/diagnostics/report.zip", "Diagnostics", "Build support report zip archive (PC only).", None, None),
+    doc(
+        "GET",
+        "/diagnostics/pending-report",
+        "Diagnostics",
+        "The crash report waiting for a yes: `{ pending, kind, created_ms, preview_text }`, the text is exactly what a send uploads (PC only).",
+        None,
+        None,
+    ),
+    doc(
+        "DELETE",
+        "/diagnostics/pending-report",
+        "Diagnostics",
+        "Don't send the waiting crash report: removes the local copy (204, PC only).",
+        None,
+        None,
+    ),
+    doc(
+        "POST",
+        "/diagnostics/pending-report/send",
+        "Diagnostics",
+        "Send the waiting crash report to Ferrocast: `{ sent: true }` or `{ sent: false, reason }` and it stays here (PC only).",
+        None,
+        None,
+    ),
 ];
 
 /// Every HTTP REST route registered on `/api/v1`.

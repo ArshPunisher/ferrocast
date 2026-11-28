@@ -150,6 +150,17 @@ impl RemoteHandler for Handler {
                 .hint("Everything else in Settings works from here."),
             );
         }
+        // Nor may it agree to send crash reports without asking.
+        if method == Method::PUT && rel == "/settings" && crash_reports_change(&self.engine, &r.body) {
+            return error_response(
+                ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "not_allowed_for_role",
+                    "Automatic crash reports can only be turned on on the PC itself.",
+                )
+                .hint("Everything else in Settings works from here."),
+            );
+        }
         // Custom alert HTML and fields are code-like content: PC only, like plugins.
         if matches!(method, Method::PUT | Method::POST)
             && rel.starts_with("/alert-rules")
@@ -247,6 +258,11 @@ fn lan_change(engine: &Engine, body: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
     let now = json!(engine.settings());
     ["lan_access", "api_keys_over_lan"].iter().any(|f| v.get(f).is_some_and(|want| now.get(f) != Some(want)))
+}
+
+fn crash_reports_change(engine: &Engine, body: &[u8]) -> bool {
+    let Ok(Value::Object(patch)) = serde_json::from_slice::<Value>(body) else { return false };
+    remote_scope::crash_reports_to_always(engine, &patch)
 }
 
 /// The handler for `Engine::set_remote_handler`.

@@ -218,6 +218,12 @@ async fn a_phone_reaches_this_pc_through_the_relay() {
     let lan = !json!(w.engine.settings())["lan_access"].as_bool().unwrap();
     let (s, v) = w.phone(Method::PUT, "/r/api/v1/settings", &owner, Some(json!({ "lan_access": lan }))).await;
     assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{v}");
+    // Nor can it agree to automatic crash reports; going back to asking is fine.
+    let (s, v) = w.phone(Method::PUT, "/r/api/v1/settings", &owner, Some(json!({ "crash_reports": "always" }))).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{v}");
+    assert_eq!(w.engine.settings().crash_reports, "ask");
+    let (s, v) = w.phone(Method::PUT, "/r/api/v1/settings", &owner, Some(json!({ "crash_reports": "never" }))).await;
+    assert_eq!((s, v["crash_reports"].as_str()), (200, Some("never")), "{v}");
     // Refused on the relay before reaching the PC.
     for (token, method, path) in [
         (&moder, Method::GET, "/r/api/v1/settings"),
@@ -497,6 +503,8 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/diagnostics/preview",
         "/diagnostics/report",
         "/diagnostics/report.zip",
+        "/diagnostics/pending-report",
+        "/diagnostics/pending-report/send",
         "/store/catalog",
         "/store/installed",
         "/store/install",
@@ -630,6 +638,9 @@ async fn remote_owner_and_mod_are_refused_diagnostics_end_to_end() {
             ("GET", "/api/v1/diagnostics/preview", ""),
             ("POST", "/api/v1/diagnostics/report", r#"{"folder":"/tmp"}"#),
             ("POST", "/api/v1/diagnostics/report.zip", "{}"),
+            ("GET", "/api/v1/diagnostics/pending-report", ""),
+            ("POST", "/api/v1/diagnostics/pending-report/send", "{}"),
+            ("DELETE", "/api/v1/diagnostics/pending-report", ""),
         ] {
             let (s, v) = ask(&h, role, method, path, body).await;
             assert_eq!(

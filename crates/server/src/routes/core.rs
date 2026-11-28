@@ -451,6 +451,11 @@ pub async fn save_settings(
             }
         }
     }
+    // Agreeing to send crash reports without asking is the owner's too, on the PC itself.
+    if api_key.is_some() && super::remote_scope::crash_reports_to_always(&app.engine, patch) {
+        return Err(ApiError::forbidden("Local API keys can't turn on automatic crash reports.")
+            .hint("Change Send crash reports in Settings on this PC."));
+    }
     Ok(Json(json!(app.engine.patch_settings(patch).await?)))
 }
 

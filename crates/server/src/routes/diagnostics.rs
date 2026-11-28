@@ -113,3 +113,37 @@ pub async fn download_zip(
         bytes,
     ))
 }
+
+/// `GET /api/v1/diagnostics/pending-report` -> `{ pending, kind, created_ms, preview_text }`.
+/// `preview_text` is exactly the text a send uploads (gzipped).
+pub async fn pending_report(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+    State(app): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    ensure_local_loopback(connect, remote)?;
+    Ok(Json(app.engine.pending_crash_report().await))
+}
+
+/// `POST /api/v1/diagnostics/pending-report/send` -> `{ sent: true }`, or `{ sent: false,
+/// reason }` (`relay_too_old`, `rate_limited`, `too_large`, `rejected`, `relay_unavailable`;
+/// the report stays on this PC). 404 `no_pending_report` when nothing is waiting.
+pub async fn send_pending_report(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+    State(app): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    ensure_local_loopback(connect, remote)?;
+    Ok(Json(app.engine.send_pending_crash_report().await?))
+}
+
+/// `DELETE /api/v1/diagnostics/pending-report`: don't send; the local copy is removed -> 204.
+pub async fn discard_pending_report(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+    State(app): State<AppState>,
+) -> ApiResult<StatusCode> {
+    ensure_local_loopback(connect, remote)?;
+    app.engine.discard_pending_crash_report().await;
+    Ok(StatusCode::NO_CONTENT)
+}

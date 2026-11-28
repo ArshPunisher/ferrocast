@@ -217,6 +217,13 @@ async fn scope_enforcement_matrix_across_all_route_groups() {
             body: Some(json!({ "lan_access": true })),
             expected: [F, F, F, F, F, F, F],
         },
+        // Agreeing to automatic crash reports is the owner's, on the PC: never by a key.
+        Case {
+            method: "PUT",
+            path: "/settings",
+            body: Some(json!({ "crash_reports": "always" })),
+            expected: [F, F, F, F, F, F, F],
+        },
         // NEVER allowed for ANY scope, even with ALL 6 scopes granted!
         Case { method: "GET", path: "/api-keys", body: None, expected: [F, F, F, F, F, F, F] },
         Case {
@@ -273,6 +280,14 @@ async fn scope_enforcement_matrix_across_all_route_groups() {
             body: Some(json!({})),
             expected: [F, F, F, F, F, F, F],
         },
+        Case { method: "GET", path: "/diagnostics/pending-report", body: None, expected: [F, F, F, F, F, F, F] },
+        Case {
+            method: "POST",
+            path: "/diagnostics/pending-report/send",
+            body: Some(json!({})),
+            expected: [F, F, F, F, F, F, F],
+        },
+        Case { method: "DELETE", path: "/diagnostics/pending-report", body: None, expected: [F, F, F, F, F, F, F] },
         Case { method: "GET", path: "/plugins", body: None, expected: [F, F, F, F, F, F, F] },
         Case { method: "GET", path: "/plugins/catalog", body: None, expected: [F, F, F, F, F, F, F] },
         Case {
