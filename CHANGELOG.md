@@ -10,13 +10,16 @@ words. The Release workflow reads the section whose heading is the version being
 Pick the quality for each platform, see who is watching, run real polls, let chat talk, and a
 steadier Studio that stays smooth when you resize it.
 
-- **Quality per platform**: each destination in Go live has a small quality chip. One click
-  shows a few choices: Same as main, Best for that platform, or your own resolution, frame rate
-  and bitrate. The lists only offer what the platform accepts and what your computer can encode.
-  Kick never gets more than 1080p (it closes anything bigger), Twitch can still take 1440p with a
-  small note that 1080p is its recommended maximum. Platforms that want the same quality share
-  one encode, so you only pay for what is different. You can change it while live: only that
-  platform switches, your main stream and recording keep going.
+- **Quality per platform**: tap a platform's quality in Go live (or the gear) to open one
+  "Your platforms" window: your platforms on the left, that platform's quality on the right.
+  Choose "Match main stream" or set your own resolution, frame rate and bitrate. With Match main
+  you see your main stream next to what the platform really gets, for example Kick gets 1080p60
+  at 8 Mbps because it closes anything bigger, and Twitch gets 6 Mbps with a one-tap "Use 1080p60"
+  tip. Only values the platform accepts and your computer can encode are offered. Platforms that
+  want the same quality share one encode, and you can change it while live: only that platform
+  switches, your main stream and recording keep going.
+- **Go live list**: every platform row is two steady lines, its quality or a short coloured status
+  (live, reconnecting, error, switching), and tapping a problem shows the reason and one fix.
 - **Your bitrate, explained**: next to the bitrate setting you now see what each platform really
   gets (for example "Twitch 6 Mbps (max)").
 - **Watching now and Peak**: viewer counts from Twitch, YouTube and Kick, live on Home while you
@@ -35,7 +38,11 @@ steadier Studio that stays smooth when you resize it.
   the sidebar folds instantly, and below 900 px the Studio switches to a compact layout.
 - **macOS**: after an update or a restart, Ferrocast opens again in your pinned Dock icon instead
   of a second one.
-- **Fixes**: Kick closing the stream now says why (over 1080p) instead of blaming multistreaming,
+- **Sources**: Camera and Capture card are now one "Video device" entry (both list the same
+  devices), and you can add the same camera or capture card more than once in a scene: each copy
+  shows the same feed with its own size and crop, and the device is still opened only once.
+- **Scene collections and profiles**: switching a scene collection no longer leaves the preview stuck on the old one with 0 FPS; the preview, Studio Mode, vertical picture and projectors follow the new collection at once. Switching profiles keeps your settings safe (a damaged profile falls back to its backup instead of resetting), and quick clicks or switches can no longer save one collection over another.
+- **Fixes**: Selected buttons that sit side by side (stage toolbar, mixer) no longer merge into one block. A thin line of the preview no longer shows across dialogs on the Mac, an unplugged sound device's meter drops to silence instead of freezing, Advanced audio's Push to talk, Push to mute and This is a mic switches no longer overlap the next sound, the Ready check chip can be closed, toasts stay readable over dialogs, Escape returns you to where you were, no dialog opens on top of another, and many long names, narrow docks and phone layouts no longer cut off buttons or text. Kick closing the stream now says why (over 1080p) instead of blaming multistreaming,
   chat's pin button no longer overlaps messages, clearer missed-frame and falling-behind details
   in Stats and the log, and graphics card errors after a restart are gone.
 - **API**: new `GET /api/v1/golive/quality-options` and `PUT /api/v1/golive/destinations/{id}/quality`,
