@@ -127,14 +127,24 @@ pub async fn pending_report(
 
 /// `POST /api/v1/diagnostics/pending-report/send` -> `{ sent: true }`, or `{ sent: false,
 /// reason }` (`relay_too_old`, `rate_limited`, `too_large`, `rejected`, `relay_unavailable`;
-/// the report stays on this PC). 404 `no_pending_report` when nothing is waiting.
+/// the report stays on this PC). Body `{ created_ms? }`: the report that was shown, 409 if a different
+/// one is waiting now. 404 `no_pending_report` when nothing is waiting.
 pub async fn send_pending_report(
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     remote: Option<Extension<RemotePrincipal>>,
     State(app): State<AppState>,
+    Body(b): Body<SendRequest>,
 ) -> ApiResult<Json<Value>> {
     ensure_local_loopback(connect, remote)?;
-    Ok(Json(app.engine.send_pending_crash_report().await?))
+    Ok(Json(app.engine.send_pending_crash_report(b.created_ms).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SendRequest {
+    /// The `created_ms` of the report the person was shown. If another report is waiting now,
+    /// the answer is 409 and nothing is sent. Omitted: whatever is waiting is sent.
+    pub created_ms: Option<i64>,
 }
 
 /// `DELETE /api/v1/diagnostics/pending-report`: don't send; the local copy is removed -> 204.
@@ -144,6 +154,6 @@ pub async fn discard_pending_report(
     State(app): State<AppState>,
 ) -> ApiResult<StatusCode> {
     ensure_local_loopback(connect, remote)?;
-    app.engine.discard_pending_crash_report().await;
+    app.engine.discard_pending_crash_report().await?;
     Ok(StatusCode::NO_CONTENT)
 }

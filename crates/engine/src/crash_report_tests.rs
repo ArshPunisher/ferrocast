@@ -203,7 +203,7 @@ async fn the_signature_is_the_same_after_every_crash_of_the_same_bug() {
         .replace("/Users/secretHomeUser99", "/Users/someoneElse")
         .replace("index 77 out of range for 5", "index 4 out of range for 2");
     std::fs::write(d.path().join("logs/ferrocast.log"), log).unwrap();
-    e.discard_pending_crash_report().await;
+    e.discard_pending_crash_report().await.unwrap();
     // Another start of the engine on the same folder.
     let e2 = start_in(d.path(), Arc::new(MemorySecrets::default()), None).await;
     set_mode(&e2, "ask").await;
@@ -303,7 +303,7 @@ async fn send_uploads_exactly_the_preview_with_the_install_auth_and_removes_it()
     e.crash_report_startup().await;
     assert!(rel.lock().unwrap().bodies.is_empty(), "ask: nothing is sent without a yes");
     let preview = pending_text(&e.pending_crash_report().await);
-    assert_eq!(e.send_pending_crash_report().await.unwrap(), json!({ "sent": true }));
+    assert_eq!(e.send_pending_crash_report(None).await.unwrap(), json!({ "sent": true }));
     let (b, auths, sent) = {
         let r = rel.lock().unwrap();
         (r.bodies.first().cloned().unwrap_or(Value::Null), r.auths.clone(), r.bodies.len())
@@ -324,7 +324,48 @@ async fn send_uploads_exactly_the_preview_with_the_install_auth_and_removes_it()
     // It is gone from this PC, and a second send has nothing to send.
     assert_eq!(e.pending_crash_report().await["pending"], false);
     assert!(!d.path().join("crash-report/pending.json").exists());
-    assert!(matches!(e.send_pending_crash_report().await, Err(crate::EngineError::Missing { .. })));
+    assert!(matches!(e.send_pending_crash_report(None).await, Err(crate::EngineError::Missing { .. })));
+}
+
+#[tokio::test]
+async fn a_yes_is_for_the_report_that_was_shown() {
+    let (url, rel) = relay(201).await;
+    let (e, _d) = crashed(Some(url), "ask").await;
+    e.crash_report_startup().await;
+    let shown = e.pending_crash_report().await["created_ms"].as_i64().unwrap();
+    // Another report is saved meanwhile (a newer crash).
+    let mut newer = e.load_pending_for_test().unwrap();
+    newer.created_ms = shown + 5;
+    e.save_pending_for_test(&newer);
+    let err = e.send_pending_crash_report(Some(shown)).await.unwrap_err();
+    assert!(matches!(err, crate::EngineError::Conflict(_)), "{err}");
+    assert!(rel.lock().unwrap().bodies.is_empty(), "nothing was sent");
+    assert_eq!(e.send_pending_crash_report(Some(shown + 5)).await.unwrap(), json!({ "sent": true }));
+    assert_eq!(rel.lock().unwrap().bodies.len(), 1);
+}
+
+#[tokio::test]
+async fn a_start_line_inside_a_panic_message_is_not_a_session_start() {
+    let logs = "T INFO ferrocast: Ferrocast starting v=1\n\
+                T ERROR boom info=panicked at a.rs:1:1:\nfailed after Ferrocast starting up\n\
+                T INFO ferrocast: Ferrocast starting v=1\nfine\n";
+    let s = previous_session(logs);
+    assert!(s.contains("panicked at a.rs:1:1:") && s.contains("failed after Ferrocast starting up"), "{s}");
+    assert!(!s.contains("fine"));
+    assert_eq!(find_panic(s).unwrap().message, "failed after Ferrocast starting up");
+}
+
+#[tokio::test]
+async fn on_its_own_only_while_the_person_still_says_always() {
+    let (url, rel) = relay(201).await;
+    let (e, _d) = crashed(Some(url), "ask").await;
+    e.crash_report_startup().await;
+    let mut p = e.load_pending_for_test().unwrap();
+    // The setting was "always" when the start began and "ask" when it reached the send.
+    let outcome = e.upload_pending_for_test(&mut p, true).await;
+    assert_eq!(outcome, "consent_changed");
+    assert!(rel.lock().unwrap().bodies.is_empty());
+    assert_eq!(e.pending_crash_report().await["pending"], true, "kept");
 }
 
 #[tokio::test]
@@ -336,7 +377,7 @@ async fn an_older_relay_or_a_limit_keeps_the_report_here() {
         let (e, d) = crashed(Some(url), "ask").await;
         e.crash_report_startup().await;
         assert_eq!(
-            e.send_pending_crash_report().await.unwrap(),
+            e.send_pending_crash_report(None).await.unwrap(),
             json!({ "sent": false, "reason": reason }),
             "{status}"
         );
@@ -346,10 +387,10 @@ async fn an_older_relay_or_a_limit_keeps_the_report_here() {
     // No relay in this build, and a relay nobody answers from.
     let (e, _d) = crashed(None, "ask").await;
     e.crash_report_startup().await;
-    assert_eq!(e.send_pending_crash_report().await.unwrap()["reason"], "relay_unavailable");
+    assert_eq!(e.send_pending_crash_report(None).await.unwrap()["reason"], "relay_unavailable");
     let (e, _d) = crashed(Some("http://127.0.0.1:1".into()), "ask").await;
     e.crash_report_startup().await;
-    assert_eq!(e.send_pending_crash_report().await.unwrap()["reason"], "relay_unavailable");
+    assert_eq!(e.send_pending_crash_report(None).await.unwrap()["reason"], "relay_unavailable");
 }
 
 #[tokio::test]
@@ -358,7 +399,7 @@ async fn a_relay_that_refuses_for_good_is_reported_as_such() {
         let (url, _rel) = relay(status).await;
         let (e, _d) = crashed(Some(url), "ask").await;
         e.crash_report_startup().await;
-        assert_eq!(e.send_pending_crash_report().await.unwrap()["reason"], reason, "{status}");
+        assert_eq!(e.send_pending_crash_report(None).await.unwrap()["reason"], reason, "{status}");
         assert_eq!(e.pending_crash_report().await["pending"], true);
     }
 }
@@ -368,12 +409,12 @@ async fn delete_means_dont_send_and_it_stays_deleted() {
     let (url, rel) = relay(201).await;
     let (e, d) = crashed(Some(url), "ask").await;
     e.crash_report_startup().await;
-    assert!(e.discard_pending_crash_report().await);
+    assert!(e.discard_pending_crash_report().await.unwrap());
     assert_eq!(e.pending_crash_report().await["pending"], false);
     // Looking again never builds it again.
     assert_eq!(e.pending_crash_report().await["pending"], false);
     assert!(!d.path().join("crash-report/pending.json").exists());
-    assert!(!e.discard_pending_crash_report().await, "nothing left to delete");
+    assert!(!e.discard_pending_crash_report().await.unwrap(), "nothing left to delete");
     assert!(rel.lock().unwrap().bodies.is_empty());
 }
 
@@ -502,7 +543,7 @@ async fn the_real_relay_takes_what_the_app_sends_and_shows_it_to_the_admin() {
     let (e, _d) = crashed(Some(base.clone()), "ask").await;
     e.crash_report_startup().await;
     let preview = pending_text(&e.pending_crash_report().await);
-    assert_eq!(e.send_pending_crash_report().await.unwrap(), json!({ "sent": true }));
+    assert_eq!(e.send_pending_crash_report(None).await.unwrap(), json!({ "sent": true }));
 
     let http = reqwest::Client::new();
     let list: Value = http

@@ -163,11 +163,19 @@ pub(crate) fn signature_of(kind: &str, place: &str, message: &str) -> String {
 /// `Ferrocast starting` to the last one (this session's own start), else everything before
 /// this session's start, else all of it.
 pub(crate) fn previous_session(logs: &str) -> &str {
-    let starts: Vec<usize> = logs.match_indices("Ferrocast starting").map(|(i, _)| i).collect();
-    let line_start = |i: usize| logs[..i].rfind('\n').map_or(0, |n| n + 1);
+    // A start is a whole INFO line (`<time> INFO <target>: Ferrocast starting …`), so the words
+    // inside some other line's text (a panic message) don't count as one.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut at = 0usize;
+    for line in logs.split_inclusive('\n') {
+        if line.contains(" INFO ") && line.contains("Ferrocast starting") {
+            starts.push(at);
+        }
+        at += line.len();
+    }
     match starts.as_slice() {
-        [.., prev, last] => &logs[line_start(*prev)..line_start(*last)],
-        [only] => &logs[..line_start(*only)],
+        [.., prev, last] => &logs[*prev..*last],
+        [only] => &logs[..*only],
         [] => logs,
     }
 }
@@ -381,13 +389,17 @@ impl Engine {
         .map_err(|e| EngineError::Internal(format!("saving the crash report: {e}")))
     }
 
-    fn drop_pending(&self) -> bool {
+    /// Removes the saved report (and any `.bak` copy of it: it holds log text). `Ok(false)`
+    /// when there was none; an error when it is still there.
+    fn drop_pending(&self) -> Result<bool, EngineError> {
         let path = self.crash_report_path();
-        let existed = path.exists();
-        // The folder's own `.bak` copies of a removed file are not kept (it holds log text).
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(ferrocast_store::durable::backup_path(&path));
-        existed
+        let gone = |p: &std::path::Path| match std::fs::remove_file(p) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        };
+        let _ = gone(&ferrocast_store::durable::backup_path(&path));
+        gone(&path).map_err(|e| EngineError::Unavailable(format!("Couldn't remove the saved crash report: {e}")))
     }
 
     /// Builds the report from the diagnostics now (the same collection as the support zip).
@@ -435,13 +447,17 @@ impl Engine {
     }
 
     /// `DELETE /api/v1/diagnostics/pending-report`: don't send; the local copy goes too.
-    pub async fn discard_pending_crash_report(&self) -> bool {
+    pub async fn discard_pending_crash_report(&self) -> Result<bool, EngineError> {
         let _one = self.inner.crash_report_op.lock().await;
         self.drop_pending()
     }
 
     /// `POST /api/v1/diagnostics/pending-report/send`: the person said yes.
-    pub async fn send_pending_crash_report(&self) -> Result<Value, EngineError> {
+    ///
+    /// `shown`: the `created_ms` of the report the person looked at. A different report
+    /// (a newer crash was saved meanwhile) is 409 and nothing is sent, so a yes always means
+    /// the text that was shown. `None` sends whatever is waiting.
+    pub async fn send_pending_crash_report(&self, shown: Option<i64>) -> Result<Value, EngineError> {
         let _one = self.inner.crash_report_op.lock().await;
         let Some(mut p) = self.load_pending() else {
             return Err(EngineError::Missing {
@@ -450,7 +466,12 @@ impl Engine {
                 hint: "There is nothing to send.",
             });
         };
-        Ok(match self.upload_pending(&mut p).await {
+        if shown.is_some_and(|s| s != p.created_ms) {
+            return Err(EngineError::Conflict(
+                "A different crash report is waiting now. Look at it again before sending.".into(),
+            ));
+        }
+        Ok(match self.upload_pending(&mut p, false).await {
             Outcome::Sent => json!({ "sent": true }),
             Outcome::Failed { reason, .. } => json!({ "sent": false, "reason": reason }),
         })
@@ -458,11 +479,16 @@ impl Engine {
 
     /// Sends the saved report; removes it when it went, keeps it (noting a final refusal)
     /// when it didn't. The caller holds `crash_report_op`.
-    async fn upload_pending(&self, p: &mut Pending) -> Outcome {
-        let outcome = self.try_upload(p).await;
+    async fn upload_pending(&self, p: &mut Pending, auto: bool) -> Outcome {
+        let outcome = self.try_upload(p, auto).await;
         match &outcome {
             Outcome::Sent => {
-                self.drop_pending();
+                if let Err(e) = self.drop_pending() {
+                    // Sent, but the file stays: mark it so no start sends it a second time.
+                    tracing::warn!(error = %e, "the crash report was sent but couldn't be removed");
+                    p.refused = Some("already_sent".into());
+                    let _ = self.save_pending(p);
+                }
             }
             Outcome::Failed { reason, terminal } => {
                 if *terminal {
@@ -476,10 +502,15 @@ impl Engine {
         outcome
     }
 
-    async fn try_upload(&self, p: &Pending) -> Outcome {
+    async fn try_upload(&self, p: &Pending, auto: bool) -> Outcome {
         let unavailable = Outcome::Failed { reason: "relay_unavailable", terminal: false };
         let Ok(url) = self.relay_url() else { return unavailable };
         let Ok(auth) = self.relay_auth().await else { return unavailable };
+        // On its own only while the person still says "always": it may have changed while
+        // this waited (the lock, the sign-up with the relay).
+        if auto && self.settings().crash_reports != "always" {
+            return Outcome::Failed { reason: "consent_changed", terminal: false };
+        }
         let body = match serde_json::to_vec(&upload_body(p)) {
             Ok(b) => b,
             Err(_) => return Outcome::Failed { reason: "too_large", terminal: true },
@@ -522,7 +553,9 @@ impl Engine {
         let mode = self.settings().crash_reports;
         if mode == "never" {
             let _one = self.inner.crash_report_op.lock().await;
-            self.drop_pending();
+            if let Err(e) = self.drop_pending() {
+                tracing::warn!(error = %e, "couldn't remove an old crash report");
+            }
             return;
         }
         if self.safe_mode_status().unclean_exit {
@@ -540,10 +573,11 @@ impl Engine {
                 Err(e) => tracing::warn!(error = %e, "couldn't build the crash report"),
             }
         }
+        let _one = self.inner.crash_report_op.lock().await;
+        // Looked at again with the lock held: the person may have changed it meanwhile.
         if self.settings().crash_reports != "always" {
             return;
         }
-        let _one = self.inner.crash_report_op.lock().await;
         let Some(mut p) = self.load_pending() else { return };
         if p.refused.is_some() || p.auto_attempts >= MAX_AUTO_ATTEMPTS {
             return;
@@ -554,7 +588,12 @@ impl Engine {
             tracing::warn!(error = %e, "couldn't note the crash report try");
             return;
         }
-        let outcome = self.upload_pending(&mut p).await;
+        let outcome = self.upload_pending(&mut p, true).await;
+        if matches!(outcome, Outcome::Failed { reason: "consent_changed", .. }) {
+            // Nothing was sent: that wasn't a try.
+            p.auto_attempts = p.auto_attempts.saturating_sub(1);
+            let _ = self.save_pending(&p);
+        }
         tracing::info!(sent = outcome == Outcome::Sent, "the crash report was sent on its own");
     }
 
@@ -562,5 +601,22 @@ impl Engine {
     pub(crate) fn spawn_crash_report_startup(&self) {
         let engine = self.clone();
         tokio::spawn(async move { engine.crash_report_startup().await });
+    }
+}
+
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn load_pending_for_test(&self) -> Option<Pending> {
+        self.load_pending()
+    }
+    pub(crate) fn save_pending_for_test(&self, p: &Pending) {
+        self.save_pending(p).unwrap();
+    }
+    /// The reason an upload ended with (`"sent"` when it went).
+    pub(crate) async fn upload_pending_for_test(&self, p: &mut Pending, auto: bool) -> &'static str {
+        match self.upload_pending(p, auto).await {
+            Outcome::Sent => "sent",
+            Outcome::Failed { reason, .. } => reason,
+        }
     }
 }

@@ -2150,6 +2150,9 @@ async fn the_pending_crash_report_routes_answer_on_this_pc() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["error"]["code"], "no_pending_report");
+    // A report that isn't the one shown is refused before anything is sent.
+    let res = r.post("/api/v1/diagnostics/pending-report/send", json!({ "created_ms": 5 })).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "nothing waiting, whatever was shown");
     // Delete with nothing there is still a clean 204.
     let res = r
         .client

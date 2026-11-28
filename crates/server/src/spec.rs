@@ -1984,7 +1984,7 @@ const PLUGINS_AND_DIAGNOSTICS: &[RouteDoc] = &[
         "POST",
         "/diagnostics/pending-report/send",
         "Diagnostics",
-        "Send the waiting crash report to Ferrocast: `{ sent: true }` or `{ sent: false, reason }` and it stays here (PC only).",
+        "Send the waiting crash report to Ferrocast; body `{ created_ms? }` is the report that was shown (409 if another is waiting). `{ sent: true }` or `{ sent: false, reason }` and it stays here (PC only).",
         None,
         None,
     ),
