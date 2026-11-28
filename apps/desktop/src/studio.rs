@@ -1146,6 +1146,13 @@ fn reconfigure_held_previews(h: &mut Held, scale: Option<f64>, hide_for_resize: 
         vertical,
         ..
     } = h;
+    // The place kept for a picture with no view now (Studio Mode off, say) moves to the new
+    // scale too, or the view made later starts at the old one until the page sends again.
+    if let Some(s) = scale {
+        for at in [preview_at.as_mut(), program_at.as_mut(), vertical.at.as_mut()].into_iter().flatten() {
+            at.1 = s;
+        }
+    }
     ferrocast_studio::batch_preview_updates(|| {
         if let (Some(p), Some((rect, stored_scale))) = (preview.as_mut(), preview_at.as_mut()) {
             let s = scale.unwrap_or(*stored_scale);
@@ -1298,7 +1305,14 @@ fn current_hide_for_resize(app: &AppHandle) -> bool {
     let os_drag = os_in_live_resize(app);
     let now = std::time::Instant::now();
     let (hide, actions) = WINDOW_RESIZE.with(|w| w.borrow_mut().reconcile_for_sync_at(os_drag, now));
+    // This ended a hold the end notification never came for (a view is being made now): the
+    // views already held are not touched here (they are borrowed by the caller), so they are
+    // brought back on the next turn, or they would stay parked while the new one shows.
+    let restore_held = actions.restore_and_unpark;
     apply_resize_window_effects(app, actions);
+    if restore_held {
+        schedule_resync(app);
+    }
     hide
 }
 
@@ -9534,6 +9548,24 @@ mod import_tests {
         assert_eq!(h.preview_at.map(|(r, _)| r.x), Some(10.0));
         assert_eq!(h.program_at.map(|(r, _)| r.x), Some(300.0), "the failure of the first didn't skip this one");
         assert_eq!(h.vertical.at.map(|(r, _)| r.x), Some(700.0), "nor this one");
+    }
+
+    #[test]
+    fn a_new_scale_reaches_the_places_kept_for_pictures_with_no_view() {
+        use super::{Held, reconfigure_held_previews};
+        use ferrocast_studio::Rect;
+
+        let mut h = Held::default();
+        let at = (Rect { x: 0.0, y: 0.0, w: 640.0, h: 360.0, vh: 800.0 }, 1.0);
+        h.preview_at = Some(at);
+        h.program_at = Some(at);
+        h.vertical.at = Some(at);
+        reconfigure_held_previews(&mut h, Some(2.0), false);
+        assert_eq!(h.preview_at.map(|a| a.1), Some(2.0));
+        assert_eq!(h.program_at.map(|a| a.1), Some(2.0), "Studio Mode is off: no view, the place still moves on");
+        assert_eq!(h.vertical.at.map(|a| a.1), Some(2.0));
+        reconfigure_held_previews(&mut h, None, false);
+        assert_eq!(h.vertical.at.map(|a| a.1), Some(2.0), "no new scale changes nothing");
     }
 
     #[test]
