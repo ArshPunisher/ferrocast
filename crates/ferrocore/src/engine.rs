@@ -990,6 +990,10 @@ fn spawn_media_reopen(
     });
 }
 
+/// What a test's microphone has "heard": 48 kHz stereo pieces with their times.
+#[cfg(test)]
+type FakeMicSound = Arc<Mutex<Vec<(Vec<f32>, u64)>>>;
+
 enum Live {
     Still,
     Image {
@@ -1017,6 +1021,10 @@ enum Live {
     PanicOnDrop(#[allow(dead_code)] PanicDrop),
     #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     FakeCamera(FakeCapture),
+    /// A test's stand-in for a microphone: the sound it has "heard" (48 kHz stereo, with times),
+    /// taken the way a real one's is.
+    #[cfg(test)]
+    FakeMic(FakeMicSound),
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -1136,6 +1144,8 @@ struct Src {
     video_delay: Option<crate::delay::FrameDelay<Fresh>>,
     /// Its sound held back too, when the filter says so.
     audio_delay: Option<crate::delay::AudioDelay>,
+    /// Takes a steady offset out of a device's sound (a capture card with no signal sends one).
+    dc_block: crate::dcblock::DcBlock,
     /// When the memory cap cut a delay short: (the delay asked, the one both picture and sound
     /// keep now), so they stay together.
     delay_cap: Option<(u32, u32)>,
@@ -1253,6 +1263,7 @@ impl Src {
             audio_tx: None,
             video_delay: None,
             audio_delay: None,
+            dc_block: crate::dcblock::DcBlock::new(),
             delay_cap: None,
         }
     }
@@ -1896,6 +1907,30 @@ fn forward_audio(
     }
 }
 
+/// Sound from a device an input (a microphone, a line, a capture card; 48 kHz stereo) on its way
+/// to the mixer: a steady offset the device sends is taken out first, so everything after (the
+/// filters, the meters, the mix, the stream and recording) sees silence where there is none.
+/// The offset is followed while the source is off air too (`on_air` false: the sound is dropped,
+/// but the filter keeps up), so the first sound after it is heard again starts from the right
+/// state, not from a step.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn forward_device_sound(
+    id: u64,
+    on_air: bool,
+    slot: &mut Option<AudioProducer>,
+    audio_cmd: &mpsc::Sender<AudioCmd>,
+    mut pcm: Vec<f32>,
+    ts_ns: u64,
+    dc: &mut crate::dcblock::DcBlock,
+    delay: Option<&mut crate::delay::AudioDelay>,
+) {
+    dc.process(&mut pcm, 2, 48_000);
+    if on_air {
+        forward_audio(id, slot, audio_cmd, &pcm, 2, 48_000, ts_ns, delay);
+    }
+}
+
 impl Engine {
     /// Starts the engine and its frame loop.
     pub fn new(config: EngineConfig, video: VideoConfig, audio_cfg: AudioConfig) -> Result<Self, AvError> {
@@ -2345,6 +2380,7 @@ impl Engine {
                     src.opening = None;
                     src.opening_since = 0;
                     src.audio_tx = None;
+                    src.dc_block.reset();
                     src.watch = Watch::for_kind(src.kind.as_ref(), now_ns());
                     src.camera_retry =
                         is_camera_kind(src.kind.as_ref()).then(|| crate::camera_retry::CameraRetry::new(now_ns()));
@@ -6076,6 +6112,7 @@ fn watchdog_step(
                             let oc: Option<crate::mix::OutputCapture> = None;
                             leftover = Some(std::mem::replace(&mut src.live, live));
                             src.audio_tx = None;
+                            src.dc_block.reset();
                             // What the old capture left in the delay (its pictures and sound)
                             // mustn't come out ahead of the new one's: started again, empty.
                             src.video_delay = None;
@@ -6493,7 +6530,7 @@ fn frame(
     }
     let mut st_recovered = 0;
     for (id, src) in st.sources.iter_mut() {
-        let Src { live, audio_tx, audio_delay, .. } = src;
+        let Src { live, audio_tx, audio_delay, dc_block, .. } = src;
         let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match live {
             // Drawn after the frame (`visualize`).
             Live::Still | Live::Visualizer(_) => {}
@@ -6556,9 +6593,16 @@ fn frame(
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Microphone(cap) => {
                 for (pcm, t) in cap.take_sound() {
-                    if heard.contains(id) {
-                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t, audio_delay.as_mut());
-                    }
+                    let on_air = heard.contains(id);
+                    forward_device_sound(*id, on_air, audio_tx, audio_cmd, pcm, t, dc_block, audio_delay.as_mut());
+                }
+            }
+            #[cfg(test)]
+            Live::FakeMic(heard_sound) => {
+                let sound: Vec<_> = heard_sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+                for (pcm, t) in sound {
+                    let on_air = heard.contains(id);
+                    forward_device_sound(*id, on_air, audio_tx, audio_cmd, pcm, t, dc_block, audio_delay.as_mut());
                 }
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -6664,6 +6708,7 @@ fn frame(
             tracing::error!(source = id, why = panic_text(&*p), "a source faulted: stopped");
             src.live = Live::Still;
             src.audio_tx = None;
+            src.dc_block.reset();
             src.watch.faulted = true;
             st_recovered += 1;
         }
@@ -10963,6 +11008,62 @@ mod tests {
 
         e.remove_source(1);
         assert!(e.levels(1).is_none());
+    }
+
+    /// A capture card with no signal sends one steady number for every sample (the owner's
+    /// "USB2 Digital Audio": -50 dB, peak equal to RMS to four decimals, for ever). That is not
+    /// sound: the levels, in both windows and before the filters too, must settle to silence.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn a_devices_steady_offset_reads_as_silence_on_every_meter() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 2, height: 2, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let heard_sound = Arc::new(Mutex::new(Vec::new()));
+        e.lock().sources.get_mut(&1).unwrap_or_else(|| panic!("source 1")).live =
+            Live::FakeMic(Arc::clone(&heard_sound));
+        e.reset_sound(1);
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+
+        // A third of a second of nothing, then 0.0032 (-49.9 dB) on both channels, as 10 ms
+        // pieces at the speed they would arrive, for two seconds.
+        let (start, mut sent) = (Instant::now(), 0u64);
+        while start.elapsed() < Duration::from_millis(2300) {
+            while sent * 10 <= start.elapsed().as_millis() as u64 + 20 {
+                let v = if sent < 33 { 0.0 } else { 0.0032 };
+                heard_sound.lock().unwrap_or_else(|x| x.into_inner()).push((vec![v; 480 * 2], now_ns()));
+                sent += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for (window, l) in [("slow", e.levels(1)), ("fast", e.levels_fast(1))] {
+            let l = l.unwrap_or_else(|| panic!("no levels"));
+            for (what, v) in [("peak", l.peak), ("magnitude", l.rms), ("input_peak", l.input_peak)] {
+                assert!(v.iter().all(|x| *x <= -100.0), "{window} {what} still reads {v:?} dB");
+            }
+        }
+    }
+
+    /// While a microphone is off air its sound is dropped, but the offset filter keeps following
+    /// it: when it comes back on air a steady offset is silent at once, not a step the size of
+    /// the offset (CodeRabbit).
+    #[test]
+    fn the_offset_filter_keeps_up_while_a_device_is_off_air() {
+        let (tx, _rx) = mpsc::channel();
+        let (mut slot, mut dc) = (None, crate::dcblock::DcBlock::new());
+        forward_device_sound(1, true, &mut slot, &tx, vec![0.1; 960], 0, &mut dc, None);
+        assert!(slot.is_some(), "on air: the sound goes on");
+        let mut off = None;
+        forward_device_sound(1, false, &mut off, &tx, vec![0.0; 48_000 * 2], 0, &mut dc, None);
+        assert!(off.is_none(), "off air: nothing is sent");
+        // The offset is back, and now heard: the first sample is silent, not -0.1 or +0.1.
+        let mut probe = vec![0.0f32; 4];
+        dc.process(&mut probe, 2, 48_000);
+        assert!(probe.iter().all(|v| *v == 0.0));
+        let mut back = vec![0.1f32; 4];
+        dc.process(&mut back, 2, 48_000);
+        assert!(back[0].abs() > 0.09, "a real step is still passed: {}", back[0]);
     }
 
     /// A source nobody keeps meters for (its device gone, its sound stopped being mixed) reads
